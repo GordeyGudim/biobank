@@ -1,0 +1,28 @@
+# Автоматическая проверка на GitHub: при каждой отправке кода (push) и запросе на слияние
+# GitHub запускает стиль (ruff) и тесты (pytest) на нескольких версиях Python.
+# Полевых данных в репозитории нет — тесты, которым нужна книга Excel, пропускаются.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Установка
+        run: pip install -e '.[dev]'
+      - name: Стиль (ruff)
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Тесты (pytest)
+        run: pytest -q

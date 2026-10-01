@@ -16,8 +16,10 @@ from biobank.parsing import (
     is_dead_text,
     is_text_number,
     is_whole_specimen,
+    market_city,
     parse_catch_counts,
     parse_catch_note,
+    parse_city,
     parse_date,
     parse_gear,
     parse_histology,
@@ -30,6 +32,7 @@ from biobank.parsing import (
     parse_species,
     parse_time,
     parse_trawl_point,
+    sheet_capture_method,
     smear_looks_like_histology,
 )
 
@@ -555,3 +558,55 @@ def test_is_catch_note(text, expected):
 def test_parse_catch_note(text, taxon, count, mass, trawl):
     note = parse_catch_note(text)
     assert (note.taxon_text, note.count, note.mass_g, note.trawl_no) == (taxon, count, mass, trawl)
+
+
+# ---------------------------------------------------------------------------
+# Листы и города
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "header, city",
+    [
+        ("25.09.25 пр.Донтхап, г. Хонг-нга (Hong-Ngu)", "Хонг-нгу"),
+        ("28.09.25 Вьетнам, пр. Донтхап, г. Хонг-на (Hong-Ngu)", "Хонг-нгу"),
+        ("27.09.25 пр. Донтхап, г.Као-Лань (Cao-Lanh). Расстояние от первой точки - 70 км.",
+         "Као-Лань"),
+        ("04.10.25 Вьетнам, пр. Донг-хап, г. Кай-Бе", "Кай-Бе"),
+        ("24.10.25 пр.Виньлонг, г. Ку Лао Дат", "Ку Лао Дат"),
+        ("30.10.25. пр. Виньлонг, г. Кантхо", "Кантхо"),
+        ("11.08.2026 пр. Кантхо (г.Thot not)", "Thot Not"),
+        ("13.08.2026 пр.Кантхо, г.Ан-Лак-Тхон", "Ан-Лак-Тхон"),
+        ("18.08.2026  пр.Кантхо, г. Шокчанг", "Шокчанг"),
+        ("20.08.2026  пр.Кантхо", None),
+        ("13.08.2026 пр.Кантхо, рыба поймана ниже по течению, самостоятельно рыбаком", None),
+        (None, None),
+    ],
+)  # fmt: skip
+def test_parse_city(header, city):
+    parsed = parse_city(header)
+    assert (parsed.name if parsed else None) == city
+
+
+def test_city_latin():
+    assert parse_city("г. Хонг-нга (Hong-Ngu)").name_latin == "Hong Ngu"
+
+
+def test_market_city():
+    assert market_city("Рынок.Бенче").name == "Бенче"
+    assert market_city("Рынок. Чавинь").name == "Чавинь"
+
+
+@pytest.mark.parametrize(
+    "sheet, method",
+    [
+        ("Точка 1", "траление"),
+        ("Точка 6 2026", "траление"),
+        ("Аквахозяйство 1", "аквахозяйство"),
+        ("Рынок.Бенче", "рынок"),
+        ("Рыбак 1 точка", "рыбак"),
+        ("Рыбак (самостоятельно 22.08)", "рыбак"),
+    ],
+)
+def test_sheet_capture_method(sheet, method):
+    assert sheet_capture_method(sheet) == method

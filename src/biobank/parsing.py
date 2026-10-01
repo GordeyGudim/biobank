@@ -763,3 +763,84 @@ def parse_catch_note(text: str) -> CatchNote:
             t = t[match.end() :]
     taxon = re.split(r"\s[-–]|-\s*\d|\(", t)[0].strip(" -:,")
     return CatchNote(taxon or None, count, None, trawl_no)
+
+
+# ---------------------------------------------------------------------------
+# Листы и города
+# ---------------------------------------------------------------------------
+
+
+def sheet_capture_method(sheet_name: str) -> str:
+    """Способ получения рыбы по имени листа.
+
+    >>> sheet_capture_method("Рынок. Чавинь"), sheet_capture_method("Рыбак 1 точка")
+    ('рынок', 'рыбак')
+    >>> sheet_capture_method("Аквахозяйство 1"), sheet_capture_method("Точка 6.")
+    ('аквахозяйство', 'траление')
+    """
+    low = sheet_name.lower()
+    if "рынок" in low:
+        return "рынок"
+    if "рыбак" in low:
+        return "рыбак"
+    if "аквахоз" in low:
+        return "аквахозяйство"
+    return "траление"
+
+
+@dataclass(frozen=True)
+class City:
+    name: str
+    name_latin: str | None = None
+
+
+# Варианты написания → единое название. Ключ — в нижнем регистре.
+# Латиница указана только там, где она есть в исходной таблице.
+CITY_ALIASES = {
+    "хонг-нга": City("Хонг-нгу", "Hong Ngu"),
+    "хонг-на": City("Хонг-нгу", "Hong Ngu"),
+    "хонг-нгу": City("Хонг-нгу", "Hong Ngu"),
+    "као-лань": City("Као-Лань", "Cao Lanh"),
+    "thot not": City("Thot Not", "Thot Not"),
+}
+
+
+def normalize_city(name: str) -> City:
+    """Единое написание города.
+
+    >>> normalize_city("Хонг-на")
+    City(name='Хонг-нгу', name_latin='Hong Ngu')
+    >>> normalize_city("Кай-Бе")
+    City(name='Кай-Бе', name_latin=None)
+    """
+    name = normalize_space(name)
+    return CITY_ALIASES.get(name.lower(), City(name))
+
+
+def parse_city(header) -> City | None:
+    """Город из строки-заголовка листа (после «г.»). Нет города — None.
+
+    >>> parse_city("25.09.25 пр.Донтхап, г. Хонг-нга (Hong-Ngu)").name
+    'Хонг-нгу'
+    >>> parse_city("11.08.2026 пр. Кантхо (г.Thot not)").name
+    'Thot Not'
+    >>> parse_city("20.08.2026  пр.Кантхо") is None
+    True
+    """
+    if not isinstance(header, str):
+        return None
+    # (?<![\w-]) — перед «г.» не должно быть буквы, иначе поймали бы конец другого слова
+    match = re.search(r"(?<![\w-])г\.\s*([^,.()]+)", header)
+    if not match or not match.group(1).strip():
+        return None
+    return normalize_city(match.group(1))
+
+
+def market_city(sheet_name: str) -> City | None:
+    """Город рынка из имени листа: 'Рынок.Бенче' → Бенче.
+
+    >>> market_city("Рынок. Чавинь").name
+    'Чавинь'
+    """
+    match = re.match(r"рынок\.?\s*(.+)", sheet_name.strip(), flags=re.IGNORECASE)
+    return normalize_city(match.group(1)) if match else None

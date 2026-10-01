@@ -1,6 +1,6 @@
 """Командная строка: python -m biobank <команда>.
 
-Команды добавляются по этапам: init, import.
+Команды добавляются по этапам: init, import, check.
 """
 
 import argparse
@@ -8,6 +8,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from biobank.checks import run_checks, summary_by_category
 from biobank.db import DEFAULT_DB_PATH, connect, create_database, list_tables
 from biobank.excel_reader import ExcelReadError
 from biobank.importer import import_workbook
@@ -54,6 +55,30 @@ def cmd_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check(args: argparse.Namespace) -> int:
+    if not args.db.exists():
+        print(f"Ошибка: базы нет: {args.db}. Сначала: python -m biobank import …", file=sys.stderr)
+        return 1
+    conn = connect(args.db)
+    try:
+        with conn:
+            result = run_checks(conn)
+        rows = summary_by_category(conn)
+    finally:
+        conn.close()
+
+    print(f"Проверки выполнены: новых проблем {result.added}, уже известных {result.known}, "
+          f"закрыто (больше не находятся) {result.closed}.")  # fmt: skip
+    print()
+    print(f"  {'категория':<12} {'открыто':>8} {'решено':>7} {'всего':>6}")
+    for r in rows:
+        print(f"  {r['category']:<12} {r['open']:>8} {r['resolved']:>7} {r['total']:>6}")
+    print()
+    print("Подробности: python -m biobank report issues  (этап 6) или")
+    print('  sqlite3 -box output/biobank.db "SELECT * FROM data_issue WHERE resolved = 0"')
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="biobank",
@@ -74,6 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_import = sub.add_parser("import", help="пересоздать базу и импортировать книгу Excel")
     p_import.add_argument("xlsx", type=Path, help="путь к книге, напр. data/source.xlsx")
     p_import.set_defaults(func=cmd_import)
+
+    p_check = sub.add_parser("check", help="запустить проверки данных и обновить журнал проблем")
+    p_check.set_defaults(func=cmd_check)
 
     return parser
 

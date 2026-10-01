@@ -21,6 +21,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from biobank.checks import collapse_issues, run_checks
 from biobank.db import DEFAULT_DB_PATH, SCHEMA_PATH, connect, create_database
 from biobank.excel_reader import (
     CoordinateEntry,
@@ -69,9 +70,6 @@ SITE_TYPE = {
     "аквахозяйство": "аквахозяйство",
     "рыбак": "точка рыбака",
 }
-
-# Сколько одинаковых проблем на одном листе сворачивать в одну запись
-COLLAPSE_THRESHOLD = 4
 
 
 @dataclass
@@ -745,32 +743,6 @@ def _import_specimens(ctx: ImportContext, sheet: SheetData, event_id: int, event
 # ---------------------------------------------------------------------------
 
 
-def collapse_issues(issues: list[Issue]) -> list[Issue]:
-    """Свернуть повторяющиеся проблемы: ≥ 4 одинаковых на листе → одна запись с перечнем."""
-    groups: dict[tuple, list[Issue]] = defaultdict(list)
-    for issue in issues:
-        groups[(issue.category, issue.sheet, issue.description, issue.table_name)].append(issue)
-    result = []
-    for (category, sheet, description, table), items in groups.items():
-        if len(items) < COLLAPSE_THRESHOLD:
-            result.extend(items)
-            continue
-        objects = ", ".join(i.object_label or i.cell or "?" for i in items)
-        cells = [i.cell for i in items if i.cell]
-        result.append(
-            Issue(
-                category,
-                f"{description} ({len(items)} шт.)",
-                sheet,
-                f"{cells[0]}…{cells[-1]}" if cells else None,
-                objects,
-                items[0].raw_value,
-                table,
-            )
-        )
-    return result
-
-
 def _write_issues(ctx: ImportContext) -> int:
     issues = collapse_issues(ctx.issues)
     ctx.conn.executemany(
@@ -816,6 +788,7 @@ def import_workbook(
             _import_references(ctx)
             _import_expeditions(ctx, expeditions)
             _write_issues(ctx)
+            run_checks(conn)  # в новой базе закрывать нечего — результат не зависит от даты
         summary = {
             table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             for table in SUMMARY_TABLES

@@ -6,6 +6,7 @@
 
 Полевые таблицы Excel → проверенная реляционная база SQLite → отчёты, выгрузки и безопасные правки
 
+[![tests](https://github.com/GordeyGudim/biobank/actions/workflows/tests.yml/badge.svg)](https://github.com/GordeyGudim/biobank/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-схема_v2-003B57?logo=sqlite&logoColor=white)
 ![pytest](https://img.shields.io/badge/тесты-pytest-0A9EDC?logo=pytest&logoColor=white)
@@ -94,7 +95,7 @@ erDiagram
 (на Arch Linux системный `pip` вообще запрещён).
 
 ```bash
-git clone https://github.com/<владелец>/biobank.git
+git clone https://github.com/GordeyGudim/biobank.git
 cd biobank
 python -m venv .venv                 # создать окружение (один раз)
 source .venv/bin/activate            # включать в каждом новом терминале

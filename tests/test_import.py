@@ -1,40 +1,19 @@
 """Приёмочные тесты импорта (этап 3): справочники, места, выезды, траления, вода.
 
-Импорт настоящей книги занимает пару секунд, поэтому делаем его один раз
-на весь файл тестов: фикстура со scope="module" создаётся один раз и
-переиспользуется всеми тестами ниже.
+Фикстуры db_path и db (импорт настоящей книги) — в tests/conftest.py.
 """
 
 import sqlite3
 
 import pytest
+from conftest import SOURCE, count
 
 from biobank import importer
-from biobank.db import PROJECT_ROOT, connect
+from biobank.db import connect
 from biobank.excel_reader import ExcelReadError
 from biobank.importer import import_workbook
 
-SOURCE = PROJECT_ROOT / "data" / "source.xlsx"
-
 pytestmark = pytest.mark.skipif(not SOURCE.exists(), reason="нет data/source.xlsx")
-
-
-@pytest.fixture(scope="module")
-def db_path(tmp_path_factory):
-    path = tmp_path_factory.mktemp("import") / "biobank.db"
-    import_workbook(SOURCE, path)
-    return path
-
-
-@pytest.fixture
-def db(db_path):
-    conn = connect(db_path)
-    yield conn
-    conn.close()
-
-
-def count(db, sql, *params):
-    return db.execute(sql, params).fetchone()[0]
 
 
 def test_counts(db):

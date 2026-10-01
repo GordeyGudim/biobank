@@ -553,6 +553,14 @@ def test_is_catch_note(text, expected):
         ("Общий вес рыбы: 1737г.", "рыбы", None, 1737.0, None),
         ("краб (3 траление) в DNA пробирке 30кр", "краб", None, None, 3),
         ("2 креветки (4 траление) в DNA пробирке 30кв", "креветки", 2, None, 4),
+        ("креветки sp - 2 шт, заспиртовали", "креветки sp", 2, None, None),
+        (
+            "Новый вид краба рода Varuna, ранее проведен мол.ген. анализ, заспиртовали",
+            "Новый вид краба рода Varuna",
+            None,
+            None,
+            None,
+        ),
     ],
 )
 def test_parse_catch_note(text, taxon, count, mass, trawl):

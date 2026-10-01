@@ -16,13 +16,17 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from biobank.parsing import (
     City,
+    Label,
     clean_comment,
+    is_blank,
     is_catch_comment,
     is_text_number,
+    is_whole_specimen,
     normalize_space,
     parse_city,
     parse_date,
     parse_gear,
+    parse_label,
     parse_label_range,
     parse_labs,
     parse_number,
@@ -103,6 +107,32 @@ class CoordinateEntry:
 
 
 @dataclass
+class SpecimenRow:
+    """Строка особи в левой таблице листа."""
+
+    row: int
+    label: Label | None  # None — особь без номера («ХХ»)
+    label_raw: str
+    values: dict[str, object]  # поле ('dna', 'histo', 'smear', ...) → значение ячейки
+    cells: dict[str, str]  # поле → адрес ячейки, напр. 'D5'
+    comments: dict[str, str]  # поле → текст комментария к ячейке
+    tl_cm: float | None = None
+    sl_cm: float | None = None
+    mass_g: float | None = None
+    mass_gutted_g: float | None = None
+
+
+@dataclass
+class NoteRow:
+    """Строка под/между особями, которая не является особью: улов, заметка."""
+
+    row: int
+    cell: str
+    text: str
+    comment: str | None = None
+
+
+@dataclass
 class SheetData:
     """Один лист = один выезд."""
 
@@ -119,6 +149,8 @@ class SheetData:
     header_notes: list[str] = field(default_factory=list)
     dna_labs: list[str] = field(default_factory=list)
     smear_labs: list[str] = field(default_factory=list)
+    specimens: list[SpecimenRow] = field(default_factory=list)
+    note_rows: list[NoteRow] = field(default_factory=list)
     issues: list[Issue] = field(default_factory=list)
 
 
@@ -392,8 +424,100 @@ def _read_point_comments(r, row, cols, point, trawl, header_row, time_cols) -> N
             point.notes.append(f"{head}: {text}")
 
 
+def find_specimen_columns(ws: Worksheet, header_row: int) -> dict[str, int]:
+    """Колонки левой таблицы (особи) по тексту шапки."""
+    cols: dict[str, int] = {}
+    for col in range(1, ws.max_column + 1):
+        key = _header_key(ws.cell(header_row, col).value)
+        if not key:
+            continue
+        if key.startswith("№ пробы"):
+            cols["label"] = col
+        elif key == "вид":
+            cols["species"] = col
+        elif key == "dna":
+            cols["dna"] = col
+        elif key == "кишечник":
+            cols["gut"] = col
+        elif key == "гистология":
+            cols["histo"] = col
+        elif key.startswith("мазок"):
+            cols["smear"] = col
+        elif key.startswith("tl"):
+            cols["tl"] = col
+        elif key.startswith("sl"):
+            cols["sl"] = col
+        elif key.startswith("m (г"):
+            cols["mass"] = col
+        elif key.startswith(("m (без порки", "m (порка")):
+            cols["gutted"] = col
+        elif key == "№ траления":
+            break  # дальше — таблица тралений
+    return cols
+
+
+def _measure(r: _SheetReader, row: int, col: int | None, obj: str) -> float | None:
+    """Промер; «целая рыба», «заспиртовали…» в ячейке → None без предупреждения."""
+    if is_whole_specimen(r.value(row, col)):
+        return None
+    return r.number(row, col, obj, "specimen")
+
+
+def _read_specimens(r: _SheetReader, sheet: SheetData, header_row: int, last_col: int) -> None:
+    cols = find_specimen_columns(r.ws, header_row)
+    for key in ("label", "species"):
+        if key not in cols:
+            raise ExcelReadError(f"Лист «{sheet.name}»: нет колонки «{key}» в шапке особей")
+
+    for row in range(header_row + 1, r.ws.max_row + 1):
+        raw_label = r.value(row, cols["label"])
+        species = r.value(row, cols["species"])
+        # особь — строка с номером пробы и заполненным видом (или «ХХ» — особь без номера)
+        label = parse_label(raw_label) if species is not None else None
+        unnumbered = isinstance(raw_label, str) and raw_label.strip() == "ХХ"
+        if label is None and not unnumbered:
+            _read_note_row(r, sheet, row, last_col)
+            continue
+
+        values = {key: r.value(row, col) for key, col in cols.items()}
+        cells = {key: r.ws.cell(row, col).coordinate for key, col in cols.items()}
+        comments = {}
+        for key, col in cols.items():
+            text = r.comment(row, col)
+            if text:
+                comments[key] = text
+        obj = label.label if label else "ХХ"
+        sheet.specimens.append(
+            SpecimenRow(
+                row=row,
+                label=label,
+                label_raw=normalize_space(str(raw_label)),
+                values=values,
+                cells=cells,
+                comments=comments,
+                tl_cm=_measure(r, row, cols.get("tl"), obj),
+                sl_cm=_measure(r, row, cols.get("sl"), obj),
+                mass_g=_measure(r, row, cols.get("mass"), obj),
+                mass_gutted_g=_measure(r, row, cols.get("gutted"), obj),
+            )
+        )
+
+
+def _read_note_row(r: _SheetReader, sheet: SheetData, row: int, last_col: int) -> None:
+    """Первый непустой текст строки (левее таблицы тралений) — заметка."""
+    for col in range(1, last_col + 1):
+        value = r.value(row, col)
+        if isinstance(value, str) and not is_blank(value):
+            sheet.note_rows.append(
+                NoteRow(
+                    row, r.ws.cell(row, col).coordinate, normalize_space(value), r.comment(row, col)
+                )
+            )
+            return
+
+
 def read_sheet(ws: Worksheet) -> SheetData:
-    """Прочитать лист-выезд (без особей — они добавятся на этапе 4)."""
+    """Прочитать лист-выезд: особи, заметки, траления, вода, координаты."""
     issues: list[Issue] = []
     r = _SheetReader(ws, issues)
 
@@ -419,6 +543,8 @@ def read_sheet(ws: Worksheet) -> SheetData:
         _read_trawls(r, sheet, *trawl_header)
     _read_header_comments(r, sheet, header_rows)
     _read_coordinates(r, sheet)
+    last_col = trawl_header[1]["trawl"] - 1 if trawl_header else ws.max_column
+    _read_specimens(r, sheet, spec_header, last_col)
 
     if r.text_numbers:
         cells = r.text_numbers

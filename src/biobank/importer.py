@@ -27,6 +27,7 @@ from biobank.excel_reader import (
     ExpeditionData,
     Issue,
     SheetData,
+    SpecimenRow,
     WaterPoint,
     read_workbook,
 )
@@ -37,8 +38,22 @@ from biobank.parsing import (
     LAB_VN_COMPANY,
     SPECIES,
     City,
+    SampleSpec,
     distance_km,
+    is_blank,
+    is_catch_note,
+    is_dead_text,
+    is_whole_specimen,
     market_city,
+    parse_catch_counts,
+    parse_catch_note,
+    parse_histology,
+    parse_label,
+    parse_labs,
+    parse_sex,
+    parse_shrimp_samples,
+    parse_species,
+    smear_looks_like_histology,
 )
 
 CAPTURE_METHODS = ("траление", "рыбак", "рынок", "аквахозяйство")
@@ -364,6 +379,9 @@ def _event_notes(sheet: SheetData, extra: str | None) -> str | None:
     if sheet.header_text:
         parts.append(f"Заголовок листа: {sheet.header_text}")
     parts.extend(sheet.header_notes)
+    for note in sheet.note_rows:
+        if not is_catch_note(note.text):
+            parts.append(note.text + (f" ({note.comment})" if note.comment else ""))
     return "; ".join(parts) or None
 
 
@@ -435,6 +453,16 @@ def _import_sheet(ctx: ImportContext, sheet: SheetData, expedition_id: int, regi
         for point_type in ("старт", "финиш"):
             if point_type in trawl.points:
                 _import_water(ctx, event_id, trawling_id, trawl.points[point_type])
+        for comment in trawl.catch_comments:
+            for taxon, count in parse_catch_counts(comment):
+                ctx.insert(
+                    "catch_record",
+                    event_id=event_id,
+                    trawling_id=trawling_id,
+                    taxon_text=taxon,
+                    count_n=count,
+                    raw_text=comment,
+                )
 
     if sheet.fisher_point is not None:
         point = sheet.fisher_point
@@ -442,6 +470,8 @@ def _import_sheet(ctx: ImportContext, sheet: SheetData, expedition_id: int, regi
             point.notes.insert(0, sheet.fisher_point_comment)
         _import_water(ctx, event_id, None, point)
 
+    _import_note_rows(ctx, sheet, event_id)
+    _import_specimens(ctx, sheet, event_id, site_id)
     ctx.issues.extend(sheet.issues)
 
 
@@ -458,8 +488,256 @@ def _import_expeditions(ctx: ImportContext, expeditions: list[ExpeditionData]) -
             date_start=min(dates) if dates else None,
             date_end=max(dates) if dates else None,
         )
+        _check_missing_shipments(expedition)
         for sheet in expedition.sheets:
             _import_sheet(ctx, sheet, expedition_id, region_id, market_notes)
+
+
+def _check_missing_shipments(expedition: ExpeditionData) -> None:
+    """Лист с образцами, но без записи «куда отправлены», если на других листах она есть."""
+    for attr, column, sample_word in (
+        ("dna_labs", "dna", "ДНК"),
+        ("smear_labs", "smear", "мазков"),
+    ):
+        if not any(getattr(s, attr) for s in expedition.sheets):
+            continue  # в экспедиции вообще не записано — не проблема конкретного листа
+        for sheet in expedition.sheets:
+            has_samples = any(
+                not is_blank(spec.values.get(column))
+                and not is_whole_specimen(spec.values.get(column))
+                for spec in sheet.specimens
+            )
+            if has_samples and not getattr(sheet, attr):
+                sheet.issues.append(
+                    Issue("связь",
+                          f"Не записано, куда отправлены образцы {sample_word} "
+                          "(на других листах экспедиции записано в комментарии к шапке)",
+                          sheet.name, None, None, None, "sample_shipment")
+                )  # fmt: skip
+
+
+# ---------------------------------------------------------------------------
+# Особи, определения вида, образцы, прилов
+# ---------------------------------------------------------------------------
+
+SMEAR_PRESERVATIVE = "этанол 96% (фиксация)"
+
+
+def _import_note_rows(ctx: ImportContext, sheet: SheetData, event_id: int) -> None:
+    """Строки под таблицей особей: улов → catch_record, остальное уже в notes выезда."""
+    for note in sheet.note_rows:
+        if is_catch_note(note.text):
+            catch = parse_catch_note(note.text)
+            trawling_id = ctx.trawl_ids.get((sheet.name, catch.trawl_no))
+            if catch.trawl_no is not None and trawling_id is None:
+                sheet.issues.append(
+                    Issue("связь", f"В заметке указано траление {catch.trawl_no}, а его нет",
+                          sheet.name, note.cell, None, note.text, "catch_record")
+                )  # fmt: skip
+            ctx.insert(
+                "catch_record",
+                event_id=event_id,
+                trawling_id=trawling_id,
+                taxon_text=catch.taxon_text,
+                count_n=catch.count,
+                mass_g=catch.mass_g,
+                raw_text=note.text + (f" ({note.comment})" if note.comment else ""),
+            )
+        elif "только гистология" in note.text.lower():
+            sheet.issues.append(
+                Issue("номера",
+                      "Для этих номеров нет строк особей — вид и промеры не записаны",
+                      sheet.name, note.cell, None, note.text, "sampling_event")
+            )  # fmt: skip
+
+
+def _specimen_capture(
+    ctx: ImportContext, sheet: SheetData, spec: SpecimenRow, event_site: int, from_fisher: bool
+) -> tuple[int | None, int | None]:
+    """Способ и место поимки особи, ТОЛЬКО если они отличаются от выезда.
+
+    Возвращает (capture_method_id, capture_site_id); (None, None) — как у выезда.
+    """
+    number = spec.label.number if spec.label else None
+    for label_range, site_id in ctx.capture_sites.get(sheet.name, []):
+        if label_range and number is not None and label_range[0] <= number <= label_range[1]:
+            if site_id == event_site:
+                return None, None
+            method = None if sheet.capture_method == "рыбак" else ctx.method_ids["рыбак"]
+            return method, site_id
+    if from_fisher:
+        fisher_sites = [s for r, s in ctx.capture_sites.get(sheet.name, []) if r is None]
+        site_id = fisher_sites[-1] if fisher_sites else None
+        return ctx.method_ids["рыбак"], site_id
+    return None, None
+
+
+def _whole_text(spec: SpecimenRow) -> str | None:
+    for key in ("dna", "histo", "smear", "gut", "tl", "sl", "mass"):
+        value = spec.values.get(key)
+        if is_whole_specimen(value):
+            return str(value)
+    return None
+
+
+def _specimen_samples(sheet: SheetData, spec: SpecimenRow, label: str) -> list[tuple]:
+    """Образцы особи: [(SampleSpec, исходное значение, [лаборатории])]."""
+    values = spec.values
+    samples: list[tuple] = []
+    whole = _whole_text(spec)
+    if whole:
+        preservative = "этанол" if "спирт" in whole.lower() else None
+        samples.append((SampleSpec("целая особь", None, label, preservative), whole, []))
+
+    if spec.label and spec.label.series == "mr":
+        for sample in parse_shrimp_samples(values.get("histo"), values.get("smear"), label):
+            raw = values.get("histo") if sample.sample_type == "гистология" else values.get("smear")
+            samples.append((sample, raw, []))
+        return samples
+
+    extra_labs = []
+    for comment in spec.comments.values():
+        extra_labs += [lab for lab in parse_labs(comment) if lab == LAB_VN_COMPANY]
+
+    dna = values.get("dna")
+    if not is_blank(dna) and not is_whole_specimen(dna):
+        parsed = parse_label(dna)
+        samples.append(
+            (SampleSpec("ДНК", None, parsed.label if parsed else str(dna)), dna,
+             sheet.dna_labs + extra_labs)
+        )  # fmt: skip
+    elif extra_labs:
+        sheet.issues.append(
+            Issue("связь", "Отправлено на ген. анализ, но образца ДНК в таблице нет",
+                  sheet.name, spec.cells.get("label"), label, None, "specimen")
+        )  # fmt: skip
+
+    gut = values.get("gut")
+    if not is_blank(gut) and not is_whole_specimen(gut):
+        parsed = parse_label(gut)
+        samples.append(
+            (SampleSpec("кишечник", "кишечник", parsed.label if parsed else str(gut)), gut, [])
+        )
+
+    histo, smear = values.get("histo"), values.get("smear")
+    if smear_looks_like_histology(smear):
+        sheet.issues.append(
+            Issue("формат",
+                  "В колонке «мазок крови» записан орган — колонки гистологии и мазка "
+                  "перепутаны; импортировано как гистология + мазок",
+                  sheet.name, spec.cells.get("smear"), label, str(smear), "sample")
+        )  # fmt: skip
+        histo, smear = smear, histo
+
+    result = parse_histology(histo, label)
+    for warning in result.warnings:
+        category = "номера" if "номер" in warning else "формат"
+        sheet.issues.append(
+            Issue(category, warning, sheet.name, spec.cells.get("histo"), label,
+                  None if histo is None else str(histo), "sample")
+        )  # fmt: skip
+    samples += [(sample, histo, []) for sample in result.samples]
+
+    if (
+        not is_blank(smear)
+        and not is_whole_specimen(smear)
+        and not is_dead_text(smear)
+        and not str(smear).strip().lower().startswith("нет")
+    ):
+        parsed = parse_label(smear)
+        smear_label = parsed.label if parsed else str(smear)
+        samples.append(
+            (SampleSpec("мазок крови", None, smear_label, SMEAR_PRESERVATIVE), smear,
+             sheet.smear_labs)
+        )  # fmt: skip
+    return samples
+
+
+def _specimen_notes(spec: SpecimenRow) -> list[str]:
+    notes = []
+    for key, text in spec.comments.items():
+        if key == "species" or (key == "smear" and "шприц" in text):
+            continue  # вид → в определение; методика мазка одинакова на всех листах
+        notes.append(text if key == "label" else f"{key}: {text}")
+    smear = spec.values.get("smear")
+    if isinstance(smear, str) and smear.strip().lower().startswith("нет"):
+        notes.append(f"мазок: {smear.strip()}")
+    return notes
+
+
+def _import_specimens(ctx: ImportContext, sheet: SheetData, event_id: int, event_site: int):
+    from_fisher_series = None  # после комментария «далее рыба, пойманная … рыбаком»
+    event_date = sheet.event_date
+
+    for spec in sheet.specimens:
+        label = spec.label.label if spec.label else f"{spec.label_raw} ({sheet.name})"
+        series = spec.label.series if spec.label else None
+
+        label_comment = spec.comments.get("label", "").lower()
+        if "далее" in label_comment and "рыбак" in label_comment:
+            from_fisher_series = series
+        from_fisher = from_fisher_series is not None and from_fisher_series == series
+        method_id, site_id = _specimen_capture(ctx, sheet, spec, event_site, from_fisher)
+
+        texts = [v for v in spec.values.values() if isinstance(v, str)]
+        texts += list(spec.comments.values())
+        is_dead = any(is_dead_text(text) for text in texts)
+        sex = next((parse_sex(c) for c in spec.comments.values() if parse_sex(c)), None)
+
+        species_raw = spec.values.get("species")
+        species = parse_species(species_raw)
+        species_id = ctx.species_ids.get(species.name) if species.name else None
+
+        specimen_id = ctx.insert(
+            "specimen",
+            label=label,
+            label_raw=spec.label_raw,
+            series=series,
+            series_no=spec.label.number if spec.label else None,
+            event_id=event_id,
+            trawling_id=None,  # в таблице не записано — не угадываем
+            species_id=species_id,
+            capture_method_id=method_id,
+            capture_site_id=site_id,
+            tl_cm=spec.tl_cm,
+            sl_cm=spec.sl_cm,
+            mass_g=spec.mass_g,
+            mass_gutted_g=spec.mass_gutted_g,
+            sex=sex,
+            is_dead=int(is_dead),
+            notes="; ".join(_specimen_notes(spec)) or None,
+            source_row=spec.row,
+        )
+
+        id_notes = [n for n in (species.note, spec.comments.get("species")) if n]
+        ctx.insert(
+            "species_identification",
+            specimen_id=specimen_id,
+            species_id=species_id,
+            method="морфология",
+            confidence=species.confidence,
+            identified_on=event_date,
+            raw_text=None if species_raw is None else " ".join(str(species_raw).split()),
+            notes="; ".join(id_notes) or None,
+        )
+
+        for sample, raw, labs in _specimen_samples(sheet, spec, label):
+            sample_id = ctx.insert(
+                "sample",
+                specimen_id=specimen_id,
+                sample_type=sample.sample_type,
+                organ=sample.organ,
+                label=sample.label,
+                preservative=sample.preservative,
+                raw_value=None if raw is None else str(raw),
+                notes=sample.notes,
+            )
+            for lab in dict.fromkeys(labs):  # без повторов, порядок сохраняется
+                ctx.insert("sample_shipment", sample_id=sample_id, lab_id=ctx.lab_ids[lab])
+
+        for issue in sheet.issues:
+            if issue.table_name == "specimen" and issue.object_label in (label, "ХХ"):
+                issue.record_id = issue.record_id or specimen_id
 
 
 # ---------------------------------------------------------------------------

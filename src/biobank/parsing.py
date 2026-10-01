@@ -761,7 +761,7 @@ def parse_catch_note(text: str) -> CatchNote:
         if match:
             count = int(match.group(1))
             t = t[match.end() :]
-    taxon = re.split(r"\s[-–]|-\s*\d|\(", t)[0].strip(" -:,")
+    taxon = re.split(r"\s[-–]|-\s*\d|\(|,", t)[0].strip(" -:,")
     return CatchNote(taxon or None, count, None, trawl_no)
 
 

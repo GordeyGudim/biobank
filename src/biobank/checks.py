@@ -156,10 +156,15 @@ def check_numbering(conn: sqlite3.Connection) -> list[Issue]:
 
 
 def check_trawl_links(conn: sqlite3.Connection) -> list[Issue]:
-    """Выезды-траления, где у особей не указано траление (по записи на выезд)."""
+    """Выезды-траления, где у особей не указано траление (по записи на выезд).
+
+    Число особей в запись не пишем: иначе каждая привязка меняла бы запись,
+    и журнал засорялся бы закрытыми дублями. Запись закрывается сама,
+    когда привязаны все особи выезда (или её закрывают вручную).
+    """
     rows = conn.execute(
         """
-        SELECT e.event_id, e.source_sheet, count(s.specimen_id) AS n
+        SELECT e.event_id, e.source_sheet
         FROM sampling_event e
         JOIN specimen s ON s.event_id = e.event_id
             AND s.trawling_id IS NULL AND s.capture_method_id IS NULL
@@ -169,8 +174,8 @@ def check_trawl_links(conn: sqlite3.Connection) -> list[Issue]:
         """
     )
     return [
-        Issue("связь", DESC_NO_TRAWL, r["source_sheet"], None, None,
-              f"особей без траления: {r['n']}", "sampling_event", r["event_id"])
+        Issue("связь", DESC_NO_TRAWL, r["source_sheet"], None, None, None,
+              "sampling_event", r["event_id"])
         for r in rows
     ]  # fmt: skip
 

@@ -1,6 +1,6 @@
 """Командная строка: python -m biobank <команда>.
 
-Команды добавляются по этапам: init, import, check, export, report, sql.
+Команды: init, import, check, export, report, sql, link-trawl, identify, resolve-issue.
 """
 
 import argparse
@@ -10,6 +10,16 @@ from pathlib import Path
 
 from biobank.checks import run_checks, summary_by_category
 from biobank.db import DEFAULT_DB_PATH, connect, create_database, list_tables
+from biobank.edit import (
+    CONFIDENCES,
+    METHODS,
+    EditError,
+    backup_database,
+    identify,
+    link_trawl,
+    manual_edits,
+    resolve_issue,
+)
 from biobank.excel_reader import ExcelReadError
 from biobank.export import export_csv, export_xlsx
 from biobank.importer import import_workbook
@@ -50,6 +60,22 @@ def cmd_import(args: argparse.Namespace) -> int:
     if not xlsx.exists():
         print(f"Ошибка: файл не найден: {xlsx}", file=sys.stderr)
         return 1
+    if args.db.exists():
+        conn = connect(args.db)
+        try:
+            edits = manual_edits(conn)
+        except sqlite3.Error:
+            edits = {}  # старая база другого формата — правок в ней искать негде
+        finally:
+            conn.close()
+        if edits:
+            print("ВНИМАНИЕ: импорт пересоздаёт базу из Excel, ручные правки пропадут:")
+            for name, n in edits.items():
+                print(f"  {name}: {n}")
+            if not args.yes and not ask_yes_no("Продолжить импорт?"):
+                print("Отменено, база не изменена.")
+                return 1
+            print(f"Резервная копия текущей базы: {backup_database(args.db)}")
     try:
         summary = import_workbook(xlsx, args.db)
     except (ExcelReadError, sqlite3.Error) as error:
@@ -142,6 +168,47 @@ def cmd_sql(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_edit(args: argparse.Namespace, action) -> int:
+    """Общая обёртка правок: резервная копия → правка → отчёт."""
+    if not _require_db(args.db):
+        return 1
+    backup = backup_database(args.db)
+    conn = connect(args.db)
+    try:
+        result = action(conn)
+    except EditError as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        print("База не изменена.", file=sys.stderr)
+        backup.unlink()  # правки не было — копия не нужна
+        return 1
+    finally:
+        conn.close()
+    print(result.message)
+    print(f"Резервная копия до правки: {backup}")
+    if result.checks.added or result.checks.closed:
+        print(f"Журнал проблем: новых {result.checks.added}, закрыто {result.checks.closed}.")
+    return 0
+
+
+def cmd_link_trawl(args: argparse.Namespace) -> int:
+    return _run_edit(args, lambda conn: link_trawl(conn, args.label, args.trawl_no))
+
+
+def cmd_identify(args: argparse.Namespace) -> int:
+    species = None if args.species in ("?", "-") else args.species
+    return _run_edit(
+        args,
+        lambda conn: identify(
+            conn, args.label, species, args.method, args.confidence,
+            identified_by=args.by, identified_on=args.date, notes=args.notes,
+        ),
+    )  # fmt: skip
+
+
+def cmd_resolve_issue(args: argparse.Namespace) -> int:
+    return _run_edit(args, lambda conn: resolve_issue(conn, args.issue_id, args.resolution))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="biobank",
@@ -161,6 +228,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_import = sub.add_parser("import", help="пересоздать базу и импортировать книгу Excel")
     p_import.add_argument("xlsx", type=Path, help="путь к книге, напр. data/source.xlsx")
+    p_import.add_argument(
+        "-y", "--yes", action="store_true", help="не спрашивать, даже если есть ручные правки"
+    )
     p_import.set_defaults(func=cmd_import)
 
     p_check = sub.add_parser("check", help="запустить проверки данных и обновить журнал проблем")
@@ -182,6 +252,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_sql.add_argument("query", help='SQL-запрос в кавычках, напр. "SELECT * FROM species"')
     p_sql.add_argument("--width", type=int, default=50, help="макс. ширина колонки (символов)")
     p_sql.set_defaults(func=cmd_sql)
+
+    p_link = sub.add_parser("link-trawl", help="привязать особь к тралению её же выезда")
+    p_link.add_argument("label", help='номер пробы, напр. "26 ph"')
+    p_link.add_argument("trawl_no", type=int, help="номер траления на этом выезде")
+    p_link.set_defaults(func=cmd_link_trawl)
+
+    p_ident = sub.add_parser(
+        "identify", help="добавить определение вида и сделать его текущим видом особи"
+    )
+    p_ident.add_argument("label", help='номер пробы, напр. "26 ph"')
+    p_ident.add_argument(
+        "species", help='вид из справочника, напр. "Pangasius elongatus"; «?» — не определён'
+    )
+    p_ident.add_argument("--method", choices=METHODS, required=True)
+    p_ident.add_argument("--confidence", choices=CONFIDENCES, required=True)
+    p_ident.add_argument("--by", help="кто определил")
+    p_ident.add_argument("--date", help="дата определения ГГГГ-ММ-ДД (по умолчанию сегодня)")
+    p_ident.add_argument("--notes", help="примечание, напр. номер в GenBank")
+    p_ident.set_defaults(func=cmd_identify)
+
+    p_resolve = sub.add_parser("resolve-issue", help="отметить проблему из журнала решённой")
+    p_resolve.add_argument("issue_id", type=int, help="номер проблемы (report issues)")
+    p_resolve.add_argument("resolution", help="как решили, в кавычках")
+    p_resolve.set_defaults(func=cmd_resolve_issue)
 
     return parser
 

@@ -101,7 +101,7 @@ def test_numbering_gaps_and_duplicates(small_db):
 def test_trawl_link_issue(small_db):
     add_specimen(small_db, "1 pc", None, None, None, None, trawl=None)
     issues = [i for i in find_issues(small_db) if i.category == "связь"]
-    assert [i.raw_value for i in issues] == ["особей без траления: 1"]
+    assert [i.sheet for i in issues] == ["Лист"]
     small_db.execute("UPDATE specimen SET trawling_id = 1")
     assert [i for i in find_issues(small_db) if i.category == "связь"] == []
 

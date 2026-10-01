@@ -1,6 +1,6 @@
 """Командная строка: python -m biobank <команда>.
 
-Команды добавляются по этапам: init, import, check.
+Команды добавляются по этапам: init, import, check, export, report, sql.
 """
 
 import argparse
@@ -11,7 +11,15 @@ from pathlib import Path
 from biobank.checks import run_checks, summary_by_category
 from biobank.db import DEFAULT_DB_PATH, connect, create_database, list_tables
 from biobank.excel_reader import ExcelReadError
+from biobank.export import export_csv, export_xlsx
 from biobank.importer import import_workbook
+from biobank.reports import (
+    REPORTS,
+    connect_read_only,
+    format_table,
+    render_report,
+    run_query,
+)
 
 
 def ask_yes_no(question: str) -> bool:
@@ -74,8 +82,63 @@ def cmd_check(args: argparse.Namespace) -> int:
     for r in rows:
         print(f"  {r['category']:<12} {r['open']:>8} {r['resolved']:>7} {r['total']:>6}")
     print()
-    print("Подробности: python -m biobank report issues  (этап 6) или")
-    print('  sqlite3 -box output/biobank.db "SELECT * FROM data_issue WHERE resolved = 0"')
+    print("Подробности: python -m biobank report issues")
+    return 0
+
+
+def _require_db(path: Path) -> bool:
+    if path.exists():
+        return True
+    print(f"Ошибка: базы нет: {path}. Сначала: python -m biobank import …", file=sys.stderr)
+    return False
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    if not _require_db(args.db):
+        return 1
+    if args.out is None:
+        args.out = args.db.parent / ("biobank.xlsx" if args.format == "xlsx" else "csv")
+    conn = connect_read_only(args.db)
+    try:
+        if args.format == "xlsx":
+            written = export_xlsx(conn, args.out)
+        else:
+            written = export_csv(conn, args.out)
+    finally:
+        conn.close()
+    print(f"Выгружено: {args.out}")
+    print(format_table(["лист / файл", "строк"], written))
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    if not _require_db(args.db):
+        return 1
+    conn = connect_read_only(args.db)
+    try:
+        print(render_report(conn, args.name, args.width))
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_sql(args: argparse.Namespace) -> int:
+    if not _require_db(args.db):
+        return 1
+    conn = connect_read_only(args.db)
+    try:
+        columns, rows = run_query(conn, args.query)
+    except sqlite3.Error as error:
+        # база открыта только на чтение — UPDATE/DELETE/INSERT тоже окажутся здесь
+        print(f"Ошибка SQL: {error}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    if not columns:
+        print("Запрос ничего не вернул.")
+        return 0
+    print(format_table(columns, rows, max_width=args.width))
+    print(f"строк: {len(rows)}")
     return 0
 
 
@@ -102,6 +165,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_check = sub.add_parser("check", help="запустить проверки данных и обновить журнал проблем")
     p_check.set_defaults(func=cmd_check)
+
+    p_export = sub.add_parser("export", help="выгрузить все таблицы и сводки в xlsx или csv")
+    p_export.add_argument("--format", choices=["xlsx", "csv"], default="xlsx")
+    p_export.add_argument(
+        "--out", type=Path, help="файл .xlsx или папка для csv (по умолчанию — в output/)"
+    )
+    p_export.set_defaults(func=cmd_export)
+
+    p_report = sub.add_parser("report", help="стандартный отчёт")
+    p_report.add_argument("name", choices=list(REPORTS), help="какой отчёт")
+    p_report.add_argument("--width", type=int, default=50, help="макс. ширина колонки")
+    p_report.set_defaults(func=cmd_report)
+
+    p_sql = sub.add_parser("sql", help="выполнить запрос только на чтение и напечатать результат")
+    p_sql.add_argument("query", help='SQL-запрос в кавычках, напр. "SELECT * FROM species"')
+    p_sql.add_argument("--width", type=int, default=50, help="макс. ширина колонки (символов)")
+    p_sql.set_defaults(func=cmd_sql)
 
     return parser
 

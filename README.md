@@ -10,6 +10,7 @@
 ![SQLite](https://img.shields.io/badge/SQLite-схема_v2-003B57?logo=sqlite&logoColor=white)
 ![pytest](https://img.shields.io/badge/тесты-pytest-0A9EDC?logo=pytest&logoColor=white)
 ![Ruff](https://img.shields.io/badge/стиль-ruff-D7FF64?logo=ruff&logoColor=black)
+![License: MIT](https://img.shields.io/badge/лицензия-MIT-green)
 
 [Возможности](#возможности) •
 [Схема данных](#схема-данных) •
@@ -332,3 +333,8 @@ ruff format .       # автоформатирование
 - Траления особей — восстановить по полевым журналам (`link-trawl`).
 - Позже: выгрузка в Darwin Core для GBIF; переход на PostgreSQL и веб-интерфейс
   для исследователей, не знающих SQL.
+
+## Лицензия
+
+Код — под лицензией [MIT](LICENSE). Полевые данные экспедиций в репозиторий не входят
+и этой лицензией не покрываются.

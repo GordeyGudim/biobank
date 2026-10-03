@@ -83,6 +83,7 @@ biobank/
 | `python -m biobank identify <label> <species> --method ДНК --confidence точно` | добавить запись в историю определений и обновить текущий вид особи |
 | `python -m biobank resolve-issue <id> "<как решили>"` | отметить проблему решённой |
 | `python -m biobank sql "<SELECT ...>"` | выполнить запрос только на чтение и красиво напечатать результат |
+| `python -m biobank show <label>` | карточка особи (`card.py`): все сведения из всех таблиц, только чтение |
 
 Правки (`link-trawl`, `identify`, `resolve-issue`) — только через проверенные функции в
 `edit.py`, в транзакции, с понятным сообщением об ошибке. Перед любой массовой правкой —

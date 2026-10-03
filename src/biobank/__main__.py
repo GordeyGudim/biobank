@@ -1,13 +1,15 @@
 """Командная строка: python -m biobank <команда>.
 
-Команды: init, import, check, export, report, sql, link-trawl, identify, resolve-issue.
+Команды: init, import, check, export, report, sql, show, link-trawl, identify, resolve-issue.
 """
 
 import argparse
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
 
+from biobank.card import render_card, specimen_card
 from biobank.checks import run_checks, summary_by_category
 from biobank.db import DEFAULT_DB_PATH, connect, create_database, list_tables
 from biobank.edit import (
@@ -112,6 +114,13 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def screen_width() -> int | None:
+    """Ширина окна терминала; None — если вывод идёт в файл (там переносить незачем)."""
+    if not sys.stdout.isatty():
+        return None
+    return shutil.get_terminal_size().columns
+
+
 def _require_db(path: Path) -> bool:
     if path.exists():
         return True
@@ -142,7 +151,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         return 1
     conn = connect_read_only(args.db)
     try:
-        print(render_report(conn, args.name, args.width))
+        print(render_report(conn, args.name, args.width, screen_width()))
     finally:
         conn.close()
     return 0
@@ -163,8 +172,23 @@ def cmd_sql(args: argparse.Namespace) -> int:
     if not columns:
         print("Запрос ничего не вернул.")
         return 0
-    print(format_table(columns, rows, max_width=args.width))
+    print(format_table(columns, rows, max_width=args.width, total_width=screen_width()))
     print(f"строк: {len(rows)}")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    if not _require_db(args.db):
+        return 1
+    conn = connect_read_only(args.db)
+    try:
+        sections = specimen_card(conn, args.label)
+    except EditError as error:  # особь не найдена
+        print(f"Ошибка: {error}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(render_card(sections, args.width, screen_width()))
     return 0
 
 
@@ -252,6 +276,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_sql.add_argument("query", help='SQL-запрос в кавычках, напр. "SELECT * FROM species"')
     p_sql.add_argument("--width", type=int, default=50, help="макс. ширина колонки (символов)")
     p_sql.set_defaults(func=cmd_sql)
+
+    p_show = sub.add_parser("show", help="карточка особи: всё о ней из всех таблиц")
+    p_show.add_argument("label", help='номер пробы, напр. "155 pc"')
+    p_show.add_argument(
+        "--width", type=int, default=1000, help="обрезать текст в ячейке до стольких символов"
+    )
+    p_show.set_defaults(func=cmd_show)
 
     p_link = sub.add_parser("link-trawl", help="привязать особь к тралению её же выезда")
     p_link.add_argument("label", help='номер пробы, напр. "26 ph"')

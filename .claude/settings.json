@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -m biobank sql:*)",
+      "Bash(.venv/bin/python -m biobank show:*)",
+      "Bash(.venv/bin/python -m biobank report:*)"
+    ]
+  }
+}

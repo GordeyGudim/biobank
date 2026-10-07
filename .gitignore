@@ -17,3 +17,6 @@ output/
 # Неопубликованные полевые данные и документы коллег — только локально, не в git
 data/
 docs/
+
+# Личные настройки Claude Code (общие — в .claude/settings.json)
+.claude/settings.local.json

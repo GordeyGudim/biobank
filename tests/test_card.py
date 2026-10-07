@@ -7,9 +7,8 @@ from conftest import SOURCE
 
 from biobank.__main__ import main
 from biobank.card import render_card, specimen_card
-from biobank.db import connect
+from biobank.db import connect, connect_read_only
 from biobank.edit import EditError, link_trawl
-from biobank.reports import connect_read_only
 
 pytestmark = pytest.mark.skipif(not SOURCE.exists(), reason="нет data/source.xlsx")
 

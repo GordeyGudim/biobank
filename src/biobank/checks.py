@@ -189,29 +189,54 @@ CHECKS = (check_measurements, check_suffix_species, check_numbering, check_trawl
 
 
 def collapse_issues(issues: list[Issue]) -> list[Issue]:
-    """Свернуть повторяющиеся проблемы: ≥ 4 одинаковых на листе → одна запись с перечнем."""
+    """Свернуть повторяющиеся проблемы: ≥ 4 одинаковых на листе → одна запись с перечнем.
+
+    Проблемы без листа Excel (записи, введённые не из Excel, и проверки всей базы)
+    не сворачиваются: «один лист» для них не означает «одно место в таблице».
+
+    Порядок сохраняется: запись без листа остаётся на своём месте, группа встаёт туда,
+    где была её первая запись. От порядка зависят номера (issue_id) в свежей базе —
+    на них ссылаются README и заметки пользователя.
+    """
     groups: dict[tuple, list[Issue]] = defaultdict(list)
+    # порядок вывода: отдельная проблема (Issue) или ключ группы (tuple)
+    order: list[Issue | tuple] = []
     for issue in issues:
-        groups[(issue.category, issue.sheet, issue.description, issue.table_name)].append(issue)
-    result = []
-    for (category, sheet, description, table), items in groups.items():
-        if len(items) < COLLAPSE_THRESHOLD:
-            result.extend(items)
+        if issue.sheet is None:
+            order.append(issue)
             continue
-        objects = ", ".join(i.object_label or i.cell or "?" for i in items)
-        cells = [i.cell for i in items if i.cell]
-        result.append(
-            Issue(
-                category,
-                f"{description} ({len(items)} шт.)",
-                sheet,
-                f"{cells[0]}…{cells[-1]}" if cells else None,
-                objects,
-                items[0].raw_value,
-                table,
-            )
-        )
+        key = (issue.category, issue.sheet, issue.description, issue.table_name)
+        if key not in groups:
+            order.append(key)
+        groups[key].append(issue)
+
+    result = []
+    for item in order:
+        if isinstance(item, Issue):
+            result.append(item)
+        else:
+            result.extend(_collapse_group(item, groups[item]))
     return result
+
+
+def _collapse_group(key: tuple, items: list[Issue]) -> list[Issue]:
+    """Группа одинаковых проблем листа: меньше порога — как есть, иначе одна запись."""
+    if len(items) < COLLAPSE_THRESHOLD:
+        return items
+    category, sheet, description, table = key
+    objects = ", ".join(i.object_label or i.cell or "?" for i in items)
+    cells = [i.cell for i in items if i.cell]
+    return [
+        Issue(
+            category,
+            f"{description} ({len(items)} шт.)",
+            sheet,
+            f"{cells[0]}…{cells[-1]}" if cells else None,
+            objects,
+            items[0].raw_value,
+            table,
+        )
+    ]
 
 
 def find_issues(conn: sqlite3.Connection) -> list[Issue]:
@@ -234,8 +259,17 @@ class CheckResult:
     closed: int  # были открыты, но больше не находятся
 
 
-def _key(category, sheet, object_label, raw_value, description) -> tuple:
-    return (category, sheet, object_label, raw_value, description)
+# Ключ проблемы: по нему повторный запуск узнаёт уже известную запись журнала.
+# table_name и record_id различают записи без листа Excel (например, два выезда,
+# введённые через веб, — у обоих source_sheet пустой).
+_KEY_COLUMNS = (
+    "category", "sheet_name", "object_label", "raw_value", "description", "table_name", "record_id",
+)  # fmt: skip
+
+
+def _issue_key(i: Issue) -> tuple:
+    return (i.category, i.sheet, i.object_label, i.raw_value, i.description, i.table_name,
+            i.record_id)  # fmt: skip
 
 
 def run_checks(conn: sqlite3.Connection, today: str | None = None) -> CheckResult:
@@ -243,19 +277,15 @@ def run_checks(conn: sqlite3.Connection, today: str | None = None) -> CheckResul
     today = today or dt.date.today().isoformat()
     found = find_issues(conn)
     existing = {}
-    for r in conn.execute(
-        "SELECT issue_id, category, sheet_name, object_label, raw_value, description, resolved "
-        "FROM data_issue"
-    ):
+    # список колонок — фиксированный текст из кода, не данные пользователя
+    for r in conn.execute(f"SELECT issue_id, resolved, {', '.join(_KEY_COLUMNS)} FROM data_issue"):
         if is_check_issue(r["description"]):
-            key = _key(r["category"], r["sheet_name"], r["object_label"], r["raw_value"],
-                       r["description"])  # fmt: skip
-            existing[key] = r
+            existing[tuple(r[c] for c in _KEY_COLUMNS)] = r
 
     added = known = 0
     found_keys = set()
     for i in found:
-        key = _key(i.category, i.sheet, i.object_label, i.raw_value, i.description)
+        key = _issue_key(i)
         found_keys.add(key)
         if key in existing:
             known += 1

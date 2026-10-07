@@ -10,28 +10,30 @@ import sys
 from pathlib import Path
 
 from biobank.card import render_card, specimen_card
-from biobank.checks import run_checks, summary_by_category
-from biobank.db import DEFAULT_DB_PATH, connect, create_database, list_tables
+from biobank.checks import summary_by_category
+from biobank.db import (
+    DEFAULT_DB_PATH,
+    backup_database,
+    connect,
+    connect_read_only,
+    create_database,
+    list_tables,
+)
 from biobank.edit import (
     CONFIDENCES,
     METHODS,
     EditError,
-    backup_database,
+    apply_edit,
+    check_database,
     identify,
     link_trawl,
-    manual_edits,
     resolve_issue,
 )
 from biobank.excel_reader import ExcelReadError
 from biobank.export import export_csv, export_xlsx
-from biobank.importer import import_workbook
-from biobank.reports import (
-    REPORTS,
-    connect_read_only,
-    format_table,
-    render_report,
-    run_query,
-)
+from biobank.importer import prepare_import
+from biobank.reports import REPORTS, render_report
+from biobank.tables import format_table, run_query
 
 
 def ask_yes_no(question: str) -> bool:
@@ -62,43 +64,59 @@ def cmd_import(args: argparse.Namespace) -> int:
     if not xlsx.exists():
         print(f"Ошибка: файл не найден: {xlsx}", file=sys.stderr)
         return 1
-    if args.db.exists():
-        conn = connect(args.db)
-        try:
-            edits = manual_edits(conn)
-        except sqlite3.Error:
-            edits = {}  # старая база другого формата — правок в ней искать негде
-        finally:
-            conn.close()
-        if edits:
-            print("ВНИМАНИЕ: импорт пересоздаёт базу из Excel, ручные правки пропадут:")
-            for name, n in edits.items():
-                print(f"  {name}: {n}")
-            if not args.yes and not ask_yes_no("Продолжить импорт?"):
-                print("Отменено, база не изменена.")
-                return 1
-            print(f"Резервная копия текущей базы: {backup_database(args.db)}")
     try:
-        summary = import_workbook(xlsx, args.db)
+        # новая база собирается во временном файле и сравнивается с текущей
+        prepared = prepare_import(xlsx, args.db)
     except (ExcelReadError, sqlite3.Error) as error:
         print(f"Ошибка импорта, база не изменена: {error}", file=sys.stderr)
         return 1
+    with prepared:  # при выходе временный файл удаляется, если базу не заменили
+        if prepared.needs_force:
+            if prepared.unreadable:
+                print(f"ВНИМАНИЕ: не удалось сравнить базу {args.db} с Excel:")
+                print(f"  {prepared.unreadable}")
+            else:
+                print(
+                    "ВНИМАНИЕ: текущая база отличается от Excel — данные, введённые или "
+                    "исправленные не через Excel, при импорте пропадут (число записей):"
+                )
+                for difference in prepared.differences:
+                    print(f"  {difference.describe()}")
+                print(
+                    "Изменённая запись считается и «только в базе», и «только в Excel». "
+                    "Если вы исправили сам Excel или обновили программу — это тоже различия."
+                )
+            if not args.force:
+                print(
+                    "Импорт отменён, база не изменена. Если базу действительно нужно пересоздать "
+                    "из Excel — повторите с --force (резервная копия будет сделана).",
+                    file=sys.stderr,
+                )
+                return 1
+            if not args.yes and not ask_yes_no("Пересоздать базу из Excel?"):
+                print("Отменено, база не изменена.")
+                return 1
+        if prepared.exists:
+            print(f"Резервная копия текущей базы: {backup_database(args.db)}")
+        prepared.replace_database()
 
     print(f"Импорт завершён: {args.db}")
-    width = max(len(name) for name in summary)
-    for table, count in summary.items():
+    width = max(len(name) for name in prepared.summary)
+    for table, count in prepared.summary.items():
         print(f"  {table:<{width}}  {count:>5}")
     return 0
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    if not args.db.exists():
-        print(f"Ошибка: базы нет: {args.db}. Сначала: python -m biobank import …", file=sys.stderr)
+    if not _require_db(args.db):
         return 1
-    conn = connect(args.db)
     try:
-        with conn:
-            result = run_checks(conn)
+        result = check_database(args.db)  # проверки в транзакции BEGIN IMMEDIATE
+    except EditError as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        return 1
+    conn = connect_read_only(args.db)
+    try:
         rows = summary_by_category(conn)
     finally:
         conn.close()
@@ -164,7 +182,10 @@ def cmd_sql(args: argparse.Namespace) -> int:
     try:
         columns, rows = run_query(conn, args.query)
     except sqlite3.Error as error:
-        # база открыта только на чтение — UPDATE/DELETE/INSERT тоже окажутся здесь
+        # подключение только на чтение: UPDATE/DELETE/INSERT, ATTACH, PRAGMA с записью
+        # SQLite отклоняет с ошибкой «not authorized» (VACUUM INTO — «authorization denied»)
+        if "authoriz" in str(error):
+            error = f"команда sql только читает данные, этот запрос запрещён ({error})"
         print(f"Ошибка SQL: {error}", file=sys.stderr)
         return 1
     finally:
@@ -183,7 +204,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     conn = connect_read_only(args.db)
     try:
         sections = specimen_card(conn, args.label)
-    except EditError as error:  # особь не найдена
+    except EditError as error:  # особь не найдена (NotFoundError)
         print(f"Ошибка: {error}", file=sys.stderr)
         return 1
     finally:
@@ -193,22 +214,15 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def _run_edit(args: argparse.Namespace, action) -> int:
-    """Общая обёртка правок: резервная копия → правка → отчёт."""
-    if not _require_db(args.db):
-        return 1
-    backup = backup_database(args.db)
-    conn = connect(args.db)
+    """Общая обёртка правок: apply_edit (резервная копия → правка) → отчёт."""
     try:
-        result = action(conn)
+        result = apply_edit(args.db, action)
     except EditError as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         print("База не изменена.", file=sys.stderr)
-        backup.unlink()  # правки не было — копия не нужна
         return 1
-    finally:
-        conn.close()
     print(result.message)
-    print(f"Резервная копия до правки: {backup}")
+    print(f"Резервная копия до правки: {result.backup}")
     if result.checks.added or result.checks.closed:
         print(f"Журнал проблем: новых {result.checks.added}, закрыто {result.checks.closed}.")
     return 0
@@ -253,7 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_import = sub.add_parser("import", help="пересоздать базу и импортировать книгу Excel")
     p_import.add_argument("xlsx", type=Path, help="путь к книге, напр. data/source.xlsx")
     p_import.add_argument(
-        "-y", "--yes", action="store_true", help="не спрашивать, даже если есть ручные правки"
+        "--force",
+        action="store_true",
+        help="пересоздать базу, даже если в ней есть записи не из Excel (они пропадут)",
+    )
+    p_import.add_argument(
+        "-y", "--yes", action="store_true", help="вместе с --force: не спрашивать подтверждение"
     )
     p_import.set_defaults(func=cmd_import)
 

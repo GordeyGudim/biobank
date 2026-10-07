@@ -10,8 +10,9 @@ import pytest
 from conftest import SOURCE, count
 
 from biobank.__main__ import main
-from biobank.db import connect
-from biobank.edit import EditError, backup_database, identify, link_trawl, resolve_issue
+from biobank.db import backup_database, connect, connect_read_only
+from biobank.edit import EditError, identify, link_trawl, resolve_issue
+from biobank.importer import compare_databases
 
 pytestmark = pytest.mark.skipif(not SOURCE.exists(), reason="нет data/source.xlsx")
 
@@ -265,22 +266,9 @@ def test_cli_identify_question_mark(edit_path):
 # ---------------------------------------------------------------------------
 
 
-def test_reimport_asks_when_edits_exist(edit_path, monkeypatch, capsys):
+def test_reimport_with_force_and_yes_makes_backup(edit_path, capsys):
     assert main(["--db", str(edit_path), "link-trawl", "5 pc", "3"]) == 0
-    monkeypatch.setattr("builtins.input", lambda _: "n")  # пользователь отвечает «нет»
-    assert main(["--db", str(edit_path), "import", str(SOURCE)]) == 1
-    out = capsys.readouterr().out
-    assert "особей привязано к тралениям: 1" in out
-    conn = connect(edit_path)
-    try:
-        assert trawl_of(conn, "5 pc") == 3  # правка на месте
-    finally:
-        conn.close()
-
-
-def test_reimport_with_yes_makes_backup(edit_path, capsys):
-    assert main(["--db", str(edit_path), "link-trawl", "5 pc", "3"]) == 0
-    assert main(["--db", str(edit_path), "import", str(SOURCE), "--yes"]) == 0
+    assert main(["--db", str(edit_path), "import", str(SOURCE), "--force", "--yes"]) == 0
     assert "Резервная копия текущей базы" in capsys.readouterr().out
     backups = sorted((edit_path.parent / "backups").iterdir())
     assert len(backups) == 2  # до правки и до импорта
@@ -291,14 +279,19 @@ def test_reimport_with_yes_makes_backup(edit_path, capsys):
         conn.close()
 
 
-def test_fresh_import_has_no_manual_edits(edit_db):
-    from biobank.edit import manual_edits
+def differences(conn, fresh_path):
+    """{таблица: (только в conn, только в свежем импорте)} — как видит защита import."""
+    fresh = connect_read_only(fresh_path)
+    try:
+        return {d.table: (d.only_old, d.only_new) for d in compare_databases(conn, fresh)}
+    finally:
+        fresh.close()
 
-    assert manual_edits(edit_db) == {}
+
+def test_fresh_import_has_nothing_not_from_excel(edit_db, db_path):
+    assert differences(edit_db, db_path) == {}
 
 
-def test_morphology_reidentification_counts_as_edit(edit_db):
-    from biobank.edit import manual_edits
-
+def test_morphology_reidentification_counts_as_edit(edit_db, db_path):
     identify(edit_db, "1 e", "Pangasius sp.", "морфология", "до рода")
-    assert manual_edits(edit_db) == {"определений вида добавлено": 1}
+    assert differences(edit_db, db_path)["species_identification"] == (1, 0)

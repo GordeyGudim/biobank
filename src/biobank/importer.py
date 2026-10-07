@@ -3,7 +3,9 @@
 Порядок:
 1. Прочитать книгу (excel_reader) — без базы.
 2. Создать новую базу во ВРЕМЕННОМ файле и записать всё в одной транзакции.
-3. Только если всё прошло успешно — заменить старый файл новым.
+3. Сравнить её со старой базой (prepare_import): если в старой есть данные не из
+   Excel, команда import откажется без --force.
+4. Только если всё прошло успешно — заменить старый файл новым.
 
 Так при ошибке старая база остаётся целой, а полузаписанной базы не бывает.
 
@@ -17,12 +19,18 @@ from __future__ import annotations
 import os
 import sqlite3
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from biobank.checks import collapse_issues, run_checks
-from biobank.db import DEFAULT_DB_PATH, SCHEMA_PATH, connect, create_database
+from biobank.db import (
+    DEFAULT_DB_PATH,
+    connect,
+    connect_read_only,
+    create_database,
+    list_tables,
+)
 from biobank.excel_reader import (
     CoordinateEntry,
     ExpeditionData,
@@ -263,10 +271,13 @@ def _event_site(ctx: ImportContext, sheet: SheetData, region_id: int) -> int:
 
     if method == "рынок":
         city = market_city(sheet.name)
-        return _site_id(
-            ctx, site_type, f"Рынок {city.name}", None, None,
-            _city_id(ctx, region_id, city), source,
-        )  # fmt: skip
+        if city is None:
+            sheet.issues.append(
+                Issue("место", "В имени листа рынка не указан город — место названо по листу",
+                      sheet.name, None, None, sheet.name, "sampling_site")
+            )  # fmt: skip
+        name = f"Рынок {city.name}" if city else f"Рынок (город не указан, {source})"
+        return _site_id(ctx, site_type, name, None, None, _city_id(ctx, region_id, city), source)
 
     if method == "траление":
         first = _first_trawl_point(sheet)
@@ -733,8 +744,10 @@ def _import_specimens(ctx: ImportContext, sheet: SheetData, event_id: int, event
             for lab in dict.fromkeys(labs):  # без повторов, порядок сохраняется
                 ctx.insert("sample_shipment", sample_id=sample_id, lab_id=ctx.lab_ids[lab])
 
+        # проблемы этой особи; особь без номера excel_reader называет «ХХ»
+        own_label = spec.label.label if spec.label else "ХХ"
         for issue in sheet.issues:
-            if issue.table_name == "specimen" and issue.object_label in (label, "ХХ"):
+            if issue.table_name == "specimen" and issue.object_label == own_label:
                 issue.record_id = issue.record_id or specimen_id
 
 
@@ -758,7 +771,7 @@ def _write_issues(ctx: ImportContext) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Точка входа
+# Сборка новой базы во временном файле
 # ---------------------------------------------------------------------------
 
 SUMMARY_TABLES = (
@@ -769,19 +782,14 @@ SUMMARY_TABLES = (
 )  # fmt: skip
 
 
-def import_workbook(
-    xlsx_path: Path | str,
-    db_path: Path | str = DEFAULT_DB_PATH,
-    schema_path: Path | str = SCHEMA_PATH,
-) -> dict[str, int]:
-    """Пересоздать базу и импортировать книгу. Вернуть {таблица: число строк}."""
-    db_path = Path(db_path)
-    expeditions = read_workbook(xlsx_path)
+def _build_database(expeditions: list[ExpeditionData], path: Path) -> dict[str, int]:
+    """Создать базу в файле path и записать в неё книгу. Вернуть {таблица: число строк}.
 
-    tmp_path = db_path.with_name(db_path.name + ".tmp")
-    tmp_path.unlink(missing_ok=True)
-    create_database(tmp_path, schema_path)
-    conn = connect(tmp_path)
+    При ошибке файл удаляется — полузаписанной базы не остаётся.
+    """
+    path.unlink(missing_ok=True)
+    create_database(path)
+    conn = connect(path)
     try:
         with conn:  # одна транзакция на весь импорт
             ctx = ImportContext(conn)
@@ -789,14 +797,219 @@ def import_workbook(
             _import_expeditions(ctx, expeditions)
             _write_issues(ctx)
             run_checks(conn)  # в новой базе закрывать нечего — результат не зависит от даты
+        # имена таблиц — из кода (SUMMARY_TABLES), не от пользователя
         summary = {
             table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             for table in SUMMARY_TABLES
         }
     except Exception:
         conn.close()
-        tmp_path.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
         raise
     conn.close()
-    os.replace(tmp_path, db_path)  # атомарная замена: старая база исчезает только сейчас
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Защита: импорт пересоздаёт базу — не стереть то, чего нет в Excel
+# ---------------------------------------------------------------------------
+#
+# Как узнать, что в базе есть данные не из Excel? Собрать новую базу из Excel
+# (это всё равно нужно для импорта) и сравнить со старой ПО СОДЕРЖИМОМУ: каждая
+# запись — набор значений колонок без собственного номера (id). Номер не
+# сравниваем: он ничего не говорит о данных (у записей журнала проблем номера
+# могут отличаться, хотя содержание то же). Ссылки на другие таблицы (event_id,
+# specimen_id…) сравниваем — импорт нумерует записи всегда в одном порядке.
+#
+# Записи сравниваются как мультимножества (collections.Counter — «словарь
+# запись → сколько раз встречается»): две одинаковые строки считаются двумя.
+# - запись есть только в старой базе → её добавили или изменили не через Excel,
+#   при импорте она ПРОПАДЁТ;
+# - запись есть только в новой базе → её удалили или изменили в старой базе,
+#   импорт вернёт её из Excel.
+# Изменённая запись попадает в обе группы: старая версия пропадёт, версия из Excel вернётся.
+
+TABLE_TITLES = {
+    "region": "провинции",
+    "city": "города",
+    "sampling_site": "места",
+    "capture_method": "способы получения",
+    "gear": "сети",
+    "species": "виды",
+    "lab": "лаборатории",
+    "expedition": "экспедиции",
+    "sampling_event": "выезды",
+    "trawling": "траления",
+    "water_measurement": "замеры воды",
+    "specimen": "особи",
+    "species_identification": "определения вида",
+    "sample": "образцы",
+    "sample_shipment": "отправки образцов",
+    "analysis": "результаты анализов",
+    "catch_record": "прилов",
+    "data_issue": "журнал проблем",
+}
+
+
+@dataclass
+class TableDifference:
+    """Чем таблица в текущей базе отличается от свежего импорта Excel."""
+
+    table: str
+    only_old: int  # записей только в текущей базе: пропадут при импорте
+    only_new: int  # записей только в Excel: удалены или изменены в базе, импорт их вернёт
+
+    def describe(self) -> str:
+        """Строка для человека: «особи (specimen): 1 — только в текущей базе (пропадут)»."""
+        parts = []
+        if self.only_old:
+            parts.append(f"{self.only_old} — только в текущей базе (пропадут при импорте)")
+        if self.only_new:
+            parts.append(f"{self.only_new} — только в Excel (удалены или изменены в базе)")
+        return f"{TABLE_TITLES.get(self.table, self.table)} ({self.table}): " + "; ".join(parts)
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """Колонки таблицы без собственного номера записи (одиночный INTEGER PRIMARY KEY).
+
+    Составной ключ (sample_shipment: sample_id + lab_id) — это ссылки, их сравниваем.
+    """
+    rows = conn.execute(
+        "SELECT name, pk FROM pragma_table_info(?) ORDER BY cid", (table,)
+    ).fetchall()
+    key_columns = [r["name"] for r in rows if r["pk"]]
+    own_id = key_columns[0] if len(key_columns) == 1 else None
+    return [r["name"] for r in rows if r["name"] != own_id]
+
+
+def _records(conn: sqlite3.Connection, table: str, columns: list[str]) -> Counter:
+    # имена таблицы и колонок — из схемы базы (sqlite_master), а не от пользователя
+    sql = f"SELECT {', '.join(columns)} FROM {table}"
+    return Counter(tuple(row) for row in conn.execute(sql))
+
+
+def compare_databases(old: sqlite3.Connection, new: sqlite3.Connection) -> list[TableDifference]:
+    """Сравнить две базы по содержимому (см. пояснение выше). Пустой список — совпадают.
+
+    Если у баз разная структура (нет таблицы, другие колонки) — sqlite3.DatabaseError:
+    сравнивать нечего, такую базу импорт без --force не заменяет.
+    """
+    old_tables, new_tables = set(list_tables(old)), set(list_tables(new))
+    if old_tables != new_tables:
+        names = ", ".join(sorted(old_tables ^ new_tables))
+        raise sqlite3.DatabaseError(
+            f"структура базы отличается от db/schema.sql (таблицы: {names})"
+        )
+    differences = []
+    for table in sorted(new_tables):
+        columns = _columns(new, table)
+        if _columns(old, table) != columns:
+            raise sqlite3.DatabaseError(f"структура таблицы {table} отличается от db/schema.sql")
+        old_records, new_records = _records(old, table, columns), _records(new, table, columns)
+        only_old = sum((old_records - new_records).values())
+        only_new = sum((new_records - old_records).values())
+        if only_old or only_new:
+            differences.append(TableDifference(table, only_old, only_new))
+    return differences
+
+
+@dataclass
+class PreparedImport:
+    """Новая база уже собрана во временном файле; старая ещё не тронута.
+
+    Дальше вызывающий код решает (CLI спрашивает, веб покажет кнопку):
+    replace_database() — заменить старую базу новой, discard() — отказаться.
+    Удобнее всего через with: при выходе временный файл удаляется сам.
+    """
+
+    db_path: Path  # рабочая база
+    new_path: Path  # новая база из Excel (временный файл рядом с рабочей)
+    summary: dict[str, int]  # сколько чего загружено
+    exists: bool  # рабочая база уже есть — перед заменой нужна резервная копия
+    differences: list[TableDifference] = field(default_factory=list)
+    unreadable: str | None = None  # текущую базу не удалось сравнить: текст ошибки
+
+    @property
+    def needs_force(self) -> bool:
+        """Заменять базу можно только с явным согласием (--force в CLI)."""
+        return bool(self.differences) or self.unreadable is not None
+
+    def replace_database(self) -> None:
+        """Атомарно заменить рабочую базу новой: старая исчезает только в этот момент."""
+        os.replace(self.new_path, self.db_path)
+
+    def discard(self) -> None:
+        """Удалить временный файл (после replace_database его уже нет — это не ошибка)."""
+        self.new_path.unlink(missing_ok=True)
+
+    def __enter__(self) -> PreparedImport:
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.discard()
+
+
+def prepare_import(
+    xlsx_path: Path | str,
+    db_path: Path | str = DEFAULT_DB_PATH,
+    compare: bool = True,
+) -> PreparedImport:
+    """Прочитать книгу, собрать новую базу во временном файле и сравнить с текущей.
+
+    Текущая база не меняется. Что видно при сравнении (compare=True):
+    - любая запись, добавленная, удалённая или изменённая не через Excel, в любой
+      таблице — в том числе исправленное значение в записи из Excel (TL особи)
+      и вручную закрытая проблема журнала;
+    Что НЕ видно:
+    - ПОЧЕМУ записи отличаются: ручная правка, исправленный Excel или новая версия
+      программы импорта выглядят одинаково — в любом случае нужен --force;
+    - правки, сделанные после сравнения и до замены файла (окно — доли секунды;
+      во время импорта с базой никто не должен работать).
+    """
+    db_path = Path(db_path)
+    expeditions = read_workbook(xlsx_path)
+    new_path = db_path.with_name(db_path.name + ".tmp")
+    summary = _build_database(expeditions, new_path)
+    prepared = PreparedImport(db_path, new_path, summary, exists=db_path.exists())
+    if not (compare and prepared.exists):
+        return prepared
+    try:
+        prepared.differences = _compare_files(db_path, new_path)
+    except sqlite3.Error as error:  # не база SQLite или другая схема
+        prepared.unreadable = str(error)
+    except BaseException:
+        prepared.discard()
+        raise
+    return prepared
+
+
+def _compare_files(old_path: Path, new_path: Path) -> list[TableDifference]:
+    """compare_databases для двух файлов; обе базы открываются только на чтение."""
+    new = connect_read_only(new_path)
+    try:
+        old = connect_read_only(old_path)
+        try:
+            return compare_databases(old, new)
+        finally:
+            old.close()
+    finally:
+        new.close()
+
+
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
+
+
+def import_workbook(
+    xlsx_path: Path | str,
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> dict[str, int]:
+    """Пересоздать базу и импортировать книгу. Вернуть {таблица: число строк}.
+
+    Старая база заменяется БЕЗ проверки и без вопросов. Команда import вместо этого
+    вызывает prepare_import(), смотрит differences и делает резервную копию.
+    """
+    with prepare_import(xlsx_path, db_path, compare=False) as prepared:
+        prepared.replace_database()
+    return prepared.summary

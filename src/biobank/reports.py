@@ -1,4 +1,4 @@
-"""Стандартные отчёты и печать таблиц в терминале.
+"""Стандартные отчёты (команда `report`) и сводные запросы для выгрузки.
 
 Каждый отчёт — это SQL-запрос. Их удобно читать как учебные примеры:
 JOIN (соединение таблиц по ключу), GROUP BY (группировка), агрегаты count/avg.
@@ -9,9 +9,8 @@ JOIN (соединение таблиц по ключу), GROUP BY (группи
 from __future__ import annotations
 
 import sqlite3
-import textwrap
-from collections.abc import Sequence
-from pathlib import Path
+
+from biobank.tables import CardSection, query_section, render_sections
 
 # ---------------------------------------------------------------------------
 # Сводные запросы: «плоские» таблицы, удобные для просмотра в Excel
@@ -217,148 +216,17 @@ REPORTS: dict[str, list[tuple[str, str]]] = {
 
 
 # ---------------------------------------------------------------------------
-# Печать таблицы в терминале
+# Отчёт как данные (для веба) и как текст (для терминала)
 # ---------------------------------------------------------------------------
 
 
-def _cell_text(value, max_width: int) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, float):
-        text = f"{value:.10g}"  # 10 значащих цифр: координаты не обрезаются
-    else:
-        text = " ".join(str(value).split())
-    return text if len(text) <= max_width else text[: max_width - 1] + "…"
-
-
-MIN_COLUMN_WIDTH = 8  # уже этого текстовые колонки не сжимаем
-
-
-def _fit_widths(
-    widths: list[int], numeric: list, total_width: int, longest_words: list[int]
-) -> list[int]:
-    """Сжать текстовые колонки, чтобы таблица поместилась в total_width символов.
-
-    Каждый раз отнимаем по символу у самой широкой текстовой колонки.
-    Сначала — не уже самого длинного слова в колонке (слова не режутся),
-    если не хватило — до MIN_COLUMN_WIDTH. Числа не сжимаем.
-    Если не помещается даже так — печатаем как есть.
-    """
-    widths = list(widths)
-    frame = 3 * len(widths) + 1  # «│ » в начале, « │ » между колонками, « │» в конце
-    for limits in (longest_words, [0] * len(widths)):
-        while sum(widths) + frame > total_width:
-            shrinkable = [
-                i
-                for i, w in enumerate(widths)
-                if not numeric[i] and w > max(MIN_COLUMN_WIDTH, limits[i])
-            ]
-            if not shrinkable:
-                break
-            widest = max(shrinkable, key=lambda i: widths[i])
-            widths[widest] -= 1
-    return widths
-
-
-def format_table(
-    columns: Sequence[str],
-    rows: Sequence[Sequence],
-    max_width: int = 50,
-    total_width: int | None = None,
-) -> str:
-    """Таблица с рамкой из символов, как `sqlite3 -box`.
-
-    total_width — ширина экрана: если таблица шире, текстовые колонки сужаются,
-    а длинный текст переносится на следующую строку внутри ячейки.
-
-    >>> print(format_table(["вид", "n"], [("Plotosus canius", 173), ("?", 2)]))
-    ┌─────────────────┬─────┐
-    │ вид             │   n │
-    ├─────────────────┼─────┤
-    │ Plotosus canius │ 173 │
-    │ ?               │   2 │
-    └─────────────────┴─────┘
-    >>> print(format_table(["вид", "n"], [("Plotosus canius", 173)], total_width=18))
-    ┌──────────┬─────┐
-    │ вид      │   n │
-    ├──────────┼─────┤
-    │ Plotosus │ 173 │
-    │ canius   │     │
-    └──────────┴─────┘
-    """
-    texts = [[_cell_text(v, max_width) for v in row] for row in rows]
-    widths = [len(c) for c in columns]
-    for row in texts:
-        widths = [max(w, len(t)) for w, t in zip(widths, row, strict=True)]
-    # числа выравниваем вправо, текст — влево
-    numeric = [
-        all(isinstance(row[i], (int, float)) or row[i] is None for row in rows) and rows
-        for i in range(len(columns))
-    ]
-    if total_width:
-        longest_words = [
-            max(
-                len(word)
-                for text in [col, *(row[i] for row in texts)]
-                for word in [*text.split(), ""]
-            )
-            for i, col in enumerate(columns)
-        ]
-        widths = _fit_widths(widths, numeric, total_width, longest_words)
-
-    def line(cells):
-        # textwrap.wrap режет текст на куски не длиннее w (по пробелам, если можно);
-        # ячейка становится многострочной, высота строки — по самой высокой ячейке
-        wrapped = [
-            textwrap.wrap(c, w) or [""] if len(c) > w else [c]
-            for c, w in zip(cells, widths, strict=True)
-        ]
-        height = max(len(parts) for parts in wrapped)
-        out = []
-        for k in range(height):
-            parts = [
-                (p[k] if k < len(p) else "").rjust(w) if num
-                else (p[k] if k < len(p) else "").ljust(w)
-                for p, w, num in zip(wrapped, widths, numeric, strict=True)
-            ]  # fmt: skip
-            out.append("│ " + " │ ".join(parts) + " │")
-        return "\n".join(out)
-
-    def border(left, mid, right):
-        return left + mid.join("─" * (w + 2) for w in widths) + right
-
-    out = [border("┌", "┬", "┐"), line(columns), border("├", "┼", "┤")]
-    out += [line(row) for row in texts]
-    out.append(border("└", "┴", "┘"))
-    return "\n".join(out)
-
-
-def run_query(conn: sqlite3.Connection, sql: str, params: Sequence = ()) -> tuple[list, list]:
-    """Выполнить запрос; вернуть (имена колонок, строки)."""
-    cursor = conn.execute(sql, params)
-    columns = [d[0] for d in cursor.description] if cursor.description else []
-    return columns, cursor.fetchall()
+def report_tables(conn: sqlite3.Connection, name: str) -> list[CardSection]:
+    """Разделы отчёта: по одному на запрос из REPORTS[name]."""
+    return [query_section(conn, title, sql, empty_text="(пусто)") for title, sql in REPORTS[name]]
 
 
 def render_report(
     conn: sqlite3.Connection, name: str, max_width: int = 50, total_width: int | None = None
 ) -> str:
     """Текст отчёта для печати."""
-    parts = []
-    for title, sql in REPORTS[name]:
-        columns, rows = run_query(conn, sql)
-        parts.append(f"{title} (строк: {len(rows)})")
-        parts.append(format_table(columns, rows, max_width, total_width) if rows else "  (пусто)")
-    return "\n\n".join(parts)
-
-
-def connect_read_only(db_path) -> sqlite3.Connection:
-    """Подключение только на чтение: любая попытка изменить данные даст ошибку.
-
-    mode=ro — режим SQLite «read only», задаётся в адресе файла (URI).
-    """
-    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return render_sections(report_tables(conn, name), max_width, total_width)

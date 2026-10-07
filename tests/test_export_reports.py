@@ -7,8 +7,10 @@ import pytest
 from conftest import SOURCE, count
 
 from biobank.__main__ import main
+from biobank.db import connect_read_only
 from biobank.export import ISSUES_SHEET, export_csv, export_xlsx
-from biobank.reports import REPORTS, connect_read_only, render_report, run_query
+from biobank.reports import REPORTS, render_report
+from biobank.tables import run_query
 
 pytestmark = pytest.mark.skipif(not SOURCE.exists(), reason="нет data/source.xlsx")
 
@@ -106,7 +108,7 @@ def test_sql_select(db_path, capsys):
 )
 def test_sql_refuses_to_write(db_path, capsys, query):
     assert main(["--db", str(db_path), "sql", query]) == 1
-    assert "readonly" in capsys.readouterr().err
+    assert "только читает данные" in capsys.readouterr().err
     conn = connect_read_only(db_path)
     try:
         assert count(conn, "SELECT count(*) FROM species") == 8

@@ -1,7 +1,7 @@
 """Карточка особи: всё, что известно об одной рыбе, из всех таблиц сразу.
 
-specimen_card() возвращает список разделов (CardSection) — данные без оформления,
-их сможет показать и будущий веб-интерфейс. render_card() печатает их в терминале.
+specimen_card() возвращает список разделов (CardSection из tables.py) — данные без
+оформления, их сможет показать и будущий веб-интерфейс. render_card() печатает их в терминале.
 
 Разделы: особь (промеры, вид, выезд, место), история определений, образцы и
 лаборатории, результаты анализов, вода, проблемы из журнала data_issue.
@@ -10,20 +10,9 @@ specimen_card() возвращает список разделов (CardSection)
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
 
 from biobank.edit import find_specimen
-from biobank.reports import format_table, run_query
-
-
-@dataclass
-class CardSection:
-    title: str
-    columns: list[str]
-    rows: list[tuple]
-    empty_text: str = "(нет)"
-    note: str | None = None
-
+from biobank.tables import CardSection, query_section, render_sections
 
 # Основные сведения. coalesce(a, b) — первое не-NULL: свой способ/место особи,
 # если записаны, иначе — как у выезда.
@@ -149,73 +138,50 @@ def _main_section(s: sqlite3.Row) -> CardSection:
         ("примечания", s["notes"]),
         ("строка в Excel", s["source_row"]),
     ]
-    return CardSection("Особь", ["поле", "значение"], [(k, v) for k, v in fields])
+    return CardSection("Особь", ["поле", "значение"], fields, is_fields=True)
 
 
 def _water_section(conn: sqlite3.Connection, s: sqlite3.Row) -> CardSection:
+    # {where} — один из двух фиксированных фрагментов кода, значения — через «?»
     if s["trawling_id"] is not None:
-        columns, rows = run_query(
-            conn, WATER_SQL.format(where="w.trawling_id = ?"), (s["trawling_id"],)
-        )
-        title, note = f"Вода: траление {s['trawl_no']}", None
+        title = f"Вода: траление {s['trawl_no']}"
+        where, value = "w.trawling_id = ?", s["trawling_id"]
     else:
-        columns, rows = run_query(conn, WATER_SQL.format(where="w.event_id = ?"), (s["event_id"],))
         title = "Вода: все замеры выезда"
-        note = None
-        if s["event_method"] == "траление":
-            note = "Траление особи неизвестно — рыба поймана в одном из этих тралений."
-        if s["own_method"]:
-            note = (
-                f"Особь получена не так, как выезд ({s['own_method']}) — "
-                "замеры выезда могут к ней не относиться."
-            )
-    return CardSection(title, columns, [tuple(r) for r in rows], "(замеров нет)", note)
+        where, value = "w.event_id = ?", s["event_id"]
+    section = query_section(conn, title, WATER_SQL.format(where=where), (value,), "(замеров нет)")
+    if s["trawling_id"] is None and s["event_method"] == "траление":
+        section.note = "Траление особи неизвестно — рыба поймана в одном из этих тралений."
+    if s["trawling_id"] is None and s["own_method"]:
+        section.note = (
+            f"Особь получена не так, как выезд ({s['own_method']}) — "
+            "замеры выезда могут к ней не относиться."
+        )
+    return section
 
 
 def specimen_card(conn: sqlite3.Connection, label: str) -> list[CardSection]:
     """Все сведения об особи по номеру пробы ('155 pc', '155pc', '26 ph').
 
-    Если особи нет — EditError с подсказкой похожих номеров (из find_specimen).
+    Если особи нет — NotFoundError с подсказкой похожих номеров (из find_specimen).
     """
     found = find_specimen(conn, label)
     s = conn.execute(SPECIMEN_SQL, (found["specimen_id"],)).fetchone()
-    sid = s["specimen_id"]
-
-    def section(title, sql, empty_text="(нет)"):
-        columns, rows = run_query(conn, sql, (sid,))
-        return CardSection(title, columns, [tuple(r) for r in rows], empty_text)
-
+    sid = (s["specimen_id"],)
     # именованные параметры (:label) — значения подставляются из словаря
-    issue_columns, issues = run_query(
-        conn, ISSUES_SQL, {"specimen_id": sid, "label": s["label"], "event_id": s["event_id"]}
-    )
+    issue_params = {"specimen_id": s["specimen_id"], "label": s["label"], "event_id": s["event_id"]}
     return [
         _main_section(s),
-        section("История определений вида", IDENTIFICATIONS_SQL),
-        section("Образцы", SAMPLES_SQL),
-        section("Результаты анализов", ANALYSES_SQL, "(пока нет)"),
+        query_section(conn, "История определений вида", IDENTIFICATIONS_SQL, sid),
+        query_section(conn, "Образцы", SAMPLES_SQL, sid),
+        query_section(conn, "Результаты анализов", ANALYSES_SQL, sid, "(пока нет)"),
         _water_section(conn, s),
-        CardSection(
-            "Проблемы в журнале (особь и её выезд)", issue_columns, [tuple(r) for r in issues]
-        ),
+        query_section(conn, "Проблемы в журнале (особь и её выезд)", ISSUES_SQL, issue_params),
     ]
 
 
 def render_card(
     sections: list[CardSection], max_width: int = 1000, total_width: int | None = None
 ) -> str:
-    """Текст карточки для печати в терминале.
-
-    total_width — ширина экрана; длинный текст переносится внутри ячеек.
-    """
-    parts = []
-    for sec in sections:
-        lines = [sec.title if sec.title == "Особь" else f"{sec.title} (строк: {len(sec.rows)})"]
-        if sec.note:
-            lines.append(f"  {sec.note}")
-        if sec.rows:
-            lines.append(format_table(sec.columns, sec.rows, max_width, total_width))
-        else:
-            lines.append(f"  {sec.empty_text}")
-        parts.append("\n".join(lines))
-    return "\n\n".join(parts)
+    """Текст карточки для печати в терминале (total_width — ширина экрана)."""
+    return render_sections(sections, max_width, total_width)

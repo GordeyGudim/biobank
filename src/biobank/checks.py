@@ -23,9 +23,25 @@ from dataclasses import dataclass
 
 from biobank.excel_reader import Issue
 
-# Границы коэффициента упитанности K = 100·m / TL³ (у рыб обычно 0,4–1,0)
-CONDITION_MIN, CONDITION_MAX = 0.2, 5.0
-SL_MIN_SHARE = 0.6  # SL меньше 60 % TL — подозрительно мало
+
+@dataclass(frozen=True)
+class MeasurementLimits:
+    """Пороги мягких проверок промеров.
+
+    Сейчас в базе только рыбы (и креветки, к которым применяются те же пороги),
+    поэтому один набор FISH_LIMITS на всех. Для других таксонов (решённый вопрос 9)
+    передавайте свой набор в measurement_problems(..., limits=…).
+    """
+
+    # Границы коэффициента упитанности K = 100·m / TL³ (у рыб обычно 0,4–1,0)
+    condition_min: float = 0.2
+    condition_max: float = 5.0
+    sl_min_share: float = 0.6  # SL меньше 60 % TL — подозрительно мало
+
+
+FISH_LIMITS = MeasurementLimits()
+CONDITION_MIN, CONDITION_MAX = FISH_LIMITS.condition_min, FISH_LIMITS.condition_max
+SL_MIN_SHARE = FISH_LIMITS.sl_min_share
 
 DESC_SL_GT_TL = "SL больше TL"
 DESC_SL_TOO_SMALL = "SL слишком мала для такой TL"
@@ -61,31 +77,66 @@ _SPECIMEN_SQL = """
 """
 
 
+def measurement_problems(
+    tl: float | None,
+    sl: float | None,
+    m: float | None,
+    mg: float | None,
+    limits: MeasurementLimits = FISH_LIMITS,
+) -> list[str]:
+    """Мягкие проблемы промеров одной особи — тексты описаний (DESC_…).
+
+    Чистая функция: её вызывают и проверка базы (check_measurements),
+    и проверка при вводе (entry.validate_specimen) — пороги в одном месте.
+    Пустой промер (None) — не ошибка: у целой особи промеров может не быть.
+
+    >>> measurement_problems(30.0, 27.0, 150.0, 140.0)
+    []
+    >>> measurement_problems(10.2, 10.3, 11.0, 8.6)
+    ['SL больше TL']
+    >>> measurement_problems(22.0, 20.4, 28.0, 34.0)
+    ['Масса без внутренних органов больше полной массы']
+    """
+    problems = []
+    if tl and sl and sl > tl:
+        problems.append(DESC_SL_GT_TL)
+    elif tl and sl and sl < limits.sl_min_share * tl:
+        problems.append(DESC_SL_TOO_SMALL)
+    if m is not None and mg is not None and mg > m:
+        problems.append(DESC_GUTTED_GT_MASS)
+    if tl and m is not None and m == tl and (mg is None or mg == sl):
+        problems.append(DESC_COPIED)
+    if tl and m:
+        k = 100 * m / tl**3
+        if not limits.condition_min <= k <= limits.condition_max:
+            problems.append(DESC_CONDITION)
+    return problems
+
+
+def suffix_mismatch(suffix: str, species_code: str | None) -> bool:
+    """Суффикс номера пробы противоречит коду вида.
+
+    Суффикс 'sp' и номер без суффикса ничего не утверждают о виде — это не ошибка.
+
+    >>> suffix_mismatch("pc", "pc"), suffix_mismatch("sp", "e"), suffix_mismatch("", "ph")
+    (False, False, False)
+    >>> suffix_mismatch("ph", "pc"), suffix_mismatch("e", None)
+    (True, True)
+    """
+    return suffix not in ("sp", "") and suffix != species_code
+
+
 def check_measurements(conn: sqlite3.Connection) -> list[Issue]:
     """Промеры: SL и TL, массы, согласованность длины и массы."""
     issues = []
     for r in conn.execute(_SPECIMEN_SQL):
         tl, sl, m, mg = r["tl_cm"], r["sl_cm"], r["mass_g"], r["mass_gutted_g"]
         values = f"TL {_fmt(tl)}, SL {_fmt(sl)}, m {_fmt(m)}, m без внутр. {_fmt(mg)}"
-
-        def add(description, *, _r=r, _values=values):
+        for description in measurement_problems(tl, sl, m, mg):
             issues.append(
-                Issue("промеры", description, _r["source_sheet"], None, _r["label"],
-                      _values, "specimen", _r["specimen_id"])
+                Issue("промеры", description, r["source_sheet"], None, r["label"],
+                      values, "specimen", r["specimen_id"])
             )  # fmt: skip
-
-        if tl and sl and sl > tl:
-            add(DESC_SL_GT_TL)
-        elif tl and sl and sl < SL_MIN_SHARE * tl:
-            add(DESC_SL_TOO_SMALL)
-        if m is not None and mg is not None and mg > m:
-            add(DESC_GUTTED_GT_MASS)
-        if tl and m is not None and m == tl and (mg is None or mg == sl):
-            add(DESC_COPIED)
-        if tl and m:
-            k = 100 * m / tl**3
-            if not CONDITION_MIN <= k <= CONDITION_MAX:
-                add(DESC_CONDITION)
     return issues
 
 
@@ -107,7 +158,7 @@ def check_suffix_species(conn: sqlite3.Connection) -> list[Issue]:
     )
     issues = []
     for r in rows:
-        if r["suffix"] in ("sp", "") or r["suffix"] == r["code"]:
+        if not suffix_mismatch(r["suffix"], r["code"]):
             continue
         issues.append(
             Issue("вид", DESC_SUFFIX, r["source_sheet"], None, r["label"],

@@ -70,14 +70,21 @@
 
 ## Этап 4. Ввод данных учёными [B], затем [F]
 
-- Функции создания: `create_expedition`, `create_site` + `find_nearby_sites`,
-  `create_event`, `add_trawling`, `add_water_measurement`, `next_label`,
-  `create_specimen` (сразу с первым определением вида), `update_measurements`,
-  `add_sample`, `ship_sample`, `add_analysis`, `create_catch_record`.
-- Проверки при вводе — одна функция `validate_specimen`, общая с `check_measurements`:
-  **жёсткие** (сохранить нельзя: TL ≤ 0, чужое траление) и **мягкие** (сохранить после
-  подтверждения + запись в `data_issue`: SL > TL, суффикс не совпадает с видом…).
+- ✓ (2026-10-07, только рыбы, текущая схема) Функции создания в `entry.py`:
+  `create_expedition`, `create_site` + `find_nearby_sites`, `create_event`, `add_trawling`,
+  `add_water_measurement`, `next_label`, `create_specimen` (сразу с первым определением вида),
+  `update_measurements`, `add_sample`, `ship_sample`, `add_analysis`, `create_catch_record`;
+  команды CLI `add-…`, `next-label`, `ship-sample`, `update-measurements`; тесты `tests/test_entry.py`.
+- ✓ Проверки при вводе — `entry.validate_specimen`, общая с `check_measurements`
+  (`checks.measurement_problems`, `suffix_mismatch`, пороги — `MeasurementLimits`):
+  **жёсткие** (сохранить нельзя: TL ≤ 0, чужое траление, занятая метка) и **мягкие**
+  (сохраняется + запись в `data_issue`: SL > TL, суффикс не совпадает с видом…).
+  В CLI мягкие сохраняются сразу с «Внимание: …»; «сохранить после подтверждения» — в форме [F]
+  (вызвать `validate_specimen` до сохранения).
 - Формы ввода (выезд, траление и вода, особь, образцы) с двумя уровнями ошибок.
+- Не сделано: правка и удаление уже введённых выездов, тралений, замеров, образцов
+  (только `update_measurements`); `browse.py` (этап 2) — чтобы в формах выбирать
+  экспедицию / место / выезд из списка, а не вводить номер.
 
 ## Новые проверки в checks.py [B]
 

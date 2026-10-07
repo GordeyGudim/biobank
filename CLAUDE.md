@@ -98,6 +98,10 @@ biobank/
 | `python -m biobank resolve-issue <id> "<как решили>"` | отметить проблему решённой |
 | `python -m biobank sql "<SELECT ...>"` | выполнить запрос только на чтение и красиво напечатать результат |
 | `python -m biobank show <label>` | карточка особи (`card.py`): все сведения из всех таблиц, только чтение |
+| `python -m biobank add-expedition`, `add-site`, `add-event`, `add-trawling`, `add-water` | ввод экспедиции, места (без дублей ближе 200 м), выезда, траления, замера воды (`entry.py`) |
+| `python -m biobank next-label <суффикс>` | следующий свободный номер пробы в серии (только чтение) |
+| `python -m biobank add-specimen`, `update-measurements` | новая особь с первым определением вида; исправление промеров |
+| `python -m biobank add-sample`, `ship-sample`, `add-analysis`, `add-catch` | образец, отправка в лабораторию, результат анализа, прилов |
 
 Правки (`link-trawl`, `identify`, `resolve-issue`) — только через проверенные функции в
 `edit.py`, в транзакции, с понятным сообщением об ошибке. Перед любой массовой правкой —

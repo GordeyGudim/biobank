@@ -20,7 +20,7 @@ import re
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from biobank.checks import CheckResult, run_checks
@@ -44,6 +44,9 @@ class EditResult:
     message: str
     checks: CheckResult
     backup: Path | None = None  # резервная копия до правки (заполняет apply_edit)
+    record_id: int | None = None  # id созданной записи (функции ввода из entry.py)
+    # мягкие предупреждения: запись сохранена, проблема — в журнале data_issue
+    warnings: list[str] = field(default_factory=list)
 
 
 @contextmanager
@@ -128,6 +131,15 @@ def check_database(db_path: Path | str) -> CheckResult:
 # ---------------------------------------------------------------------------
 
 
+def event_title(source_sheet: str | None, event_id: int, event_date: str | None) -> str:
+    """Как назвать выезд в сообщении: лист Excel или номер (у выездов, введённых вручную).
+
+    >>> event_title("Точка 1", 1, "2025-09-25"), event_title(None, 25, "2026-11-05")
+    ('«Точка 1»', '№25 от 2026-11-05')
+    """
+    return f"«{source_sheet}»" if source_sheet else f"№{event_id} от {event_date}"
+
+
 def find_specimen(conn: sqlite3.Connection, label: str) -> sqlite3.Row:
     """Особь по номеру пробы; номер нормализуется так же, как при импорте ('26ph' → '26 ph')."""
     parsed = parse_label(label)
@@ -188,16 +200,13 @@ def link_trawl(conn: sqlite3.Connection, label: str, trawl_no: int) -> EditResul
             "SELECT trawling_id, trawl_no FROM trawling WHERE event_id = ? ORDER BY trawl_no",
             (specimen["event_id"],),
         ).fetchall()
+        event = event_title(specimen["source_sheet"], specimen["event_id"], specimen["event_date"])
         if not trawls:
-            raise EditError(
-                f"У выезда «{specimen['source_sheet']}» ({specimen['event_date']}) нет тралений."
-            )
+            raise EditError(f"У выезда {event} ({specimen['event_date']}) нет тралений.")
         trawl = next((t for t in trawls if t["trawl_no"] == trawl_no), None)
         if trawl is None:
             numbers = ", ".join(str(t["trawl_no"]) for t in trawls)
-            raise EditError(
-                f"На выезде «{specimen['source_sheet']}» нет траления {trawl_no}. Есть: {numbers}."
-            )
+            raise EditError(f"На выезде {event} нет траления {trawl_no}. Есть: {numbers}.")
 
         previous = specimen["trawling_id"]
         conn.execute(
@@ -212,16 +221,16 @@ def link_trawl(conn: sqlite3.Connection, label: str, trawl_no: int) -> EditResul
     else:
         old = next(t["trawl_no"] for t in trawls if t["trawling_id"] == previous)
         message = f"Особь {specimen['label']}: траление {old} → {trawl_no}"
-    return EditResult(f"{message} (выезд «{specimen['source_sheet']}»).", checks)
+    return EditResult(f"{message} (выезд {event}).", checks)
 
 
 def _words(name: str) -> list[str]:
     return name.lower().replace(".", " ").split()
 
 
-def _find_species(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
+def find_species(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
     """Вид из справочника: полное название или сокращение рода ('P. elongatus')."""
-    rows = conn.execute("SELECT species_id, scientific_name FROM species").fetchall()
+    rows = conn.execute("SELECT species_id, scientific_name, code FROM species").fetchall()
     wanted = _words(name)
     for row in rows:
         if _words(row["scientific_name"]) == wanted:
@@ -288,7 +297,7 @@ def identify(
         if species_name is None:
             species_id, species_text = None, "(не определён)"
         else:
-            species = _find_species(conn, species_name)
+            species = find_species(conn, species_name)
             species_id, species_text = species["species_id"], species["scientific_name"]
         old = conn.execute(
             "SELECT scientific_name FROM species WHERE species_id = ?", (specimen["species_id"],)

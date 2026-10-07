@@ -1,6 +1,8 @@
 """Командная строка: python -m biobank <команда>.
 
-Команды: init, import, check, export, report, sql, show, link-trawl, identify, resolve-issue.
+Команды: init, import, check, export, report, sql, show, link-trawl, identify, resolve-issue;
+ввод новых данных (entry.py): add-expedition, add-site, add-event, add-trawling, add-water,
+next-label, add-specimen, update-measurements, add-sample, ship-sample, add-analysis, add-catch.
 """
 
 import argparse
@@ -28,6 +30,24 @@ from biobank.edit import (
     identify,
     link_trawl,
     resolve_issue,
+)
+from biobank.entry import (
+    POINT_TYPES,
+    SAMPLE_TYPES,
+    SEXES,
+    SITE_TYPES,
+    add_analysis,
+    add_sample,
+    add_trawling,
+    add_water_measurement,
+    create_catch_record,
+    create_event,
+    create_expedition,
+    create_site,
+    create_specimen,
+    next_label,
+    ship_sample,
+    update_measurements,
 )
 from biobank.excel_reader import ExcelReadError
 from biobank.export import export_csv, export_xlsx
@@ -222,6 +242,8 @@ def _run_edit(args: argparse.Namespace, action) -> int:
         print("База не изменена.", file=sys.stderr)
         return 1
     print(result.message)
+    for warning in result.warnings:
+        print(f"Внимание: {warning}")
     print(f"Резервная копия до правки: {result.backup}")
     if result.checks.added or result.checks.closed:
         print(f"Журнал проблем: новых {result.checks.added}, закрыто {result.checks.closed}.")
@@ -245,6 +267,270 @@ def cmd_identify(args: argparse.Namespace) -> int:
 
 def cmd_resolve_issue(args: argparse.Namespace) -> int:
     return _run_edit(args, lambda conn: resolve_issue(conn, args.issue_id, args.resolution))
+
+
+# --- Ввод новых данных (entry.py) --------------------------------------------
+
+
+def cmd_add_expedition(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args, lambda conn: create_expedition(conn, args.name, args.start, args.end, args.notes)
+    )
+
+
+def cmd_add_site(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args,
+        lambda conn: create_site(
+            conn, args.site_type, name=args.name, lat=args.lat, lon=args.lon, city=args.city,
+            region=args.region, description=args.description, new_region=args.new_region,
+            allow_nearby=args.new,
+        ),
+    )  # fmt: skip
+
+
+def cmd_add_event(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args,
+        lambda conn: create_event(
+            conn, args.expedition_id, args.site_id, args.date, args.method,
+            gear_mesh=args.mesh, gear_size=args.size, notes=args.notes,
+        ),
+    )  # fmt: skip
+
+
+def cmd_add_trawling(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args,
+        lambda conn: add_trawling(
+            conn, args.event_id, args.trawl_no, time_start=args.start, time_end=args.end,
+            duration_min=args.duration, speed_kmh=args.speed, intermediate_depth_m=args.depth,
+            catch_note=args.catch, notes=args.notes,
+        ),
+    )  # fmt: skip
+
+
+def cmd_add_water(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args,
+        lambda conn: add_water_measurement(
+            conn, args.event_id, args.point_type, args.trawl, measured_time=args.time,
+            coord_source=args.source, garmin_wp=args.wp, notes=args.notes,
+            lat=args.lat, lon=args.lon, depth_m=args.depth, o2_pct=args.o2, ppm=args.ppm,
+            conductivity_ms=args.ms, conductivity_us=args.us, ph=args.ph,
+            water_temp_c=args.temp,
+        ),
+    )  # fmt: skip
+
+
+def cmd_next_label(args: argparse.Namespace) -> int:
+    if not _require_db(args.db):
+        return 1
+    conn = connect_read_only(args.db)
+    try:
+        print(next_label(conn, "" if args.suffix == "-" else args.suffix))
+    except EditError as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_add_specimen(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args,
+        lambda conn: create_specimen(
+            conn, args.event_id, args.species, args.label, confidence=args.confidence,
+            tl_cm=args.tl, sl_cm=args.sl, mass_g=args.mass, mass_gutted_g=args.gutted,
+            sex=args.sex, is_dead=args.dead, trawl_no=args.trawl, capture_method=args.method,
+            capture_site_id=args.site, capture_date=args.date, identified_by=args.by,
+            notes=args.notes,
+        ),
+    )  # fmt: skip
+
+
+def cmd_update_measurements(args: argparse.Namespace) -> int:
+    # передаём только указанные промеры; «-» — стереть значение
+    given = {"tl_cm": args.tl, "sl_cm": args.sl, "mass_g": args.mass, "mass_gutted_g": args.gutted}
+    changes = {column: value for column, value in given.items() if value is not None}
+    return _run_edit(args, lambda conn: update_measurements(conn, args.label, **changes))
+
+
+def cmd_add_sample(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args,
+        lambda conn: add_sample(
+            conn, args.label, args.sample_type, organ=args.organ, sample_label=args.tag,
+            preservative=args.preservative, notes=args.notes, labs=args.lab,
+        ),
+    )  # fmt: skip
+
+
+def cmd_ship_sample(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args,
+        lambda conn: ship_sample(conn, args.sample_id, args.lab, args.date, new_lab=args.new_lab),
+    )
+
+
+def cmd_add_analysis(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args,
+        lambda conn: add_analysis(
+            conn, args.sample_id, args.analysis_type, lab=args.lab, analysed_on=args.date,
+            method=args.method, result=args.result, accession=args.accession, notes=args.notes,
+        ),
+    )  # fmt: skip
+
+
+def cmd_add_catch(args: argparse.Namespace) -> int:
+    return _run_edit(
+        args,
+        lambda conn: create_catch_record(
+            conn, args.event_id, raw_text=args.text, taxon_text=args.taxon, count_n=args.count,
+            mass_g=args.mass, trawl_no=args.trawl,
+        ),
+    )  # fmt: skip
+
+
+def _add_entry_parsers(sub) -> None:
+    """Команды ввода новых данных. Числа можно писать с запятой: 29,3."""
+    p = sub.add_parser("add-expedition", help="новая экспедиция")
+    p.add_argument("name", help='название, напр. "Кантхо 2027"')
+    p.add_argument("--start", help="дата начала ГГГГ-ММ-ДД (иначе — по первому выезду)")
+    p.add_argument("--end", help="дата окончания ГГГГ-ММ-ДД")
+    p.add_argument("--notes", help="примечание")
+    p.set_defaults(func=cmd_add_expedition)
+
+    p = sub.add_parser("add-site", help="новое место (не создаёт дубль места ближе 200 м)")
+    p.add_argument("site_type", choices=SITE_TYPES, help="тип места")
+    p.add_argument("--name", help="название (по умолчанию «Участок у <город>», «Рынок <город>»…)")
+    p.add_argument("--lat", help="широта, напр. 10.0452")
+    p.add_argument("--lon", help="долгота, напр. 105.7469")
+    p.add_argument("--city", help="город")
+    p.add_argument("--region", help="провинция города (из справочника region)")
+    p.add_argument("--description", help="описание места")
+    p.add_argument("--new-region", action="store_true", help="провинции нет — создать")
+    p.add_argument("--new", action="store_true", help="рядом есть похожее место, но это другое")
+    p.set_defaults(func=cmd_add_site)
+
+    p = sub.add_parser("add-event", help="новый выезд (день в одном месте)")
+    p.add_argument("expedition_id", type=int, help="номер экспедиции (expedition_id)")
+    p.add_argument("site_id", type=int, help="номер места (site_id)")
+    p.add_argument("date", help="дата выезда ГГГГ-ММ-ДД или ДД.ММ.ГГГГ")
+    p.add_argument("method", help="способ получения: траление, рыбак, рынок, аквахозяйство")
+    p.add_argument("--mesh", help='сеть: размер ячеи, см, напр. "3,5x3,5" (только траление)')
+    p.add_argument("--size", help='сеть: размер, м, напр. "6,5x12"')
+    p.add_argument("--notes", help="примечание")
+    p.set_defaults(func=cmd_add_event)
+
+    p = sub.add_parser("add-trawling", help="траление выезда")
+    p.add_argument("event_id", type=int, help="номер выезда (event_id)")
+    p.add_argument("trawl_no", type=int, help="номер траления в этот день")
+    p.add_argument("--start", help="время старта ЧЧ:ММ")
+    p.add_argument("--end", help="время финиша ЧЧ:ММ")
+    p.add_argument("--duration", help="длительность, мин")
+    p.add_argument("--speed", help="скорость, км/ч")
+    p.add_argument("--depth", help="промежуточная глубина, м")
+    p.add_argument("--catch", help='что поймали, напр. "2 plotosus", "трал пустой"')
+    p.add_argument("--notes", help="примечание (берег, заводы…)")
+    p.set_defaults(func=cmd_add_trawling)
+
+    p = sub.add_parser("add-water", help="замер воды: старт/финиш траления или точка")
+    p.add_argument("event_id", type=int, help="номер выезда (event_id)")
+    p.add_argument("point_type", choices=POINT_TYPES, help="старт, финиш или точка")
+    p.add_argument("--trawl", type=int, help="номер траления (для старта и финиша)")
+    p.add_argument("--time", help="время замера ЧЧ:ММ")
+    p.add_argument("--lat", help="широта")
+    p.add_argument("--lon", help="долгота")
+    p.add_argument("--source", help="источник координат: Garmin или Google Maps")
+    p.add_argument("--wp", help="№ точки на приборе Garmin")
+    p.add_argument("--depth", help="глубина, м")
+    p.add_argument("--o2", help="O2, %%")
+    p.add_argument("--ppm", help="ppm")
+    p.add_argument("--ms", help="электропроводность, mS")
+    p.add_argument("--us", help="электропроводность, uS")
+    p.add_argument("--ph", help="pH")
+    p.add_argument("--temp", help="температура воды, °C")
+    p.add_argument("--notes", help='примечание, напр. "hanna – 4,45"')
+    p.set_defaults(func=cmd_add_water)
+
+    p = sub.add_parser("next-label", help="следующий свободный номер пробы в серии")
+    p.add_argument(
+        "suffix", help="суффикс: pc, ph, e, sp, mc, Bg, mr; «-» — Pangasius без суффикса"
+    )
+    p.set_defaults(func=cmd_next_label)
+
+    p = sub.add_parser("add-specimen", help="новая особь (сразу с определением вида)")
+    p.add_argument("event_id", type=int, help="номер выезда (event_id)")
+    p.add_argument(
+        "species", help='вид, напр. "Plotosus canius", "P. elongatus"; «?» — не определён'
+    )
+    p.add_argument(
+        "--label", help='номер пробы, напр. "179 pc" (по умолчанию — следующий свободный)'
+    )
+    p.add_argument("--confidence", choices=CONFIDENCES, help="по умолчанию: точно (sp. — до рода)")
+    p.add_argument("--tl", help="TL, см")
+    p.add_argument("--sl", help="SL, см")
+    p.add_argument("--mass", help="m, г")
+    p.add_argument("--gutted", help="m без внутренних органов, г")
+    p.add_argument("--sex", choices=SEXES)
+    p.add_argument("--dead", action="store_true", help="особь мёртвая")
+    p.add_argument("--trawl", type=int, help="номер траления этого выезда, если известен")
+    p.add_argument("--method", help="способ получения, если отличается от выезда (напр. рыбак)")
+    p.add_argument("--site", type=int, help="место поимки (site_id), если отличается от выезда")
+    p.add_argument("--date", help="дата поимки, если отличается от даты выезда")
+    p.add_argument("--by", help="кто определил вид")
+    p.add_argument("--notes", help="примечание")
+    p.set_defaults(func=cmd_add_specimen)
+
+    p = sub.add_parser("update-measurements", help="исправить промеры особи («-» — стереть)")
+    p.add_argument("label", help='номер пробы, напр. "160"')
+    p.add_argument("--tl", help="TL, см")
+    p.add_argument("--sl", help="SL, см")
+    p.add_argument("--mass", help="m, г")
+    p.add_argument("--gutted", help="m без внутренних органов, г")
+    p.set_defaults(func=cmd_update_measurements)
+
+    p = sub.add_parser("add-sample", help="образец особи (пробирка, стекло, целая особь)")
+    p.add_argument("label", help='номер пробы особи, напр. "179 pc"')
+    p.add_argument("sample_type", choices=SAMPLE_TYPES, help="тип образца")
+    p.add_argument("--organ", help="орган: печень, почки, икра, жабры, мышцы…")
+    p.add_argument("--tag", help='метка образца, напр. "179 pc a" (по умолчанию — номер особи)')
+    p.add_argument("--preservative", help='фиксация, напр. "этанол 96%%", "формалин 10%%"')
+    p.add_argument("--lab", action="append", default=[], help="куда отправлен (можно несколько)")
+    p.add_argument("--notes", help="примечание")
+    p.set_defaults(func=cmd_add_sample)
+
+    p = sub.add_parser("ship-sample", help="отметить отправку образца в лабораторию")
+    p.add_argument(
+        "sample_id", type=int, help="номер образца (sample_id, есть в выводе add-sample)"
+    )
+    p.add_argument("lab", help='лаборатория, напр. "Россия", "Тропцентр"')
+    p.add_argument("--date", help="дата отправки ГГГГ-ММ-ДД")
+    p.add_argument("--new-lab", action="store_true", help="лаборатории нет — создать")
+    p.set_defaults(func=cmd_ship_sample)
+
+    p = sub.add_parser("add-analysis", help="результат исследования образца")
+    p.add_argument("sample_id", type=int, help="номер образца (sample_id)")
+    p.add_argument("analysis_type", help='вид анализа, напр. "секвенирование COI"')
+    p.add_argument("--lab", help="лаборатория")
+    p.add_argument("--date", help="дата анализа ГГГГ-ММ-ДД")
+    p.add_argument("--method", help="методика")
+    p.add_argument("--result", help="результат")
+    p.add_argument("--accession", help="номер в GenBank и т.п.")
+    p.add_argument("--notes", help="примечание")
+    p.set_defaults(func=cmd_add_analysis)
+
+    p = sub.add_parser("add-catch", help="прилов / общий улов выезда или траления")
+    p.add_argument("event_id", type=int, help="номер выезда (event_id)")
+    p.add_argument("--text", help='запись как в журнале, напр. "arius maculatus - 39 шт"')
+    p.add_argument("--taxon", help="кто пойман")
+    p.add_argument("--count", help="сколько штук")
+    p.add_argument("--mass", help="масса, г")
+    p.add_argument("--trawl", type=int, help="номер траления этого выезда")
+    p.set_defaults(func=cmd_add_catch)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -327,6 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_resolve.add_argument("resolution", help="как решили, в кавычках")
     p_resolve.set_defaults(func=cmd_resolve_issue)
 
+    _add_entry_parsers(sub)
     return parser
 
 

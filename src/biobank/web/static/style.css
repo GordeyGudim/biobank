@@ -79,7 +79,7 @@ table.fields th { background: var(--head); white-space: nowrap; width: 1%; }
 
 /* --- формы --- */
 label { display: block; font-weight: 600; margin-bottom: 0.2rem; }
-input[type="text"], input[type="search"] {
+input[type="text"], input[type="search"], input[type="date"], select, textarea {
   font: inherit;
   padding: 0.35rem 0.5rem;
   border: 1px solid #9aa5b1;
@@ -116,8 +116,50 @@ td.action { min-width: 16rem; }
 
 .links li { margin: 0.3rem 0; }
 
+/* скрыть подпись глазами, но оставить для программ чтения с экрана */
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap;
+}
+
+/* поиск в шапке */
+.top .search-top { margin: 0 0 0 auto; flex-wrap: nowrap; }
+.top .search-top input { width: 12rem; border-color: #fff; }
+.top .search-top button { background: #fff; color: var(--accent); }
+
+/* --- фильтры списков --- */
+.filters {
+  display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.6rem 1rem;
+  padding: 0.75rem; margin-bottom: 1rem;
+  background: var(--head); border-radius: 4px;
+}
+.filters select, .filters input[type="search"] { min-width: 10rem; max-width: 22rem; }
+.filters .check { display: flex; align-items: center; gap: 0.4rem; }
+.filters .check label, .radios label { display: inline; font-weight: normal; margin: 0 0.8rem 0 0.2rem; }
+.filters .buttons { display: flex; align-items: center; gap: 0.8rem; }
+.radios { border: 0; padding: 0; margin: 0; }
+.radios legend { font-weight: 600; padding: 0; margin-bottom: 0.2rem; }
+.count { margin: 0.25rem 0 0.5rem; }
+td.num { text-align: right; white-space: nowrap; }
+td.nowrap { white-space: nowrap; }
+a.warn { background: var(--warn-bg); padding: 0 0.4rem; border-radius: 4px; font-weight: 600; }
+.pager { display: flex; gap: 1rem; align-items: center; margin: 0.75rem 0; }
+.flash-warn { background: var(--warn-bg); }
+.htmx-request .results, .results.htmx-request { opacity: 0.6; } /* идёт загрузка */
+
+/* --- формы правки в карточке --- */
+.edit-form { border: 1px solid var(--line); border-radius: 4px; padding: 0.5rem 0.75rem; margin: 0.5rem 0; }
+.edit-form summary { cursor: pointer; font-weight: 600; color: var(--accent); }
+.edit-form form { margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.4rem; align-items: flex-start; }
+.edit-form .grid { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; }
+.edit-form textarea { width: 100%; max-width: 40rem; }
+select[aria-invalid="true"] { border-color: var(--error); }
+
 @media (max-width: 600px) {
   main { padding: 0.5rem; }
   .search input { width: 100%; }
+  .top .search-top { margin: 0; width: 100%; }
+  .top .search-top input { width: 100%; }
+  .filters > div, .filters select, .filters input[type="search"] { width: 100%; max-width: none; }
   table { font-size: 0.85rem; }
 }

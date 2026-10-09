@@ -1,5 +1,5 @@
 {#- Макрос — «функция» шаблона: таблица раздела (CardSection) пишется один раз,
-    а используется в карточке особи, отчётах и журнале. -#}
+    а используется в карточках особи, выезда, места и в отчётах. -#}
 
 {#- Значение ячейки: пустое (NULL) — серый прочерк «—» с подсказкой, а не пустота. -#}
 {% macro value(v) -%}
@@ -8,11 +8,17 @@
   {%- else -%}{{ text }}{%- endif -%}
 {%- endmacro %}
 
+{#- Ячейка: значение, а если для неё есть адрес — ссылка. -#}
+{% macro linked(v, url) -%}
+  {%- if url -%}<a href="{{ url }}">{{ value(v) }}</a>{%- else -%}{{ value(v) }}{%- endif -%}
+{%- endmacro %}
+
 {#- Раздел: заголовок, пояснение, таблица. Все колонки показываются, даже пустые
-    (решение пользователя: у всех особей одинаковый вид, сразу видно, что не заполнено).
-    issue_links — первая колонка «id» ведёт в журнал проблем. -#}
-{% macro section_table(sec, issue_links=false) %}
-<section class="section">
+    (решение пользователя: у всех записей одинаковый вид, сразу видно, что не заполнено).
+    view — SectionView (views.py): раздел + адреса ссылок и якоря строк. -#}
+{% macro section_table(view, html_id=none) %}
+{% set sec = view.section %}
+<section class="section"{% if html_id %} id="{{ html_id }}"{% endif %}>
   <h2>{{ sec.title }}{% if not sec.is_fields %} <small>(строк: {{ sec.rows | length }})</small>{% endif %}</h2>
   {% if sec.note %}<p class="note">{{ sec.note }}</p>{% endif %}
   {% if sec.rows %}
@@ -20,7 +26,7 @@
     {% if sec.is_fields %}
     <table class="fields">
       {% for name, v in sec.rows %}
-      <tr><th scope="row">{{ name }}</th><td>{{ value(v) }}</td></tr>
+      <tr><th scope="row">{{ name }}</th><td>{{ linked(v, view.links[loop.index0].get(1)) }}</td></tr>
       {% endfor %}
     </table>
     {% else %}
@@ -28,14 +34,10 @@
       <thead><tr>{% for col in sec.columns %}<th scope="col">{{ col }}</th>{% endfor %}</tr></thead>
       <tbody>
       {% for row in sec.rows %}
-        <tr>
-        {% for v in row %}
-          {% if issue_links and sec.columns[loop.index0] == "id" %}
-          <td><a href="{{ url_for('issues', _anchor='issue-' ~ v) }}" title="открыть в журнале проблем">№{{ v }}</a></td>
-          {% else %}
-          <td>{{ value(v) }}</td>
-          {% endif %}
-        {% endfor %}
+        {% set links = view.links[loop.index0] %}
+        {% set anchor = view.anchors[loop.index0] %}
+        <tr{% if anchor %} id="{{ anchor }}"{% endif %}>
+        {% for v in row %}<td>{{ linked(v, links.get(loop.index0)) }}</td>{% endfor %}
         </tr>
       {% endfor %}
       </tbody>
@@ -46,4 +48,28 @@
   <p class="empty">{{ sec.empty_text }}</p>
   {% endif %}
 </section>
+{% endmacro %}
+
+{#- Постраничная навигация. p — browse.Page; args — фильтры из адреса (без page).
+    Ссылки обычные (работают без JavaScript); с HTMX они подгружают только блок #results
+    и меняют адрес в строке браузера (hx-push-url), чтобы «Назад» и «поделиться» работали. -#}
+{% macro pager(p, endpoint, args) %}
+{% if p.pages > 1 %}
+<nav class="pager" aria-label="Страницы">
+  {% if p.page > 1 %}
+    {% set url = url_for(endpoint, page=p.page - 1, **args) %}
+    <a href="{{ url }}" hx-get="{{ url }}" hx-target="#results" hx-swap="outerHTML" hx-push-url="true" rel="prev">← назад</a>
+  {% endif %}
+  <span>страница {{ p.page }} из {{ p.pages }}</span>
+  {% if p.page < p.pages %}
+    {% set url = url_for(endpoint, page=p.page + 1, **args) %}
+    <a href="{{ url }}" hx-get="{{ url }}" hx-target="#results" hx-swap="outerHTML" hx-push-url="true" rel="next">вперёд →</a>
+  {% endif %}
+</nav>
+{% endif %}
+{% endmacro %}
+
+{#- Предупреждения о непонятых фильтрах в адресе. -#}
+{% macro warnings(items) %}
+{% for w in items %}<p class="flash flash-warn" role="status">{{ w }}</p>{% endfor %}
 {% endmacro %}

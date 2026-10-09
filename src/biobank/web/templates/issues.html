@@ -4,30 +4,28 @@
 <h1>Журнал проблем</h1>
 <p>Спорные значения в базе не исправляются молча — они записаны здесь. Когда проблема
   разобрана, напишите, как решили, и нажмите «Решено». Резервная копия базы делается перед
-  каждой записью.</p>
-{% from "_macros.html" import value %}
-<section class="section">
-  <h2>{{ section.title }} <small>(строк: {{ section.rows | length }})</small></h2>
-  {% if section.rows %}
-  <div class="table-wrap">
-    <table class="issues">
-      <thead><tr>
-        {% for col in section.columns %}<th scope="col">{{ col }}</th>{% endfor %}
-        <th scope="col">решение</th>
-      </tr></thead>
-      <tbody>
-      {% for row in section.rows %}
-        {% set issue_id = row[id_index] %}
-        <tr id="issue-{{ issue_id }}">
-          {% for v in row %}<td>{{ value(v) }}</td>{% endfor %}
-          <td class="action">{% include "_resolve_form.html" %}</td>
-        </tr>
+  каждой записью. Решённые проблемы не пропадают — они видны с фильтром «решённые».</p>
+{#- Фильтры — как в списке особей: GET (в адресе), HTMX обновляет только таблицу #results. -#}
+<form class="filters" method="get" action="{{ url_for('issues') }}"
+      hx-get="{{ url_for('issues') }}" hx-target="#results" hx-swap="outerHTML"
+      hx-push-url="true" hx-sync="this:replace" hx-trigger="change, submit">
+  <div>
+    <label for="f-category">Категория</label>
+    <select id="f-category" name="category">
+      <option value="">все</option>
+      {% for c in categories %}
+      <option value="{{ c.category }}"{% if query.text('category') == c.category %} selected{% endif %}>{{ c.category }} (открытых {{ c.open }} из {{ c.total }})</option>
       {% endfor %}
-      </tbody>
-    </table>
+    </select>
   </div>
-  {% else %}
-  <p class="empty">{{ section.empty_text }}</p>
-  {% endif %}
-</section>
+  <fieldset class="radios">
+    <legend>Показать</legend>
+    {% for key, title in statuses.items() %}
+    <input id="f-status-{{ key }}" type="radio" name="status" value="{{ key }}"{% if query.text('status') == key %} checked{% endif %}>
+    <label for="f-status-{{ key }}">{{ title }}</label>
+    {% endfor %}
+  </fieldset>
+  <div class="buttons"><button type="submit">Показать</button></div>
+</form>
+{% include "_issues_results.html" %}
 {% endblock %}

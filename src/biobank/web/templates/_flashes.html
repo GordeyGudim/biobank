@@ -1,0 +1,6 @@
+{#- Сообщения после записи (flash): «Особь … привязана к тралению 3». Показываются один раз. -#}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, message in messages %}
+    <p class="flash flash-{{ category }}" role="status">{{ message }}</p>
+  {% endfor %}
+{% endwith %}

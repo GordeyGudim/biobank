@@ -1,0 +1,33 @@
+{#- Форма «Привязать к тралению»: траления выезда особи (browse.event_trawls) → edit.link_trawl.
+
+    <details> — раскрывающийся блок: форма видна по щелчку, после ошибки — сразу открыта.
+    Метод POST: запись только кнопкой. С HTMX (hx-post) ответ сервера — вся карточка,
+    hx-select="#card" берёт из него только карточку и заменяет ею старую.
+    hx-sync="this:drop" и hx-disabled-elt — защита от двойного нажатия, как у «Решено».
+    Без JavaScript: обычный POST → redirect на карточку. -#}
+{% set action = url_for('specimen_link_trawl', label=label) %}
+<details class="edit-form"{% if link_error %} open{% endif %}>
+  <summary>Привязать к тралению</summary>
+  {% if trawls %}
+  <form method="post" action="{{ action }}" hx-post="{{ action }}"
+        hx-target="#card" hx-select="#card" hx-swap="outerHTML"
+        hx-sync="this:drop" hx-disabled-elt="find button, find select">
+    <p class="small">Траление в полевой таблице не записано. Привязывайте, только если оно
+      точно известно (например, из полевого журнала). Можно выбрать траления только этого выезда.</p>
+    <label for="trawl_no">Траление выезда</label>
+    <select id="trawl_no" name="trawl_no" required
+            {% if link_error %}aria-invalid="true" aria-describedby="link-error"{% endif %}>
+      <option value="">— выберите —</option>
+      {% for t in trawls %}
+      {% set chosen = (form.trawl_no | string == t.trawl_no | string) if form.trawl_no else (ids.trawling_id == t.trawling_id) %}
+      <option value="{{ t.trawl_no }}"{% if chosen %} selected{% endif %}>№{{ t.trawl_no }}{% if t.time_start %}, {{ t.time_start }}–{{ t.time_end or '?' }}{% endif %}{% if t.catch_note %} — {{ t.catch_note }}{% endif %}</option>
+      {% endfor %}
+    </select>
+    {% if link_error %}<p class="field-error" id="link-error" role="alert">{{ link_error }}</p>{% endif %}
+    <button type="submit">Привязать</button>
+  </form>
+  {% else %}
+  {% if link_error %}<p class="field-error" id="link-error" role="alert">{{ link_error }}</p>{% endif %}
+  <p class="empty">У выезда этой особи нет тралений — привязывать не к чему.</p>
+  {% endif %}
+</details>

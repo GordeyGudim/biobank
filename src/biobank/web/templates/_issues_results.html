@@ -1,0 +1,43 @@
+{#- Таблица журнала (browse.list_issues). Фрагмент для HTMX, как у списка особей.
+    У открытой проблемы — форма «Решено», у решённой — как решили. -#}
+{% from "_macros.html" import value, pager, warnings %}
+<div id="results" class="results">
+  {{ warnings(query.warnings) }}
+  <p class="count">Записей: <strong>{{ page.total }}</strong>.</p>
+  {% if page.items %}
+  <div class="table-wrap">
+    <table class="issues">
+      <thead><tr>
+        <th scope="col">№</th><th scope="col">категория</th><th scope="col">к чему</th>
+        <th scope="col">объект</th><th scope="col">лист</th><th scope="col">ячейка</th>
+        <th scope="col">значение</th><th scope="col">описание</th><th scope="col">решение</th>
+      </tr></thead>
+      <tbody>
+      {% for issue in page.items %}
+        {% set issue_id = issue.issue_id %}
+        <tr id="issue-{{ issue_id }}">
+          <td class="num">{{ issue_id }}</td>
+          <td>{{ issue.category }}</td>
+          <td>{{ value(issue.table_title) }}</td>
+          <td>{% if issue.object_url %}<a href="{{ issue.object_url }}">{{ issue.object_label }}</a>{% else %}{{ value(issue.object_label) }}{% endif %}</td>
+          <td>{{ value(issue.sheet_name) }}</td>
+          <td>{{ value(issue.cell) }}</td>
+          <td>{{ value(issue.raw_value) }}</td>
+          <td>{{ issue.description }}</td>
+          <td class="action">
+            {% if issue.resolved %}
+            <div class="resolved"><strong>Решено.</strong> {{ issue.resolution }}</div>
+            {% else %}
+            {% with resolution=none, error=none %}{% include "_resolve_form.html" %}{% endwith %}
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">По этим фильтрам записей нет.</p>
+  {% endif %}
+  {{ pager(page, 'issues', query.args) }}
+</div>

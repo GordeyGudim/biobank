@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Особи{% endblock %}
+{% block content %}
+<h1>Особи</h1>
+{#- Фильтры — обычная форма GET: значения попадают в адрес (/specimens?expedition=1&…),
+    ссылкой можно поделиться. Без JavaScript — кнопка «Показать».
+    С HTMX таблица обновляется сама, без перезагрузки страницы:
+    hx-trigger — при смене списка/галочки (change) и через 400 мс после ввода номера;
+    hx-target/hx-swap — ответ (кусок _specimens_results.html) заменяет блок #results;
+    hx-push-url — адрес в строке браузера меняется вместе с фильтрами;
+    hx-sync="this:replace" — новый запрос отменяет ещё не завершённый старый. -#}
+<form id="filters" class="filters" method="get" action="{{ url_for('specimens') }}"
+      hx-get="{{ url_for('specimens') }}" hx-target="#results" hx-swap="outerHTML"
+      hx-push-url="true" hx-sync="this:replace"
+      hx-trigger="change, input changed delay:400ms from:#f-label, submit">
+  <div>
+    <label for="f-expedition">Экспедиция</label>
+    <select id="f-expedition" name="expedition">
+      <option value="">все</option>
+      {% for x in expeditions %}
+      <option value="{{ x.expedition_id }}"{% if query.text('expedition') == x.expedition_id | string %} selected{% endif %}>{{ x.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label for="f-event">Выезд</label>
+    {% include "_event_select.html" %}
+  </div>
+  <div>
+    <label for="f-site">Место</label>
+    <select id="f-site" name="site">
+      <option value="">все</option>
+      {% for s in sites %}
+      <option value="{{ s.site_id }}"{% if query.text('site') == s.site_id | string %} selected{% endif %}>{{ s.name }}{% if s.city and s.city not in s.name %} ({{ s.city }}){% endif %}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label for="f-species">Вид</label>
+    <select id="f-species" name="species">
+      <option value="">все</option>
+      <option value="none"{% if query.text('species') == 'none' %} selected{% endif %}>вид не определён</option>
+      {% for sp in species %}
+      <option value="{{ sp.species_id }}"{% if query.text('species') == sp.species_id | string %} selected{% endif %}>{{ sp.scientific_name }} ({{ sp.specimen_count }})</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label for="f-method">Способ получения</label>
+    <select id="f-method" name="method">
+      <option value="">все</option>
+      {% for m in methods %}
+      <option value="{{ m }}"{% if query.text('method') == m %} selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label for="f-label">Номер начинается с</label>
+    <input id="f-label" name="label" type="search" value="{{ query.text('label') }}"
+           placeholder="например 15 или 155pc" autocomplete="off">
+  </div>
+  <div>
+    <label for="f-order">Сортировка</label>
+    <select id="f-order" name="order">
+      {% for key, title in orders.items() %}
+      <option value="{{ key }}"{% if (query.text('order') or 'label') == key %} selected{% endif %}>{{ title }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="check">
+    <input id="f-issues" name="issues" type="checkbox" value="1"{% if query.text('issues') %} checked{% endif %}>
+    <label for="f-issues">есть открытые проблемы</label>
+  </div>
+  <div class="buttons">
+    <button type="submit">Показать</button>
+    <a href="{{ url_for('specimens') }}">сбросить фильтры</a>
+  </div>
+</form>
+{% include "_specimens_results.html" %}
+{% endblock %}

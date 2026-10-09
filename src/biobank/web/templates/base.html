@@ -14,20 +14,23 @@
   <script src="{{ url_for('static', filename='htmx.min.js') }}" defer></script>
 </head>
 <body>
+  {%- set section = request.endpoint -%}
   <header class="top">
     <a class="brand" href="{{ url_for('index') }}">Biobank</a>
     <nav>
-      <a href="{{ url_for('index') }}"{% if request.endpoint in ('index', 'search', 'specimen') %} aria-current="page"{% endif %}>Поиск</a>
-      <a href="{{ url_for('reports') }}"{% if request.endpoint in ('reports', 'report') %} aria-current="page"{% endif %}>Отчёты</a>
-      <a href="{{ url_for('issues') }}"{% if request.endpoint == 'issues' %} aria-current="page"{% endif %}>Журнал проблем</a>
+      <a href="{{ url_for('specimens') }}"{% if section in ('specimens', 'specimen') %} aria-current="page"{% endif %}>Особи</a>
+      <a href="{{ url_for('expeditions') }}"{% if section in ('expeditions', 'expedition', 'event') %} aria-current="page"{% endif %}>Экспедиции</a>
+      <a href="{{ url_for('sites') }}"{% if section in ('sites', 'site') %} aria-current="page"{% endif %}>Места</a>
+      <a href="{{ url_for('issues') }}"{% if section == 'issues' %} aria-current="page"{% endif %}>Журнал проблем</a>
+      <a href="{{ url_for('reports') }}"{% if section in ('reports', 'report') %} aria-current="page"{% endif %}>Отчёты</a>
     </nav>
+    {#- на главной большая форма поиска, вторая в шапке не нужна -#}
+    {% if section != 'index' %}
+      {% with form_id="top", compact=true, label=none, error=none %}{% include "_search_form.html" %}{% endwith %}
+    {% endif %}
   </header>
   <main>
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% for category, message in messages %}
-        <p class="flash flash-{{ category }}" role="status">{{ message }}</p>
-      {% endfor %}
-    {% endwith %}
+    {% block flashes %}{% include "_flashes.html" %}{% endblock %}
     {% block content %}{% endblock %}
   </main>
 </body>

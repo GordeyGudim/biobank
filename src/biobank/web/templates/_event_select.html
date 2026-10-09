@@ -1,0 +1,14 @@
+{#- Список выездов для фильтра: только выезды выбранной экспедиции (или все, по экспедициям).
+    oob — ответ HTMX на смену фильтра: hx-swap-oob («вне очереди») велит HTMX заменить
+    этот список в форме, хотя основной ответ вставляется в #results. Так при смене
+    экспедиции список выездов обновляется тем же запросом. -#}
+<select id="f-event" name="event"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <option value="">все</option>
+  {% for group in events | groupby("expedition_id") %}
+    <optgroup label="{{ group.list[0].expedition }}">
+    {% for e in group.list %}
+      <option value="{{ e.event_id }}"{% if event_id == e.event_id %} selected{% endif %}>{{ e.event_date }} {{ e.title }}</option>
+    {% endfor %}
+    </optgroup>
+  {% endfor %}
+</select>

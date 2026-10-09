@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% from "_macros.html" import value %}
+{% block title %}{{ expedition.name }}{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('expeditions') }}">Экспедиции</a> /</p>
+<h1>Экспедиция {{ expedition.name }}</h1>
+<table class="fields">
+  <tr><th scope="row">даты</th><td>{{ value(expedition.date_start) }} — {{ value(expedition.date_end) }}</td></tr>
+  <tr><th scope="row">выездов</th><td>{{ expedition.event_count }}</td></tr>
+  <tr><th scope="row">особей</th><td><a href="{{ url_for('specimens', expedition=expedition.expedition_id) }}">{{ expedition.specimen_count }} — список</a></td></tr>
+  <tr><th scope="row">примечания</th><td>{{ value(expedition.notes) }}</td></tr>
+</table>
+<section class="section">
+  <h2>Выезды <small>(строк: {{ events | length }})</small></h2>
+  {% if events %}
+  <div class="table-wrap">
+    <table class="list">
+      <thead><tr>
+        <th scope="col">дата</th><th scope="col">выезд</th><th scope="col">место</th>
+        <th scope="col">способ получения</th><th scope="col">сеть</th>
+        <th scope="col">тралений</th><th scope="col">особей</th><th scope="col">примечания</th>
+      </tr></thead>
+      <tbody>
+      {% for e in events %}
+        <tr>
+          <td class="nowrap">{{ value(e.event_date) }}</td>
+          <td><a href="{{ url_for('event', event_id=e.event_id) }}">{{ e.title }}</a></td>
+          <td><a href="{{ url_for('site', site_id=e.site_id) }}">{{ e.site }}</a></td>
+          <td>{{ e.capture_method }}</td>
+          <td>{% if e.gear_mesh_cm or e.gear_size_m %}ячея {{ e.gear_mesh_cm or '?' }} см, {{ e.gear_size_m or '?' }} м{% else %}{{ value(none) }}{% endif %}</td>
+          <td class="num">{{ e.trawl_count }}</td>
+          <td class="num"><a href="{{ url_for('specimens', expedition=e.expedition_id, event=e.event_id) }}" title="список особей выезда">{{ e.specimen_count }}</a></td>
+          <td>{{ value(e.notes) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">Выездов пока нет.</p>
+  {% endif %}
+</section>
+{% endblock %}

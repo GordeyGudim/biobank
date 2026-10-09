@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% from "_macros.html" import section_table %}
+{#- Карточка выезда (browse.event_card): все разделы, все колонки, даже пустые.
+    Строки таблицы «Траления» имеют id trawling-N — на них ведут ссылки «траление» из карточек особей. -#}
+{% block title %}Выезд {{ title }}{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('expeditions') }}">Экспедиции</a> /
+  <a href="{{ url_for('expedition', expedition_id=ids.expedition_id) }}">экспедиция</a> /</p>
+<h1>Выезд {{ title }}</h1>
+<p><a href="{{ url_for('specimens', expedition=ids.expedition_id, event=event_id) }}">Особи этого выезда — списком с фильтрами</a></p>
+{% for view in views %}{{ section_table(view) }}{% endfor %}
+{% endblock %}

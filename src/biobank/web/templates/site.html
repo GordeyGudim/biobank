@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% from "_macros.html" import section_table %}
+{#- Карточка места (browse.site_card): все разделы, все колонки, даже пустые. -#}
+{% block title %}Место {{ title }}{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('sites') }}">Места</a> /</p>
+<h1>{{ title }}</h1>
+<p><a href="{{ url_for('specimens', site=site_id) }}">Особи этого места — списком с фильтрами</a></p>
+{% for view in views %}{{ section_table(view) }}{% endfor %}
+{% endblock %}

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% from "_macros.html" import value %}
+{% block title %}Места{% endblock %}
+{% block content %}
+<h1>Места</h1>
+<p>Место — точка сбора, не меняется между экспедициями; на одно место может быть несколько выездов.</p>
+{% if sites %}
+<div class="table-wrap">
+  <table class="list">
+    <thead><tr>
+      <th scope="col">№</th><th scope="col">место</th><th scope="col">тип</th>
+      <th scope="col">город</th><th scope="col">провинция</th><th scope="col">координаты</th>
+      <th scope="col">выездов</th><th scope="col">даты</th><th scope="col">особей</th>
+    </tr></thead>
+    <tbody>
+    {% for s in sites %}
+      <tr>
+        <td class="num">{{ s.site_id }}</td>
+        <td><a href="{{ url_for('site', site_id=s.site_id) }}">{{ s.name }}</a></td>
+        <td>{{ value(s.site_type) }}</td>
+        <td>{{ value(s.city) }}</td>
+        <td>{{ value(s.region) }}</td>
+        <td class="nowrap">{% if s.lat is not none %}{{ s.lat | cell }}, {{ s.lon | cell }}{% else %}{{ value(none) }}{% endif %}</td>
+        <td class="num">{{ s.event_count }}</td>
+        <td class="nowrap">{% if s.first_date %}{{ s.first_date }}{% if s.last_date != s.first_date %} — {{ s.last_date }}{% endif %}{% else %}{{ value(none) }}{% endif %}</td>
+        <td class="num"><a href="{{ url_for('specimens', site=s.site_id) }}" title="список особей места">{{ s.specimen_count }}</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="empty">Мест пока нет.</p>
+{% endif %}
+{% endblock %}

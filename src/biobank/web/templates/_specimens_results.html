@@ -1,0 +1,42 @@
+{#- Результаты списка особей. Отдельный файл-фрагмент: HTMX при смене фильтра получает
+    только его (и вставляет вместо блока #results), обычный запрос — всю страницу. -#}
+{% from "_macros.html" import value, pager, warnings %}
+<div id="results" class="results">
+  {{ warnings(query.warnings) }}
+  <p class="count">Найдено особей: <strong>{{ page.total }}</strong>{% if page.pages > 1 %}, показаны {{ (page.page - 1) * page.per_page + 1 }}–{{ (page.page - 1) * page.per_page + page.items | length }}{% endif %}.</p>
+  {% if page.items %}
+  <div class="table-wrap">
+    <table class="list">
+      <thead><tr>
+        <th scope="col">№ пробы</th><th scope="col">вид</th><th scope="col">экспедиция</th>
+        <th scope="col">выезд</th><th scope="col">дата</th><th scope="col">место</th>
+        <th scope="col">способ</th><th scope="col">TL, см</th><th scope="col">SL, см</th>
+        <th scope="col">m, г</th><th scope="col">образцов</th><th scope="col">открытых проблем</th>
+      </tr></thead>
+      <tbody>
+      {% for s in page.items %}
+        <tr>
+          <td><a href="{{ url_for('specimen', label=s.label) }}">{{ s.label }}</a></td>
+          <td>{% if s.species %}{{ s.species }}{% else %}<span class="empty">(не определён)</span>{% endif %}
+            {%- if s.confidence and s.confidence != 'точно' %} <span class="small">({{ s.confidence }})</span>{% endif %}</td>
+          <td><a href="{{ url_for('expedition', expedition_id=s.expedition_id) }}">{{ s.expedition }}</a></td>
+          <td><a href="{{ url_for('event', event_id=s.event_id) }}">{{ s.event_title }}</a></td>
+          <td class="nowrap">{{ value(s.event_date) }}</td>
+          <td><a href="{{ url_for('site', site_id=s.site_id) }}">{{ s.site }}</a></td>
+          <td>{{ value(s.capture_method) }}</td>
+          <td class="num">{{ value(s.tl_cm) }}</td>
+          <td class="num">{{ value(s.sl_cm) }}</td>
+          <td class="num">{{ value(s.mass_g) }}</td>
+          <td class="num">{{ s.sample_count }}</td>
+          <td class="num">{% if s.open_issue_count %}<a class="warn" href="{{ url_for('specimen', label=s.label, _anchor='issues') }}" title="открыть проблемы в карточке">{{ s.open_issue_count }}</a>{% else %}0{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">По этим фильтрам особей нет.</p>
+  {% endif %}
+  {{ pager(page, 'specimens', query.args) }}
+</div>
+{% if oob %}{% include "_event_select.html" %}{% endif %}

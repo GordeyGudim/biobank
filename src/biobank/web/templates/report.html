@@ -4,5 +4,5 @@
 {% block content %}
 <p class="crumbs"><a href="{{ url_for('reports') }}">Отчёты</a> /</p>
 <h1>{{ title }}</h1>
-{% for sec in sections %}{{ section_table(sec, issue_links=(name == "issues")) }}{% endfor %}
+{% for view in views %}{{ section_table(view) }}{% endfor %}
 {% endblock %}

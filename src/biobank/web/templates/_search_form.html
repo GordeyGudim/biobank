@@ -1,9 +1,19 @@
-{#- Форма поиска особи по номеру. Метод GET: поиск ничего не меняет, адрес можно сохранить. -#}
-<form class="search" action="{{ url_for('search') }}" method="get">
-  <label for="label">Номер пробы</label>
-  <input id="label" name="label" type="search" value="{{ label or '' }}"
-         placeholder="например 26 ph, 155pc, 107" autocomplete="off" required
-         {% if error %}aria-invalid="true" aria-describedby="label-error"{% endif %}>
+{#- Форма поиска особи по номеру. Метод GET: поиск ничего не меняет, адрес можно сохранить.
+
+    Подсказки при вводе: HTMX через 300 мс после последней нажатой клавиши (delay) спрашивает
+    /suggest?label=… и вставляет ответ (<option>) в <datalist> — браузер показывает их
+    выпадающим списком под полем. Без JavaScript форма работает и без подсказок.
+    form_id — чтобы у двух форм на странице (шапка и главная) были разные id. -#}
+{% set fid = form_id or "search" %}
+<form class="search{% if compact %} search-top{% endif %}" action="{{ url_for('search') }}" method="get" role="search">
+  <label for="{{ fid }}-label"{% if compact %} class="visually-hidden"{% endif %}>Номер пробы</label>
+  <input id="{{ fid }}-label" name="label" type="search" value="{{ label or '' }}"
+         placeholder="{% if compact %}номер пробы{% else %}например 26 ph, 155pc, 107{% endif %}"
+         autocomplete="off" required list="{{ fid }}-suggestions"
+         hx-get="{{ url_for('suggest') }}" hx-trigger="input changed delay:300ms"
+         hx-target="#{{ fid }}-suggestions" hx-swap="innerHTML" hx-sync="this:replace"
+         {% if error %}aria-invalid="true" aria-describedby="{{ fid }}-error"{% endif %}>
+  <datalist id="{{ fid }}-suggestions"></datalist>
   <button type="submit">Найти</button>
-  {% if error %}<p class="field-error" id="label-error">{{ error }}</p>{% endif %}
+  {% if error %}<p class="field-error" id="{{ fid }}-error">{{ error }}</p>{% endif %}
 </form>

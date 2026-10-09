@@ -1,0 +1,52 @@
+{#- Форма «Новое определение вида» → edit.identify. Старые определения не удаляются:
+    новое добавляется в историю и становится текущим видом особи.
+    Устроена так же, как форма траления (POST, HTMX заменяет #card, защита от двойного нажатия). -#}
+{% set action = url_for('specimen_identify', label=label) %}
+<details class="edit-form"{% if identify_error %} open{% endif %}>
+  <summary>Новое определение вида</summary>
+  <form method="post" action="{{ action }}" hx-post="{{ action }}"
+        hx-target="#card" hx-select="#card" hx-swap="outerHTML"
+        hx-sync="this:drop" hx-disabled-elt="find button, find select, find input, find textarea">
+    {% if identify_error %}<p class="field-error" id="identify-error" role="alert">{{ identify_error }}</p>{% endif %}
+    {% set invalid %}{% if identify_error %} aria-describedby="identify-error"{% endif %}{% endset %}
+    <div class="grid">
+      <div>
+        <label for="id-species">Вид</label>
+        <select id="id-species" name="species"{{ invalid }}>
+          <option value="">не определён</option>
+          {% for sp in species %}
+          <option value="{{ sp.scientific_name }}"{% if form.species == sp.scientific_name %} selected{% endif %}>{{ sp.scientific_name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="id-method">Метод</label>
+        <select id="id-method" name="method" required{{ invalid }}>
+          {% for m in methods %}
+          <option value="{{ m }}"{% if form.method == m %} selected{% endif %}>{{ m }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="id-confidence">Уверенность</label>
+        <select id="id-confidence" name="confidence" required{{ invalid }}>
+          {% for c in confidences %}
+          <option value="{{ c }}"{% if form.confidence == c %} selected{% endif %}>{{ c }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="id-date">Дата определения <span class="small">(пусто — сегодня)</span></label>
+        <input id="id-date" name="identified_on" type="date" value="{{ form.identified_on or '' }}"{{ invalid }}>
+      </div>
+      <div>
+        <label for="id-by">Кто определил</label>
+        <input id="id-by" name="identified_by" type="text" value="{{ form.identified_by or '' }}">
+      </div>
+    </div>
+    <label for="id-notes">Примечание</label>
+    <textarea id="id-notes" name="notes" rows="2">{{ form.notes or '' }}</textarea>
+    <p class="small">Вид «не определён» — только с уверенностью «не определён».</p>
+    <button type="submit">Добавить определение</button>
+  </form>
+</details>

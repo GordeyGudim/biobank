@@ -1,20 +1,37 @@
 {% extends "base.html" %}
 {% from "_macros.html" import section_table %}
-{#- sections — разделы specimen_card: первый — «Особь» (поле — значение),
-    последний — проблемы из журнала (особь и её выезд). Номер — первое поле раздела «Особь». -#}
-{% block title %}Особь {{ (sections[0].rows | first)[1] }}{% endblock %}
+{#- views — разделы specimen_card со ссылками (views.section_views): первый — «Особь»
+    (поле — значение), последний — проблемы из журнала (особь и её выезд).
+    Всё содержимое — в блоке #card: формы правки (HTMX) берут из ответа сервера только его
+    и заменяют карточку целиком — она обновляется без перезагрузки страницы. -#}
+{% block title %}Особь {{ label }}{% endblock %}
+{% block flashes %}{% endblock %}{#- сообщения показываются внутри #card, у форм -#}
 {% block content %}
-<h1>Особь {{ (sections[0].rows | first)[1] }}</h1>
-{% set issues = sections[-1] %}
+<div id="card">
+<p class="crumbs"><a href="{{ url_for('specimens') }}">Особи</a> /
+  <a href="{{ url_for('specimens', expedition=ids.expedition_id, event=ids.event_id) }}">все особи этого выезда</a></p>
+<h1>Особь {{ label }}</h1>
+{% set issues = views[-1].section %}
 {% set status = issues.columns.index("статус") %}
 {% set open_count = issues.rows | selectattr(status, "equalto", "открыто") | list | length %}
 {% if open_count %}
 <p class="badge-warn"><a href="#issues">Открытых проблем в журнале: {{ open_count }}</a>
   — значения показаны как в базе, без исправлений.</p>
 {% endif %}
-{% for sec in sections %}
-  {% if loop.last %}<div id="issues">{{ section_table(sec, issue_links=true) }}</div>
-  {% else %}{{ section_table(sec) }}{% endif %}
+{{ section_table(views[0]) }}
+
+<section class="section edits" id="edits">
+  <h2>Изменить</h2>
+  {% include "_flashes.html" %}
+  <p class="small">Перед каждой записью делается резервная копия базы. Изменения проверяются;
+    если что-то не так — база не меняется, а причина написана у формы.</p>
+  {% include "_link_trawl_form.html" %}
+  {% include "_identify_form.html" %}
+</section>
+
+{% for view in views[1:] %}
+  {% if loop.last %}{{ section_table(view, html_id="issues") }}
+  {% else %}{{ section_table(view) }}{% endif %}
 {% endfor %}
-{% include "_search_form.html" %}
+</div>
 {% endblock %}

@@ -1,8 +1,12 @@
 {% extends "base.html" %}
 {% block title %}Особь не найдена{% endblock %}
 {% block content %}
+{#- id="card": формы карточки (HTMX) берут из ответа блок #card — если особи вдруг
+    не стало, на месте карточки появится это сообщение, а не пустота. -#}
+<div id="card">
 <h1>Особь не найдена</h1>
 <p class="flash flash-error">{{ message }}</p>
 <p>Проверьте номер и попробуйте ещё раз.</p>
 {% include "_search_form.html" %}
+</div>
 {% endblock %}

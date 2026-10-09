@@ -20,6 +20,7 @@ class CardSection:
 
     row_ids — служебные id записей для ссылок в вебе, по словарю на строку rows
     (в том же порядке): {"sample_id": 12}, {"event_id": 3, "site_id": 5}, {} — ссылок нет.
+    Изредка рядом с id — его название (в карточке особи: "capture_method": "траление").
     В терминале не печатаются. Пустой список — у раздела ссылок нет вообще.
     """
 
@@ -29,7 +30,7 @@ class CardSection:
     empty_text: str = "(нет)"
     note: str | None = None  # пояснение под заголовком
     is_fields: bool = False  # таблица «поле — значение» (одна запись), а не список строк
-    row_ids: list[dict[str, int | None]] = field(default_factory=list)
+    row_ids: list[dict[str, int | str | None]] = field(default_factory=list)
 
 
 # Колонки запроса с именем на «_» — служебные id: их не показывают, а переносят в row_ids.

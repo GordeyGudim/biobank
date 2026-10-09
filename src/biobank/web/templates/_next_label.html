@@ -1,0 +1,7 @@
+{#- Ответ кнопки «Следующий свободный» (HTMX): поле номера пробы с подобранным значением.
+    Заменяет старое поле целиком (hx-swap="outerHTML"); id и name — те же. -#}
+<span id="f-specimen-label-box">
+  <input type="text" id="f-specimen-label" name="label" value="{{ label }}" autocomplete="off"
+         {%- if error %} aria-invalid="true" aria-describedby="f-specimen-label-error"{% endif %}>
+  {% if error %}<span class="field-error" id="f-specimen-label-error">{{ error }}</span>{% endif %}
+</span>

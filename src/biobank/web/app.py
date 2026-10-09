@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 from flask import (
@@ -46,7 +47,26 @@ from biobank.edit import (
     link_trawl,
     resolve_issue,
 )
+from biobank.entry import (
+    COORD_SOURCES,
+    MEASUREMENTS,
+    POINT_TYPES,
+    SAMPLE_TYPES,
+    SEXES,
+    SITE_TYPES,
+    WATER_NUMBERS,
+)
+from biobank.importer import LABS
+from biobank.parsing import ORGANS
 from biobank.reports import REPORTS, report_tables
+from biobank.web.entry_forms import (
+    PRESERVATIVE_HINTS,
+    Submitted,
+    grouped_sites,
+    label_suffixes,
+    register_entry_routes,
+    site_hints,
+)
 from biobank.web.views import (
     ISSUE_STATUSES,
     SPECIMEN_ORDERS,
@@ -107,6 +127,9 @@ def create_app(db_path: Path | str) -> Flask:
     _register_db(app)
     _register_errors(app)
     _register_routes(app)
+    # формы ввода — в своём модуле entry_forms.py; он получает этот модуль (функции
+    # страниц и read_db) параметром, чтобы два модуля не импортировали друг друга по кругу
+    register_entry_routes(app, sys.modules[__name__])
     return app
 
 
@@ -324,33 +347,38 @@ def _register_routes(app: Flask) -> None:
 
     @app.get("/expeditions")
     def expeditions():
-        return render_template("expeditions.html", expeditions=browse.list_expeditions(read_db()))
+        return expeditions_page()
 
     @app.get("/expeditions/<int:expedition_id>")
     def expedition(expedition_id: int):
-        conn = read_db()
-        events = browse.list_events(conn, expedition_id)  # нет экспедиции — NotFoundError → 404
-        info = next(x for x in browse.list_expeditions(conn) if x["expedition_id"] == expedition_id)
-        return render_template("expedition.html", expedition=info, events=events)
+        # ?site=N — пришли со страницы места («Добавить выезд на это место»):
+        # форма нового выезда сразу раскрыта, место выбрано
+        site = request.args.get("site", "")
+        submitted = Submitted("f-event", {"site_id": site}) if site.isdigit() else None
+        return expedition_page(expedition_id, submitted)
 
     @app.get("/events/<int:event_id>")
     def event(event_id: int):
-        sections = browse.event_card(read_db(), event_id)  # нет выезда — 404
-        ids = field_ids(sections[0])
-        views = section_views(sections, own_key="event_id", event_id=event_id)
-        title = sections[0].rows[0][1]
-        return render_template("event.html", views=views, title=title, event_id=event_id, ids=ids)
+        # ?form=specimen — ссылка «Ещё особь на этом выезде»: форма особи сразу раскрыта
+        opened = request.args.get("form", "")
+        submitted = Submitted(f"f-{opened}") if opened in EVENT_FORMS else None
+        return event_page(event_id, submitted)
 
     @app.get("/sites")
     def sites():
-        return render_template("sites.html", sites=browse.list_sites(read_db()))
+        return sites_page()
 
     @app.get("/sites/<int:site_id>")
     def site(site_id: int):
-        sections = browse.site_card(read_db(), site_id)  # нет места — 404
+        conn = read_db()
+        sections = browse.site_card(conn, site_id)  # нет места — 404
         views = section_views(sections, own_key="site_id")
         return render_template(
-            "site.html", views=views, title=sections[0].rows[0][1], site_id=site_id
+            "site.html",
+            views=views,
+            title=sections[0].rows[0][1],
+            site_id=site_id,
+            expeditions=browse.list_expeditions(conn),
         )
 
     # ---- отчёты ----
@@ -425,15 +453,94 @@ def _register_routes(app: Flask) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Страницы с формами ввода (их вызывают и маршруты просмотра, и entry_forms.py:
+# после ошибки ввода — та же страница с раскрытой формой и введёнными значениями)
+# ---------------------------------------------------------------------------
+
+# Формы карточки выезда, которые можно раскрыть ссылкой /events/N?form=…
+EVENT_FORMS = ("trawling", "water", "catch", "specimen")
+
+
+def expeditions_page(submitted: Submitted | None = None, status: int = 200):
+    """Список экспедиций + форма «Новая экспедиция»."""
+    expeditions = browse.list_expeditions(read_db())
+    return render_template("expeditions.html", expeditions=expeditions, submitted=submitted), status
+
+
+def expedition_page(expedition_id: int, submitted: Submitted | None = None, status: int = 200):
+    """Экспедиция, её выезды + форма «Новый выезд» (место — по группам типов мест)."""
+    conn = read_db()
+    events = browse.list_events(conn, expedition_id)  # нет экспедиции — NotFoundError → 404
+    info = next(x for x in browse.list_expeditions(conn) if x["expedition_id"] == expedition_id)
+    return render_template(
+        "expedition.html",
+        expedition=info,
+        events=events,
+        site_groups=grouped_sites(browse.list_sites(conn)),
+        methods=browse.list_capture_methods(conn),
+        submitted=submitted,
+    ), status
+
+
+def event_page(event_id: int, submitted: Submitted | None = None, status: int = 200):
+    """Карточка выезда + формы: траление, замер воды, прилов, новая особь."""
+    conn = read_db()
+    sections = browse.event_card(conn, event_id)  # нет выезда — 404
+    ids = field_ids(sections[0])
+    fields = dict(sections[0].rows)
+    trawls = browse.event_trawls(conn, event_id)
+    return render_template(
+        "event.html",
+        views=section_views(sections, own_key="event_id", event_id=event_id),
+        title=fields["выезд"],
+        event_id=event_id,
+        ids=ids,
+        is_trawling=fields["способ получения"] == "траление",
+        trawls=trawls,
+        next_trawl_no=max((t["trawl_no"] for t in trawls), default=0) + 1,
+        species=browse.list_species(conn),
+        methods=browse.list_capture_methods(conn),
+        site_groups=grouped_sites(browse.list_sites(conn)),
+        suffixes=label_suffixes(),
+        confidences=CONFIDENCES,
+        sexes=SEXES,
+        point_types=POINT_TYPES,
+        coord_sources=COORD_SOURCES.values(),
+        water_numbers=WATER_NUMBERS,
+        measurements=MEASUREMENTS,
+        submitted=submitted,
+    ), status
+
+
+def sites_page(submitted: Submitted | None = None, status: int = 200):
+    """Список мест + форма «Новое место» (с проверкой похожих мест)."""
+    sites = browse.list_sites(read_db())
+    return render_template(
+        "sites.html",
+        sites=sites,
+        site_types=SITE_TYPES,
+        hints=site_hints(sites),
+        submitted=submitted,
+    ), status
+
+
+# ---------------------------------------------------------------------------
 # Карточка особи и её формы
 # ---------------------------------------------------------------------------
 
 
-def _specimen_page(label: str, status: int = 200, form: dict | None = None, **errors):
+def _specimen_page(
+    label: str,
+    status: int = 200,
+    form: dict | None = None,
+    submitted: Submitted | None = None,
+    **errors,
+):
     """Карточка особи с формами правки.
 
-    form — что пользователь ввёл (после ошибки поля заполнены снова, вводить заново
-    не нужно); errors — link_error / identify_error: текст ошибки рядом со своей формой.
+    form — что пользователь ввёл в формы этапа B (траление, определение вида);
+    submitted — состояние форм ввода (образец, отправка, промеры);
+    errors — link_error / identify_error: текст ошибки рядом со своей формой.
     """
     conn = read_db()
     try:
@@ -442,18 +549,46 @@ def _specimen_page(label: str, status: int = 200, form: dict | None = None, **er
         # своя 404 с формой поиска: подсказка «Похожие: …» — из find_specimen
         return render_template("not_found.html", message=str(error), label=label), 404
     ids = field_ids(sections[0])
+    fields = dict(sections[0].rows)
+    samples = next(sec for sec in sections if sec.title == "Образцы")  # sample_id — в row_ids
     return render_template(
         "specimen.html",
         views=section_views(sections, own_key="specimen_id", event_id=ids["event_id"]),
-        label=sections[0].rows[0][1],  # номер как в базе: «155pc» → «155 pc»
+        label=fields["номер пробы"],  # номер как в базе: «155pc» → «155 pc»
         ids=ids,
         trawls=browse.event_trawls(conn, ids["event_id"]),
         species=browse.list_species(conn),
         methods=METHODS,
         confidences=CONFIDENCES,
         form=form or {},
+        submitted=submitted,
+        sample_types=SAMPLE_TYPES,
+        samples=[
+            (row_ids.get("sample_id"), dict(zip(samples.columns, row, strict=True)))
+            for row, row_ids in zip(samples.rows, samples.row_ids, strict=True)
+        ],
+        labs=LABS,
+        organs=list(dict.fromkeys(name for _, name in ORGANS)),
+        preservatives=PRESERVATIVE_HINTS,
+        current=current_measurements(fields),
+        measurements=MEASUREMENTS,
         **errors,
     ), status
+
+
+def specimen_entry_page(label: str, submitted: Submitted, status: int = 400):
+    """Карточка особи после отправки формы ввода (ошибка — 400, ждёт подтверждения — 200)."""
+    return _specimen_page(label, status, submitted=submitted)
+
+
+def current_measurements(fields: dict) -> dict[str, str]:
+    """Промеры особи для формы «Исправить промеры»: '29.9 см' → '29.9', нет значения → ''.
+
+    Карточка уже показывает промеры текстом с единицей; форма отправляет назад и
+    показанное значение (скрытые поля old_…) — меняются только исправленные поля.
+    """
+    shown = {"tl_cm": "TL", "sl_cm": "SL", "mass_g": "m", "mass_gutted_g": "m без внутр."}
+    return {column: (fields.get(name) or "").split(" ")[0] for column, name in shown.items()}
 
 
 def _specimen_edit(label: str, form: dict, error_name: str, action):

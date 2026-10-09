@@ -657,3 +657,465 @@ def test_identify_form_errors(client, path, data, message):
     assert '<details class="edit-form" open>' in html  # форма с ошибкой раскрыта
     assert f'value="{data.get("identified_on", "")}"' in html  # введённое не пропало
     assert digest(path) == before and backups(path) == []
+
+
+# ---------------------------------------------------------------------------
+# Этап C: формы ввода новых записей (entry.py через apply_edit)
+# ---------------------------------------------------------------------------
+
+
+def location(r):
+    """Адрес перехода после записи: обычная форма — redirect 303, HTMX — заголовок HX-Redirect."""
+    return r.headers.get("HX-Redirect") or r.headers["Location"]
+
+
+def last_id(url):
+    return int(url.rstrip("/").rsplit("/", 1)[1])
+
+
+def trawling_event(path):
+    """Выезд-траление с тралениями (для форм карточки выезда)."""
+    return db_value(
+        path,
+        "SELECT min(e.event_id) FROM sampling_event e JOIN capture_method m "
+        "USING (capture_method_id) WHERE m.name = 'траление'",
+    )
+
+
+def market_event(path):
+    return db_value(
+        path,
+        "SELECT min(e.event_id) FROM sampling_event e JOIN capture_method m "
+        "USING (capture_method_id) WHERE m.name = 'рынок'",
+    )
+
+
+def next_pc(path):
+    return db_value(path, "SELECT max(series_no) + 1 FROM specimen WHERE series = 'pc'")
+
+
+GOOD_FISH = {"species": "Plotosus canius", "tl_cm": "25,4", "sl_cm": "22", "mass_g": "150",
+             "mass_gutted_g": "140", "sex": "самка"}  # fmt: skip
+
+
+def test_entry_forms_on_pages(client, path):
+    """Формы ввода есть на своих страницах: POST, подписи, защита от двойного нажатия."""
+    pages = {
+        "/expeditions": ["/expeditions/new"],
+        "/sites": ["/sites/new"],
+        "/expeditions/3": ["/expeditions/3/events/new"],
+        f"/events/{trawling_event(path)}": ["/specimens/new", "/trawlings/new", "/water/new",
+                                           "/catch/new"],
+        "/specimen/1": ["/specimen/1/samples/new", "/specimen/1/ship", "/specimen/1/measurements"],
+    }  # fmt: skip
+    for url, actions in pages.items():
+        html = client.get(url).get_data(as_text=True)
+        for action in actions:
+            assert action in html, (url, action)
+        assert 'method="post"' in html and 'hx-sync="this:drop"' in html
+        assert 'hx-disabled-elt="find button"' in html
+        assert 'title="обязательное поле"' in html  # обязательные поля помечены
+    # у рынка нет тралений — и формы «Добавить траление» нет
+    html = client.get(f"/events/{market_event(path)}").get_data(as_text=True)
+    assert "/trawlings/new" not in html and "/specimens/new" in html
+    # место в выезде — по группам типа места
+    html = client.get("/expeditions/3").get_data(as_text=True)
+    for group in ("Участки реки (траление)", "Рынки", "Точки рыбаков"):
+        assert f'<optgroup label="{group}">' in html
+    assert 'class="gear-fields' in html
+
+
+def test_every_entry_field_has_label(client, path):
+    """У каждого поля формы ввода есть <label for=…>."""
+    import re
+
+    for url in ("/expeditions", "/sites", "/expeditions/3", f"/events/{trawling_event(path)}",
+                "/specimen/1"):  # fmt: skip
+        html = client.get(url).get_data(as_text=True)
+        for field_id in re.findall(r'<(?:input|select|textarea)[^>]*\bid="(f-[\w-]+)"', html):
+            assert f'for="{field_id}"' in html, (url, field_id)
+
+
+def test_full_entry_flow(client, path):
+    """Экспедиция → место → выезд → траление → вода → прилов → особь → образец → отправка
+    → промеры. Каждая запись — одна резервная копия; после записи — карточка новой записи."""
+    r = client.post("/expeditions/new", data={"name": "Кантхо осень 2026", "notes": "тест"})
+    assert r.status_code == 303 and "/expeditions/" in location(r)
+    expedition_id = last_id(location(r))
+    assert "Создана экспедиция" in client.get(location(r)).get_data(as_text=True)
+    assert len(backups(path)) == 1
+
+    site = {"site_type": "участок реки", "city": "Новоград", "region": "Кантхо",
+            "lat": "10,07", "lon": "105,78"}  # fmt: skip
+    r = client.post("/sites/new", data=site)
+    assert r.status_code == 303
+    site_id = last_id(location(r))
+    assert db_value(path, "SELECT name FROM sampling_site WHERE site_id = ?", site_id) == (
+        "Участок у Новоград"
+    )
+    assert len(backups(path)) == 2
+
+    r = client.post(
+        f"/expeditions/{expedition_id}/events/new",
+        data={"site_id": site_id, "event_date": "15.09.2026", "capture_method": "траление",
+              "gear_mesh": "3,5 х 3,5", "gear_size": "6,5x12"},
+    )  # fmt: skip
+    assert r.status_code == 303
+    event_id = last_id(location(r))
+    assert db_value(path, "SELECT event_date FROM sampling_event WHERE event_id = ?", event_id) == (
+        "2026-09-15"
+    )
+    assert len(backups(path)) == 3
+
+    trawl = {"trawl_no": "1", "time_start": "9.30", "time_end": "9:50", "duration_min": "20",
+             "speed_kmh": "3,5"}  # fmt: skip
+    r = client.post(f"/events/{event_id}/trawlings/new", data=trawl)
+    assert r.status_code == 303 and location(r).endswith(f"/events/{event_id}")
+    assert db_value(path, "SELECT time_start FROM trawling WHERE event_id = ?", event_id) == "09:30"
+
+    water = {"point_type": "старт", "trawl_no": "1", "lat": "10,0731", "lon": "105,7829",
+             "coord_source": "Garmin", "ph": "7,2", "o2_pct": "85"}  # fmt: skip
+    assert client.post(f"/events/{event_id}/water/new", data=water).status_code == 303
+    assert db_value(path, "SELECT ph FROM water_measurement WHERE event_id = ?", event_id) == 7.2
+
+    catch = {"taxon_text": "arius maculatus", "count_n": "39", "trawl_no": "1"}
+    assert client.post(f"/events/{event_id}/catch/new", data=catch).status_code == 303
+    assert db_value(path, "SELECT raw_text FROM catch_record WHERE event_id = ?", event_id) == (
+        "arius maculatus - 39 шт"
+    )
+    assert len(backups(path)) == 6
+
+    label = f"{next_pc(path)} pc"
+    r = client.post(f"/events/{event_id}/specimens/new", data={**GOOD_FISH, "trawl_no": "1"})
+    assert r.status_code == 303 and location(r).endswith("/specimen/" + quote(label))
+    row = specimen_row(path, label)
+    assert row["trawl_no"] == 1
+    assert db_value(path, "SELECT tl_cm FROM specimen WHERE label = ?", label) == 25.4
+    assert len(backups(path)) == 7
+    card = client.get(location(r)).get_data(as_text=True)
+    assert f"Добавлена особь {label}" in card
+
+    r = client.post(f"/specimen/{label}/samples/new",
+                    data={"sample_type": "ДНК", "labs": "Россия\nТропцентр"})  # fmt: skip
+    assert r.status_code == 303
+    sample_id = db_value(path, "SELECT max(sample_id) FROM sample")
+    assert (
+        db_value(path, "SELECT count(*) FROM sample_shipment WHERE sample_id = ?", sample_id) == 2
+    )
+
+    r = client.post(f"/specimen/{label}/ship",
+                    data={"sample_id": sample_id, "lab": "Кантхо (секвенирование)"})  # fmt: skip
+    assert r.status_code == 303
+    assert (
+        db_value(path, "SELECT count(*) FROM sample_shipment WHERE sample_id = ?", sample_id) == 3
+    )
+
+    old = {"old_tl_cm": "25.4", "old_sl_cm": "22", "old_mass_g": "150", "old_mass_gutted_g": "140"}
+    data = {**old, "tl_cm": "26", "sl_cm": "22", "mass_g": "150", "mass_gutted_g": "140"}
+    r = client.post(f"/specimen/{label}/measurements", data=data)
+    assert r.status_code == 303
+    assert db_value(path, "SELECT tl_cm FROM specimen WHERE label = ?", label) == 26
+    assert len(backups(path)) == 10
+    assert "TL 25.4 → 26" in client.get(location(r)).get_data(as_text=True)
+
+
+def test_htmx_success_uses_hx_redirect(client, path):
+    r = client.post("/expeditions/new", data={"name": "Через HTMX"}, headers=HTMX)
+    assert r.status_code == 204
+    assert r.headers["HX-Redirect"].startswith("/expeditions/")
+    assert len(backups(path)) == 1
+
+
+def test_htmx_error_returns_form_with_entered_values(client, path):
+    before = digest(path)
+    r = client.post("/expeditions/new", data={"name": "Ошибка", "date_start": "32.13.2026"},
+                    headers=HTMX)  # fmt: skip
+    assert r.status_code == 400
+    html = r.get_data(as_text=True)
+    assert 'id="f-expedition" open' in html and "не распознана" in html
+    assert 'value="32.13.2026"' in html and 'value="Ошибка"' in html  # введённое не пропало
+    assert digest(path) == before and backups(path) == []
+
+
+SELECT_FIELDS = {"species", "sample_type", "site_type", "point_type", "capture_method",
+                 "site_id", "sample_id", "sex", "trawl_no"}  # fmt: skip
+
+
+def hard_error_cases(path):
+    event_id = trawling_event(path)
+    return [
+        ("/expeditions/new", {"name": ""}, "Укажите название"),
+        ("/expeditions/new", {"name": "Х", "date_start": "01.01.2099"}, "ещё не наступила"),
+        ("/expeditions/new", {"name": "Донг-хап 2025"}, "уже есть"),
+        ("/sites/new", {"site_type": "участок реки"}, "Укажите название места"),
+        ("/sites/new", {"site_type": "рынок", "city": "Новоград", "region": "Атлантида"},
+         "Провинции «Атлантида» нет"),
+        ("/sites/new", {"site_type": "точка рыбака", "lat": "10,1"}, "Координаты нужны обе"),
+        ("/sites/new", {"site_type": "точка рыбака", "lat": "100", "lon": "1"}, "Широта"),
+        ("/expeditions/3/events/new", {"event_date": "2026-09-01", "capture_method": "рыбак"},
+         "Выберите место"),
+        ("/expeditions/3/events/new", {"site_id": "1", "event_date": "2026-09-01",
+                                       "capture_method": "рыбак"}, "не подходит к месту"),
+        ("/expeditions/3/events/new", {"site_id": "1", "event_date": "",
+                                       "capture_method": "траление"}, "Укажите дату"),
+        (f"/events/{event_id}/trawlings/new", {"trawl_no": "абв"}, "целое число"),
+        (f"/events/{event_id}/trawlings/new", {"trawl_no": "1"}, "уже есть"),
+        (f"/events/{event_id}/trawlings/new", {"trawl_no": "9", "time_start": "25:00"},
+         "не время"),
+        (f"/events/{event_id}/water/new", {"point_type": "старт"}, "укажите номер траления"),
+        (f"/events/{event_id}/water/new", {"point_type": "точка", "ph": "15"},
+         "pH не может быть больше 14"),
+        (f"/events/{event_id}/catch/new", {}, "Укажите, что поймали"),
+        (f"/events/{market_event(path)}/trawlings/new", {"trawl_no": "1"}, "а не траление"),
+        (f"/events/{event_id}/specimens/new", {**GOOD_FISH, "tl_cm": "0"},
+         "TL должна быть больше 0"),
+        (f"/events/{event_id}/specimens/new", {**GOOD_FISH, "label": "1 pc"}, "уже занят"),
+        (f"/events/{event_id}/specimens/new", {**GOOD_FISH, "species": ""}, "Выберите вид"),
+        (f"/events/{event_id}/specimens/new", {"species": "?"}, "укажите номер явно"),
+        (f"/events/{event_id}/specimens/new", {**GOOD_FISH, "species": "Rattus rattus"},
+         "нет в справочнике"),
+        (f"/events/{event_id}/specimens/new", {**GOOD_FISH, "trawl_no": "77"}, "нет траления 77"),
+        ("/specimen/1/samples/new", {"sample_type": "кровь"}, "не подходит"),
+        ("/specimen/1/samples/new", {"sample_type": "ДНК", "labs": "Марс"},
+         "нет в справочнике"),
+        ("/specimen/1/ship", {"lab": "Россия"}, "Выберите образец"),
+        ("/specimen/1/measurements", {"tl_cm": "-1", "old_tl_cm": "93"}, "TL должна быть больше 0"),
+        ("/specimen/1/measurements", {"tl_cm": "abc", "old_tl_cm": "93"}, "не число"),
+        ("/specimen/1/measurements", {"tl_cm": "93", "old_tl_cm": "93"}, "не изменены"),
+    ]  # fmt: skip
+
+
+def test_hard_errors_400_nothing_written(client, path):
+    """Жёсткая ошибка: 400, текст у формы, введённое на месте, база и копии не меняются."""
+    before = digest(path)
+    for url, data, message in hard_error_cases(path):
+        r = client.post(url, data=data, headers=HTMX)
+        html = r.get_data(as_text=True)
+        assert r.status_code == 400, (url, data, r.status_code)
+        assert message in html, (url, data, message)
+        assert 'class="field-error' in html and " open>" in html, url
+        for name, value in data.items():
+            # введённое в текстовые поля — снова в полях; в списках выбора своего значения
+            # не впишешь (Rattus rattus в списке видов нет) — их не проверяем
+            is_select = name in SELECT_FIELDS and not url.endswith("/trawlings/new")
+            if value and not is_select:
+                assert f'value="{value}"' in html or f">{value}<" in html, (url, value)
+        assert digest(path) == before and backups(path) == [], url
+
+
+def test_ship_sample_new_lab_only_with_checkbox(client, path):
+    sample_id = db_value(path, "SELECT min(sample_id) FROM sample")
+    label = db_value(path, "SELECT sp.label FROM sample sa JOIN specimen sp USING (specimen_id) "
+                           "WHERE sample_id = ?", sample_id)  # fmt: skip
+    url = f"/specimen/{label}/ship"
+    r = client.post(url, data={"sample_id": sample_id, "lab": "Лаборатория Ханоя"})
+    assert r.status_code == 400 and "нет в справочнике" in r.get_data(as_text=True)
+    assert db_value(path, "SELECT count(*) FROM lab WHERE name = 'Лаборатория Ханоя'") == 0
+    assert backups(path) == []
+    r = client.post(url, data={"sample_id": sample_id, "lab": "Лаборатория Ханоя", "new_lab": "1",
+                               "sent_on": "01.10.2026"})  # fmt: skip
+    assert r.status_code == 303
+    assert db_value(path, "SELECT count(*) FROM lab WHERE name = 'Лаборатория Ханоя'") == 1
+    assert "(новая лаборатория)" in client.get(location(r)).get_data(as_text=True)
+
+
+def test_new_region_only_with_checkbox(client, path):
+    data = {"site_type": "рынок", "city": "Новоград", "region": "Новая провинция"}
+    r = client.post("/sites/new", data=data)
+    assert r.status_code == 400 and backups(path) == []
+    r = client.post("/sites/new", data={**data, "new_region": "1"})
+    assert r.status_code == 303
+    assert db_value(path, "SELECT count(*) FROM region WHERE name = 'Новая провинция'") == 1
+
+
+# ---- мягкие предупреждения: сохранить только после «Всё равно сохранить» ----
+
+
+def shown_warnings(html):
+    """Тексты предупреждений из скрытых полей confirmed (их отправит «Всё равно сохранить»)."""
+    import html as html_lib
+    import re
+
+    return [html_lib.unescape(v) for v in re.findall(r'name="confirmed" value="([^"]*)"', html)]
+
+
+def test_specimen_soft_warning_needs_confirmation(client, path):
+    event_id = trawling_event(path)
+    n = db_value(path, "SELECT count(*) FROM specimen")
+    label = f"{next_pc(path)} pc"
+    data = {**GOOD_FISH, "tl_cm": "20", "sl_cm": "22"}  # SL > TL
+    r = client.post(f"/events/{event_id}/specimens/new", data=data, headers=HTMX)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "SL больше TL" in html and "Всё равно сохранить" in html
+    assert 'name="confirmed" value="SL больше TL"' in html
+    assert f'value="{label}"' in html  # номер, под которым запишется, виден заранее
+    assert db_value(path, "SELECT count(*) FROM specimen") == n and backups(path) == []
+
+    # подтверждено другое предупреждение — снова спросить, не сохранять
+    r = client.post(f"/events/{event_id}/specimens/new", data={**data, "confirmed": "что-то"})
+    assert r.status_code == 200 and db_value(path, "SELECT count(*) FROM specimen") == n
+
+    r = client.post(f"/events/{event_id}/specimens/new",
+                    data={**data, "label": label, "confirmed": "SL больше TL"})  # fmt: skip
+    assert r.status_code == 303
+    assert db_value(path, "SELECT count(*) FROM specimen") == n + 1
+    assert len(backups(path)) == 1
+    specimen_id = specimen_row(path, label)["specimen_id"]
+    assert (
+        db_value(
+            path,
+            "SELECT count(*) FROM data_issue WHERE resolved = 0 AND table_name = 'specimen' "
+            "AND record_id = ? AND description LIKE '%SL больше TL%'",
+            specimen_id,
+        )
+        == 1
+    )
+    page = client.get(location(r)).get_data(as_text=True)
+    assert "Внимание: SL больше TL" in page  # предупреждение после записи — жёлтым
+
+
+def test_measurements_soft_warning_needs_confirmation(client, path):
+    # особь 1: TL 93, SL 79, m 141, m без внутр. 111 — форма присылает показанное (old_…)
+    old = {"old_tl_cm": "93", "old_sl_cm": "79", "old_mass_g": "141", "old_mass_gutted_g": "111"}
+    tl_before = db_value(path, "SELECT tl_cm FROM specimen WHERE label = '1'")
+    data = {**old, "tl_cm": "93", "sl_cm": "99", "mass_g": "141", "mass_gutted_g": "111"}
+    r = client.post("/specimen/1/measurements", data=data, headers=HTMX)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "SL больше TL" in html and "Всё равно сохранить" in html
+    assert "SL больше TL" in shown_warnings(html)
+    assert db_value(path, "SELECT sl_cm FROM specimen WHERE label = '1'") == 79  # не записано
+    assert backups(path) == []
+    r = client.post("/specimen/1/measurements", data={**data, "confirmed": shown_warnings(html)})
+    assert r.status_code == 303
+    assert db_value(path, "SELECT sl_cm FROM specimen WHERE label = '1'") == 99
+    assert db_value(path, "SELECT tl_cm FROM specimen WHERE label = '1'") == tl_before  # не тронут
+
+
+def test_measurements_form_prefilled_from_card(client):
+    html = client.get("/specimen/155pc").get_data(as_text=True)
+    form = html.split('id="f-measure"')[1].split("</details>")[0]
+    assert 'name="sl_cm" value="29.9"' in form and 'name="old_sl_cm" value="29.9"' in form
+
+
+# ---- похожее место: предложение вместо дубля ----
+
+
+def test_nearby_site_suggested_instead_of_duplicate(client, path):
+    site_id = db_value(path, "SELECT site_id FROM sampling_site WHERE name = 'Участок у Кантхо'")
+    n = db_value(path, "SELECT count(*) FROM sampling_site")
+    data = {"site_type": "участок реки", "city": "Кантхо", "region": "Кантхо"}
+    r = client.post("/sites/new", data=data, headers=HTMX)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "Такое место, похоже, уже есть" in html
+    assert f'href="/sites/{site_id}"' in html and "Использовать это место" in html
+    assert f'name="allow_nearby" value="{site_id}"' in html and "Всё равно создать новое" in html
+    assert db_value(path, "SELECT count(*) FROM sampling_site") == n and backups(path) == []
+
+    # подтверждение для других мест не годится — снова предложение
+    r = client.post("/sites/new", data={**data, "allow_nearby": "99999"})
+    assert r.status_code == 200 and db_value(path, "SELECT count(*) FROM sampling_site") == n
+
+    r = client.post("/sites/new", data={**data, "allow_nearby": str(site_id)})
+    assert r.status_code == 303
+    assert db_value(path, "SELECT count(*) FROM sampling_site") == n + 1
+    assert "Рядом есть место" in client.get(location(r)).get_data(as_text=True)
+
+
+def test_nearby_fisher_point_by_distance(client, path):
+    """Точка рыбака в ~10 м от существующей (9.5187059, 106.2082146) — то же место."""
+    data = {"site_type": "точка рыбака", "lat": "9,51875", "lon": "106,20821"}
+    r = client.post("/sites/new", data=data)
+    assert r.status_code == 200 and " м)" in r.get_data(as_text=True)
+    assert backups(path) == []
+
+
+def test_use_existing_site_opens_event_form(client, path):
+    html = client.get("/sites/13").get_data(as_text=True)
+    assert "Добавить выезд на это место" in html
+    assert 'href="/expeditions/3?site=13#f-event"' in html
+    html = client.get("/expeditions/3?site=13").get_data(as_text=True)
+    assert 'id="f-event" open' in html and '<option value="13" selected>' in html
+
+
+# ---- кнопка «Следующий свободный», ссылки на формы ----
+
+
+def test_next_label_fragment(client, path):
+    r = client.get("/next-label?suffix=pc")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "<html" not in html and f'value="{next_pc(path)} pc"' in html
+    r = client.get("/next-label?suffix=zz")
+    assert r.status_code == 200 and "не известен" in r.get_data(as_text=True)
+    page = client.get(f"/events/{trawling_event(path)}").get_data(as_text=True)
+    assert 'hx-get="/next-label"' in page and 'hx-include="#f-specimen-suffix"' in page
+
+
+def test_more_specimens_link_opens_form(client, path):
+    html = client.get("/specimen/1").get_data(as_text=True)
+    assert "?form=specimen#f-specimen" in html
+    html = client.get("/events/1?form=specimen").get_data(as_text=True)
+    assert 'id="f-specimen" open' in html
+
+
+# ---- безопасность: только POST со своего сайта, GET ничего не пишет ----
+
+
+def entry_urls(path):
+    event_id = trawling_event(path)
+    return [
+        "/expeditions/new",
+        "/sites/new",
+        "/expeditions/3/events/new",
+        f"/events/{event_id}/trawlings/new",
+        f"/events/{event_id}/water/new",
+        f"/events/{event_id}/catch/new",
+        f"/events/{event_id}/specimens/new",
+        "/specimen/1/samples/new",
+        "/specimen/1/ship",
+        "/specimen/1/measurements",
+    ]
+
+
+def test_entry_cross_site_post_rejected(client, path):
+    before = digest(path)
+    for url in entry_urls(path):
+        r = client.post(url, data={"name": "x"}, headers={"Origin": "http://evil.example"})
+        assert r.status_code == 403, url
+        r = client.post(url, data={"name": "x"}, headers={"Sec-Fetch-Site": "cross-site"})
+        assert r.status_code == 403, url
+    assert digest(path) == before and backups(path) == []
+
+
+def test_entry_get_writes_nothing(client, path):
+    before = digest(path)
+    for url in entry_urls(path):
+        # 405 — «так нельзя»; у адресов особи 404: /specimen/<номер> читает «1/ship» как номер
+        assert client.get(url + "?name=x&trawl_no=1").status_code in (404, 405), url
+    for url in ("/next-label?suffix=pc", "/expeditions/3?site=13", "/events/1?form=specimen",
+                "/events/1?form=zzz", "/sites/13"):  # fmt: skip
+        assert client.get(url).status_code == 200, url
+    assert digest(path) == before and backups(path) == []
+
+
+def test_entry_unknown_parent_404(client, path):
+    before = digest(path)
+    assert client.post("/expeditions/999/events/new", data={"site_id": "1"}).status_code == 404
+    r = client.post("/events/99999/catch/new", data={"taxon_text": "x"})
+    assert r.status_code == 404
+    r = client.post("/specimen/9999 zz/samples/new", data={"sample_type": "ДНК"})
+    assert r.status_code == 404
+    assert digest(path) == before and backups(path) == []
+
+
+def test_entry_values_escaped(client, path):
+    r = client.post(
+        "/expeditions/new", data={"name": "<b>жирно</b>", "notes": "<script>x</script>"}
+    )
+    assert r.status_code == 303
+    html = client.get(location(r)).get_data(as_text=True)
+    assert "<script>x</script>" not in html and "&lt;script&gt;" in html
+    assert "<b>жирно</b>" not in html

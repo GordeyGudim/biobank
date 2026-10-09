@@ -1,0 +1,18 @@
+{#- «Добавить траление» (карточка выезда-траления) → entry.add_trawling.
+    Номер по умолчанию — следующий после последнего траления выезда. -#}
+{% from "_entry_macros.html" import entry_form, text, area, submit %}
+{% set f = form_view(submitted, "f-trawling", {"trawl_no": next_trawl_no | string}) %}
+{% call entry_form(f, url_for('trawling_new', event_id=event_id), "Добавить траление",
+    "Время — 9:30 или 9.30; числа можно с запятой. Замеры воды на старте и финише — следующей формой.") %}
+  <div class="form-grid">
+    {{ text(f, "trawl_no", "Номер траления", required=true, number=true) }}
+    {{ text(f, "time_start", "Время старта", placeholder="9:30") }}
+    {{ text(f, "time_end", "Время финиша", placeholder="9:50") }}
+    {{ text(f, "duration_min", "Длительность, мин", number=true) }}
+    {{ text(f, "speed_kmh", "Скорость, км/ч", number=true) }}
+    {{ text(f, "intermediate_depth_m", "Промежуточная глубина, м", number=true) }}
+    {{ text(f, "catch_note", "Улов (как в журнале)", placeholder="2 plotosus / трал пустой", wide=true) }}
+    {{ area(f, "notes", "Примечания", hint="берег, заводы рядом и т.п.") }}
+  </div>
+  {{ submit(f, "Добавить траление") }}
+{% endcall %}

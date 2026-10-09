@@ -1,0 +1,45 @@
+{#- Форма «Новое место» (страница мест) → entry.create_site.
+    Экспедиции возвращаются на те же точки, поэтому сначала сервер ищет похожие места
+    (entry.find_nearby_sites: тот же тип и ближе 200 м или то же название). Если нашлись —
+    показываем их и ничего не создаём: «Использовать это место» (карточка места, там можно
+    добавить выезд) или «Всё равно создать новое». -#}
+{% from "_entry_macros.html" import entry_form, text, select, area, check, submit %}
+{% set f = form_view(submitted, "f-site", {"site_type": "участок реки"}) %}
+{% call entry_form(f, url_for('site_new'), "Новое место",
+    "Название можно не писать: участок реки — «Участок у <город>», рынок — «Рынок <город>». Координаты — обе или ни одной.") %}
+  {% if f.nearby %}
+  <div class="flash flash-warn" role="alert" id="f-site-nearby">
+    <p><strong>Такое место, похоже, уже есть.</strong> Пока ничего не создано.</p>
+    <ul class="links">
+      {% for site in f.nearby %}
+      <li>{{ site.describe() }} —
+        <a class="button-link" href="{{ url_for('site', site_id=site.site_id) }}">Использовать это место</a></li>
+      {% endfor %}
+    </ul>
+    <p class="small">«Использовать» откроет карточку места — там можно добавить выезд на него.
+      Если это действительно другое место — «Всё равно создать новое».</p>
+  </div>
+  {% endif %}
+  <div class="form-grid">
+    {% set types = [] %}{% for t in site_types %}{% set _ = types.append((t, t)) %}{% endfor %}
+    {{ select(f, "site_type", "Тип места", types, required=true) }}
+    {{ text(f, "name", "Название", hint="пусто — по правилам, см. выше", wide=true) }}
+    {{ text(f, "city", "Город", list="site-cities", hint="как в списке; разные написания объединяются") }}
+    {{ text(f, "region", "Провинция", list="site-regions", hint="нужна, если указан город") }}
+    {{ check(f, "new_region", "Это новая провинция", hint="отметьте, только если провинции точно нет в списке (не опечатка)") }}
+    {{ text(f, "lat", "Широта", number=true, placeholder="10,0731") }}
+    {{ text(f, "lon", "Долгота", number=true, placeholder="105,7829") }}
+    {{ area(f, "description", "Описание", hint="пусто — «ввод вручную»") }}
+  </div>
+  <datalist id="site-cities">{% for c in hints.cities %}<option value="{{ c }}">{% endfor %}</datalist>
+  <datalist id="site-regions">{% for r in hints.regions %}<option value="{{ r }}">{% endfor %}</datalist>
+  {% if f.nearby %}
+  <div class="buttons">
+    {#- первая кнопка — та, что срабатывает по Enter: только проверить снова, не создавать -#}
+    <button type="submit">Проверить ещё раз</button>
+    <button type="submit" class="secondary" name="allow_nearby" value="{{ f.nearby | map(attribute='site_id') | join(',') }}">Всё равно создать новое</button>
+  </div>
+  {% else %}
+  {{ submit(f, "Создать место") }}
+  {% endif %}
+{% endcall %}

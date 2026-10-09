@@ -1,0 +1,16 @@
+{#- «Добавить прилов» (карточка выезда) → entry.create_catch_record.
+    Купленное у рыбаков — не прилов: это пишут в примечания выезда. -#}
+{% from "_entry_macros.html" import entry_form, text, select, area, submit %}
+{% set f = form_view(submitted, "f-catch") %}
+{% call entry_form(f, url_for('catch_new', event_id=event_id), "Добавить прилов",
+    "Что ещё поймали (не особи с номером). Достаточно одного: текста, таксона, числа или массы.") %}
+  <div class="form-grid">
+    {% set trawl_opts = [] %}{% for t in trawls %}{% set _ = trawl_opts.append((t.trawl_no, "№" ~ t.trawl_no)) %}{% endfor %}
+    {% if trawls %}{{ select(f, "trawl_no", "Траление", trawl_opts, empty="— весь выезд —") }}{% endif %}
+    {{ text(f, "taxon_text", "Кто", placeholder="arius maculatus") }}
+    {{ text(f, "count_n", "Штук", number=true) }}
+    {{ text(f, "mass_g", "Масса, г", number=true) }}
+    {{ area(f, "raw_text", "Как записано в журнале", hint="пусто — соберётся из полей выше: «arius maculatus - 39 шт»") }}
+  </div>
+  {{ submit(f, "Добавить прилов") }}
+{% endcall %}

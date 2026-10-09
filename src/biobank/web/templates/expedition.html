@@ -10,6 +10,7 @@
   <tr><th scope="row">особей</th><td><a href="{{ url_for('specimens', expedition=expedition.expedition_id) }}">{{ expedition.specimen_count }} — список</a></td></tr>
   <tr><th scope="row">примечания</th><td>{{ value(expedition.notes) }}</td></tr>
 </table>
+{% include "_form_event.html" %}
 <section class="section">
   <h2>Выезды <small>(строк: {{ events | length }})</small></h2>
   {% if events %}

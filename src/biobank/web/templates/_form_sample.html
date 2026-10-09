@@ -1,0 +1,20 @@
+{#- «Добавить образец» (карточка особи) → entry.add_sample.
+    Лаборатории — куда образец сразу отправлен, по одной в строке; только из справочника
+    (новую — формой «Отправить в лабораторию» с галочкой «новая лаборатория»). -#}
+{% from "_entry_macros.html" import entry_form, text, select, area, submit %}
+{% set f = form_view(submitted, "f-sample") %}
+{% call entry_form(f, url_for('sample_new', label=label), "Добавить образец",
+    "Метка образца по умолчанию — номер особи. У гистологии обычно своя метка на орган: «179 pc a».") %}
+  <div class="form-grid">
+    {% set types = [] %}{% for t in sample_types %}{% set _ = types.append((t, t)) %}{% endfor %}
+    {{ select(f, "sample_type", "Тип образца", types, required=true, empty="— выберите —") }}
+    {{ text(f, "organ", "Орган", list="organs") }}
+    {{ text(f, "sample_label", "Метка образца", placeholder=label, hint="пусто — " ~ label) }}
+    {{ text(f, "preservative", "Фиксация", list="preservatives", placeholder="этанол 96%") }}
+    {{ area(f, "labs", "Отправлен в лаборатории", hint="по одной в строке: " ~ (labs | join("; "))) }}
+    {{ area(f, "notes", "Примечания") }}
+  </div>
+  <datalist id="organs">{% for o in organs %}<option value="{{ o }}">{% endfor %}</datalist>
+  <datalist id="preservatives">{% for p in preservatives %}<option value="{{ p }}">{% endfor %}</datalist>
+  {{ submit(f, "Добавить образец") }}
+{% endcall %}

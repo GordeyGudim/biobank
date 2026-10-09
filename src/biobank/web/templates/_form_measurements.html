@@ -1,0 +1,19 @@
+{#- «Исправить промеры» (карточка особи) → entry.update_measurements.
+    Поля заполнены значениями из базы; меняются только исправленные (скрытые поля old_… —
+    что было показано). Пустое поле — стереть значение. Проверки — как у новой особи:
+    ошибка — не сохраняется; предупреждение — «Всё равно сохранить», проблема → журнал.
+    Исправленная опечатка закрывает свою запись в журнале сама. -#}
+{% from "_entry_macros.html" import entry_form, text, soft_warnings, submit %}
+{% set f = form_view(submitted, "f-measure", current) %}
+{% call entry_form(f, url_for('measurements', label=label), "Исправить промеры",
+    "Числа можно с запятой. Пустое поле — значение будет стёрто.") %}
+  {{ soft_warnings(f) }}
+  <div class="form-grid">
+    {% for column, name in measurements.items() %}
+    {{ text(f, column, name ~ (", г" if column.startswith("mass") else ", см"), number=true,
+            hint="было: " ~ (current[column] or "—")) }}
+    <input type="hidden" name="old_{{ column }}" value="{{ current[column] }}">
+    {% endfor %}
+  </div>
+  {{ submit(f, "Сохранить промеры") }}
+{% endcall %}

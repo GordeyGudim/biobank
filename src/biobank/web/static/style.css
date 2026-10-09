@@ -155,6 +155,39 @@ a.warn { background: var(--warn-bg); padding: 0 0.4rem; border-radius: 4px; font
 .edit-form textarea { width: 100%; max-width: 40rem; }
 select[aria-invalid="true"] { border-color: var(--error); }
 
+/* --- формы ввода (этап C): поля сеткой, на узком окне — в один столбик --- */
+.entry-form form { align-items: stretch; }
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); /* сколько колонок влезет */
+  gap: 0.6rem 1rem;
+  width: 100%;
+}
+.field { display: flex; flex-direction: column; min-width: 0; }
+.field.wide, .form-grid > .form-grid { grid-column: 1 / -1; } /* на всю ширину */
+.field input[type="text"], .field select, .field textarea { width: 100%; }
+.field textarea { max-width: none; }
+.field.check { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 0.4rem; align-self: end; }
+.field.check label { display: inline; margin: 0; }
+.field.check .hint { width: 100%; }
+.hint { font-size: 0.8rem; color: var(--muted); margin-top: 0.15rem; }
+abbr.req { color: var(--error); text-decoration: none; }
+.inline { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: flex-start; }
+.inline > span:first-child { flex: 1 1 8rem; }
+.inline input { width: 100%; }
+.buttons { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; margin-top: 0.3rem; }
+button.secondary, a.button-link {
+  background: #fff; color: var(--accent); border: 1px solid var(--accent);
+  border-radius: 4px; padding: 0.3rem 0.8rem; text-decoration: none; font-weight: 600;
+}
+.flash ul { margin: 0.3rem 0; padding-left: 1.3rem; }
+.flash p { margin: 0.2rem 0; }
+/* поля сети нужны только тралению: прячем, когда выбран другой способ получения.
+   :has() — «форма, внутри которой выбран…»; без поддержки :has() поля просто видны */
+.entry-form form:has(select[name="capture_method"] option:checked:not([value="траление"])) .gear-fields {
+  display: none;
+}
+
 @media (max-width: 600px) {
   main { padding: 0.5rem; }
   .search input { width: 100%; }

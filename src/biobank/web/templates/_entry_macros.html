@@ -1,0 +1,109 @@
+{#- Макросы форм ввода: каркас формы и поля с подписями. Одинаковый вид у всех форм.
+
+    f — словарь от form_view(submitted, id, defaults) (entry_forms.py): id формы, введённые
+    значения (data; не values — так у словаря зовётся метод), ошибка (error), мягкие предупреждения (warnings), похожие места (nearby),
+    раскрыта ли (open).
+
+    Форма — POST (запись только кнопкой). HTMX:
+    - hx-post — отправить без перезагрузки; ответ сервера — вся страница, hx-select берёт из
+      неё только эту форму (#id) и hx-swap="outerHTML" заменяет ею старую (ошибка у формы);
+    - успех — сервер отвечает заголовком HX-Redirect, HTMX открывает карточку новой записи;
+    - hx-sync="this:drop" — пока запрос идёт, повторные нажатия отбрасываются,
+      hx-disabled-elt — кнопки на это время выключены (защита от двойной записи).
+    Без JavaScript форма работает как обычная: POST → redirect. -#}
+
+{% macro entry_form(f, action, summary, intro=none) %}
+<details class="edit-form entry-form" id="{{ f.id }}"{% if f.open %} open{% endif %}>
+  <summary>{{ summary }}</summary>
+  <form method="post" action="{{ action }}" hx-post="{{ action }}"
+        hx-target="#{{ f.id }}" hx-select="#{{ f.id }}" hx-swap="outerHTML"
+        hx-sync="this:drop" hx-disabled-elt="find button">
+    {% if intro %}<p class="small">{{ intro }}</p>{% endif %}
+    {% if f.error %}<p class="field-error flash flash-error" id="{{ f.id }}-error" role="alert">{{ f.error }}</p>{% endif %}
+    {{ caller() }}
+  </form>
+</details>
+{% endmacro %}
+
+{#- Подпись поля; * — обязательное (и атрибут required — браузер не даст отправить пустым). -#}
+{% macro label_for(f, name, text, required=false) -%}
+<label for="{{ f.id }}-{{ name }}">{{ text }}{% if required %} <abbr class="req" title="обязательное поле">*</abbr>{% endif %}</label>
+{%- endmacro %}
+
+{#- Общие атрибуты поля: id, имя, связь с текстом ошибки (для программ чтения с экрана). -#}
+{% macro attrs(f, name, required=false) -%}
+id="{{ f.id }}-{{ name }}" name="{{ name }}"{% if required %} required{% endif %}{% if f.error %} aria-describedby="{{ f.id }}-error"{% endif %}
+{%- endmacro %}
+
+{#- Текстовое поле. Числа — тоже text, а не number: поле number в браузере не примет «25,4»;
+    inputmode="decimal" — на телефоне откроется цифровая клавиатура. -#}
+{% macro text(f, name, label, required=false, hint=none, placeholder=none, number=false, list=none, wide=false) %}
+<div class="field{% if wide %} wide{% endif %}">
+  {{ label_for(f, name, label, required) }}
+  <input type="text" {{ attrs(f, name, required) }} value="{{ f.data.get(name, '') }}"
+         {%- if placeholder %} placeholder="{{ placeholder }}"{% endif %}
+         {%- if number %} inputmode="decimal" autocomplete="off"{% endif %}
+         {%- if list %} list="{{ list }}"{% endif %}>
+  {% if hint %}<span class="hint">{{ hint }}</span>{% endif %}
+</div>
+{% endmacro %}
+
+{#- Дата: текст, чтобы можно было печатать и «15.09.2026», и «2026-09-15» (разбирает entry.py). -#}
+{% macro date(f, name, label, required=false, hint=none) %}
+{{ text(f, name, label, required, hint, placeholder="ДД.ММ.ГГГГ или ГГГГ-ММ-ДД") }}
+{% endmacro %}
+
+{#- Выбор из списка. options — пары (значение, подпись); empty — подпись пустого варианта. -#}
+{% macro select(f, name, label, options, required=false, empty=none, hint=none) %}
+<div class="field">
+  {{ label_for(f, name, label, required) }}
+  <select {{ attrs(f, name, required) }}>
+    {% if empty is not none %}<option value="">{{ empty }}</option>{% endif %}
+    {% for value, title in options %}
+    <option value="{{ value }}"{% if f.data.get(name, '') == value | string %} selected{% endif %}>{{ title }}</option>
+    {% endfor %}
+  </select>
+  {% if hint %}<span class="hint">{{ hint }}</span>{% endif %}
+</div>
+{% endmacro %}
+
+{#- Многострочный текст (примечания). -#}
+{% macro area(f, name, label, hint=none, rows=2) %}
+<div class="field wide">
+  {{ label_for(f, name, label) }}
+  <textarea {{ attrs(f, name) }} rows="{{ rows }}">{{ f.data.get(name, '') }}</textarea>
+  {% if hint %}<span class="hint">{{ hint }}</span>{% endif %}
+</div>
+{% endmacro %}
+
+{#- Галочка. value="1": браузер присылает её, только если отмечена. -#}
+{% macro check(f, name, label, hint=none) %}
+<div class="field check">
+  <input type="checkbox" {{ attrs(f, name) }} value="1"{% if f.data.get(name) %} checked{% endif %}>
+  <label for="{{ f.id }}-{{ name }}">{{ label }}</label>
+  {% if hint %}<span class="hint">{{ hint }}</span>{% endif %}
+</div>
+{% endmacro %}
+
+{#- Мягкие предупреждения: запись можно сохранить, но сначала их надо увидеть.
+    Скрытые поля confirmed — какие именно предупреждения пользователь подтвердил:
+    если после исправления значений появится новое, сервер спросит снова. -#}
+{% macro soft_warnings(f) %}
+{% if f.warnings %}
+<div class="flash flash-warn" role="alert" id="{{ f.id }}-warnings">
+  <p><strong>Проверьте, пожалуйста.</strong> Пока ничего не сохранено:</p>
+  <ul>{% for w in f.warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+  <p class="small">Если так и записано в полевом журнале — нажмите «Всё равно сохранить»:
+    запись сохранится, а проблема попадёт в журнал проблем. Если это опечатка — исправьте поле.</p>
+  {% for w in f.warnings %}<input type="hidden" name="confirmed" value="{{ w }}">{% endfor %}
+</div>
+{% endif %}
+{% endmacro %}
+
+{#- Кнопка записи; при мягких предупреждениях — «Всё равно сохранить». -#}
+{% macro submit(f, text) %}
+<div class="buttons">
+  <button type="submit">{% if f.warnings %}Всё равно сохранить{% else %}{{ text }}{% endif %}</button>
+  <span class="small">Перед записью делается резервная копия базы.</span>
+</div>
+{% endmacro %}

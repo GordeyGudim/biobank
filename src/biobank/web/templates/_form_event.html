@@ -1,0 +1,35 @@
+{#- Форма «Новый выезд» (карточка экспедиции) → entry.create_event.
+    Место — из списка, по группам типа места (<optgroup>): способ получения должен
+    подходить к типу места (траление — участок реки, рыбак — точка рыбака…), это проверит сервер.
+    Поля сети нужны только тралению: CSS прячет их, когда выбран другой способ
+    (селектор :has — без JavaScript; в старом браузере поля просто всегда видны). -#}
+{% from "_entry_macros.html" import entry_form, label_for, attrs, text, date, select, area, submit %}
+{% set f = form_view(submitted, "f-event") %}
+{% call entry_form(f, url_for('event_new', expedition_id=expedition.expedition_id), "Новый выезд",
+    "Нужного места нет в списке — сначала создайте его на странице «Места». Даты экспедиции расширятся сами.") %}
+  <div class="form-grid">
+    <div class="field wide">
+      {{ label_for(f, "site_id", "Место", required=true) }}
+      <select {{ attrs(f, "site_id", true) }}>
+        <option value="">— выберите —</option>
+        {% for title, items in site_groups %}
+        <optgroup label="{{ title }}">
+          {% for s in items %}
+          <option value="{{ s.site_id }}"{% if f.data.get('site_id') == s.site_id | string %} selected{% endif %}>№{{ s.site_id }} {{ s.name }}{% if s.city and s.city not in s.name %} ({{ s.city }}){% endif %}</option>
+          {% endfor %}
+        </optgroup>
+        {% endfor %}
+      </select>
+      <span class="hint"><a href="{{ url_for('sites') }}">список мест и новое место</a></span>
+    </div>
+    {{ date(f, "event_date", "Дата выезда", required=true) }}
+    {% set opts = [] %}{% for m in methods %}{% set _ = opts.append((m, m)) %}{% endfor %}
+    {{ select(f, "capture_method", "Способ получения", opts, required=true, empty="— выберите —") }}
+    <div class="gear-fields form-grid">
+      {{ text(f, "gear_mesh", "Сеть: размер ячеи, см", placeholder="3,5x3,5", hint="только для траления") }}
+      {{ text(f, "gear_size", "Сеть: размер, м", placeholder="6,5x12") }}
+    </div>
+    {{ area(f, "notes", "Примечания") }}
+  </div>
+  {{ submit(f, "Создать выезд") }}
+{% endcall %}

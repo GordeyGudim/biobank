@@ -1,0 +1,23 @@
+{#- «Добавить замер воды» (карточка выезда) → entry.add_water_measurement.
+    Старт/финиш — замер траления (номер траления обязателен), «точка» — замер не при
+    тралении (например, точка лова рыбака), без траления. -#}
+{% from "_entry_macros.html" import entry_form, text, select, area, submit %}
+{% set f = form_view(submitted, "f-water", {"point_type": "старт" if trawls else "точка"}) %}
+{% call entry_form(f, url_for('water_new', event_id=event_id), "Добавить замер воды",
+    "Пустые поля остаются пустыми (не измеряли). Координаты — обе или ни одной.") %}
+  <div class="form-grid">
+    {% set points = [] %}{% for p in point_types %}{% if trawls or p == "точка" %}{% set _ = points.append((p, p)) %}{% endif %}{% endfor %}
+    {{ select(f, "point_type", "Точка", points, required=true, hint="старт / финиш траления или отдельная точка") }}
+    {% set trawl_opts = [] %}{% for t in trawls %}{% set _ = trawl_opts.append((t.trawl_no, "№" ~ t.trawl_no ~ (", " ~ t.time_start if t.time_start else ""))) %}{% endfor %}
+    {{ select(f, "trawl_no", "Траление", trawl_opts, empty="— без траления (точка) —", hint="для старта и финиша — обязательно") }}
+    {{ text(f, "measured_time", "Время замера", placeholder="9:30") }}
+    {% set sources = [] %}{% for s in coord_sources %}{% set _ = sources.append((s, s)) %}{% endfor %}
+    {{ select(f, "coord_source", "Координаты по", sources, empty="— не указано —") }}
+    {{ text(f, "garmin_wp", "№ точки в Garmin") }}
+    {% for column, spec in water_numbers.items() %}
+    {{ text(f, column, spec[0], number=true) }}
+    {% endfor %}
+    {{ area(f, "notes", "Примечания", hint="например, параллельный замер другим прибором: hanna – 4,45") }}
+  </div>
+  {{ submit(f, "Добавить замер") }}
+{% endcall %}

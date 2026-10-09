@@ -6,5 +6,19 @@
 <p class="crumbs"><a href="{{ url_for('sites') }}">Места</a> /</p>
 <h1>{{ title }}</h1>
 <p><a href="{{ url_for('specimens', site=site_id) }}">Особи этого места — списком с фильтрами</a></p>
+{#- Выезд на это место: ссылки на экспедиции → её карточка с раскрытой формой «Новый выезд»
+    и уже выбранным местом (?site=N). Обычные ссылки (GET) — база не меняется. -#}
+{% if expeditions %}
+<details class="edit-form">
+  <summary>Добавить выезд на это место</summary>
+  <ul class="links">
+    {% for x in expeditions %}
+    <li><a href="{{ url_for('expedition', expedition_id=x.expedition_id, site=site_id, _anchor='f-event') }}">{{ x.name }}</a></li>
+    {% endfor %}
+  </ul>
+  <p class="small">Выберите экспедицию — откроется её страница с формой нового выезда, это место уже выбрано.
+    Новая экспедиция — на странице <a href="{{ url_for('expeditions') }}">«Экспедиции»</a>.</p>
+</details>
+{% endif %}
 {% for view in views %}{{ section_table(view) }}{% endfor %}
 {% endblock %}

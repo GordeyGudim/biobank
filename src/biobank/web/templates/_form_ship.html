@@ -1,0 +1,17 @@
+{#- «Отправить в лабораторию» (карточка особи) → entry.ship_sample.
+    Новая лаборатория создаётся только с галочкой — чтобы опечатка не стала новой записью справочника. -#}
+{% from "_entry_macros.html" import entry_form, text, date, select, check, submit %}
+{% set f = form_view(submitted, "f-ship") %}
+{% if samples %}
+{% call entry_form(f, url_for('sample_ship', label=label), "Отправить образец в лабораторию") %}
+  <div class="form-grid">
+    {% set opts = [] %}{% for sample_id, s in samples %}{% set _ = opts.append((sample_id, s["метка"] ~ " — " ~ s["тип"] ~ (", " ~ s["орган"] if s["орган"] else "") ~ (" (уже: " ~ s["отправлен"] ~ ")" if s["отправлен"] else ""))) %}{% endfor %}
+    {{ select(f, "sample_id", "Образец", opts, required=true, empty="— выберите —") }}
+    {{ text(f, "lab", "Лаборатория", required=true, list="labs-list") }}
+    {{ date(f, "sent_on", "Дата отправки", hint="пусто — неизвестна") }}
+    {{ check(f, "new_lab", "Это новая лаборатория", hint="отметьте, только если её точно нет в справочнике") }}
+  </div>
+  <datalist id="labs-list">{% for l in labs %}<option value="{{ l }}">{% endfor %}</datalist>
+  {{ submit(f, "Отметить отправку") }}
+{% endcall %}
+{% endif %}

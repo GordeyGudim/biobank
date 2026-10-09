@@ -1,0 +1,74 @@
+{#- «Новая особь» (карточка выезда) → entry.create_specimen (сразу с первым определением вида).
+
+    Две ступени проверки:
+    1) жёсткие ошибки (TL ≤ 0, номер занят, траления нет…) — не сохраняется, причина над полями;
+    2) мягкие предупреждения (SL > TL, суффикс номера не совпадает с видом…) — сначала
+       показываются, сохранение — только кнопкой «Всё равно сохранить»; после записи
+       проблема попадает в журнал проблем.
+    Номер: пусто — следующий свободный в серии вида; кнопка «Следующий свободный» подставляет
+    его для выбранного суффикса (HTMX GET /next-label — только чтение). -#}
+{% from "_entry_macros.html" import entry_form, label_for, attrs, text, date, select, area, check, soft_warnings, submit %}
+{% set f = form_view(submitted, "f-specimen", {"suffix": "pc"}) %}
+{% call entry_form(f, url_for('specimen_new', event_id=event_id), "Новая особь",
+    "Числа можно с запятой (25,4). Пустой промер — не измеряли. Траление особи — только если оно точно известно.") %}
+  {{ soft_warnings(f) }}
+  <div class="form-grid">
+    <div class="field wide">
+      {{ label_for(f, "label", "Номер пробы") }}
+      <div class="inline">
+        {% with label = f.data.get("label", ""), error = none %}{% include "_next_label.html" %}{% endwith %}
+        <label class="visually-hidden" for="f-specimen-suffix">Суффикс номера</label>
+        <select id="f-specimen-suffix" name="suffix">
+          {% for suffix, series in suffixes %}
+          <option value="{{ suffix }}"{% if f.data.get('suffix') == suffix %} selected{% endif %}>{{ suffix or "без суффикса" }} — {{ series }}</option>
+          {% endfor %}
+        </select>
+        <button type="button" class="secondary" hx-get="{{ url_for('next_label') }}"
+                hx-include="#f-specimen-suffix" hx-target="#f-specimen-label-box"
+                hx-swap="outerHTML">Следующий свободный</button>
+      </div>
+      <span class="hint">«179 pc», «278», «6 Bg». Пусто — следующий свободный номер в серии вида.</span>
+    </div>
+    <div class="field wide">
+      {{ label_for(f, "species", "Вид", required=true) }}
+      <select {{ attrs(f, "species", true) }}>
+        <option value="">— выберите —</option>
+        <option value="?"{% if f.data.get('species') == '?' %} selected{% endif %}>? — вид не определён</option>
+        {% for sp in species %}
+        <option value="{{ sp.scientific_name }}"{% if f.data.get('species') == sp.scientific_name %} selected{% endif %}>{{ sp.scientific_name }}{% if sp.code %} ({{ sp.code }}){% endif %}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% set conf = [] %}{% for c in confidences %}{% set _ = conf.append((c, c)) %}{% endfor %}
+    {{ select(f, "confidence", "Уверенность", conf, empty="по умолчанию: точно, у «… sp.» — до рода") }}
+    {% for column, name in measurements.items() %}
+    {{ text(f, column, name ~ (", г" if column.startswith("mass") else ", см"), number=true) }}
+    {% endfor %}
+    {% set sex_opts = [] %}{% for s in sexes %}{% set _ = sex_opts.append((s, s)) %}{% endfor %}
+    {{ select(f, "sex", "Пол", sex_opts, empty="— не указан —") }}
+    {{ check(f, "is_dead", "Особь мёртвая") }}
+    {% if trawls %}
+    {% set trawl_opts = [] %}{% for t in trawls %}{% set _ = trawl_opts.append((t.trawl_no, "№" ~ t.trawl_no ~ (", " ~ t.time_start if t.time_start else ""))) %}{% endfor %}
+    {{ select(f, "trawl_no", "Траление", trawl_opts, empty="неизвестно") }}
+    {% endif %}
+    {% set method_opts = [] %}{% for m in methods %}{% set _ = method_opts.append((m, m)) %}{% endfor %}
+    {{ select(f, "capture_method", "Свой способ получения", method_opts, empty="как у выезда", hint="только если не как у выезда (например, купили у рыбака)") }}
+    <div class="field">
+      {{ label_for(f, "capture_site_id", "Своё место поимки") }}
+      <select {{ attrs(f, "capture_site_id") }}>
+        <option value="">как у выезда</option>
+        {% for title, items in site_groups %}
+        <optgroup label="{{ title }}">
+          {% for s in items %}
+          <option value="{{ s.site_id }}"{% if f.data.get('capture_site_id') == s.site_id | string %} selected{% endif %}>№{{ s.site_id }} {{ s.name }}</option>
+          {% endfor %}
+        </optgroup>
+        {% endfor %}
+      </select>
+    </div>
+    {{ date(f, "capture_date", "Своя дата поимки", hint="пусто — дата выезда") }}
+    {{ text(f, "identified_by", "Кто определил вид") }}
+    {{ area(f, "notes", "Примечания", hint="икра, «мертвый», куда отправили и т.п.") }}
+  </div>
+  {{ submit(f, "Добавить особь") }}
+{% endcall %}

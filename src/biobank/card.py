@@ -22,6 +22,7 @@ from biobank.tables import CardSection, query_section, render_sections
 SPECIMEN_SQL = """
 SELECT s.specimen_id, s.event_id, s.trawling_id, s.species_id, e.expedition_id,
        coalesce(s.capture_site_id, e.site_id) AS site_id,
+       coalesce(s.capture_method_id, e.capture_method_id) AS capture_method_id,
        s.label, s.label_raw, sp.scientific_name AS species,
        x.name AS expedition, e.source_sheet, e.event_date, s.capture_date,
        em.name AS event_method, cm.name AS own_method,
@@ -155,6 +156,12 @@ def _main_section(s: sqlite3.Row) -> CardSection:
         "выезд (лист)": {"event_id": s["event_id"]},
         "место": {"site_id": s["site_id"]},
         "траление": {"trawling_id": s["trawling_id"]},
+        # способ получения особи (свой, иначе выезда): веб прячет форму траления,
+        # если рыба получена не тралением (link_trawl такую привязку всё равно не даст)
+        "способ получения": {
+            "capture_method_id": s["capture_method_id"],
+            "capture_method": s["own_method"] or s["event_method"],
+        },
     }
     row_ids = [links.get(name, {}) for name, _ in fields]
     return CardSection("Особь", ["поле", "значение"], fields, is_fields=True, row_ids=row_ids)

@@ -45,6 +45,7 @@ class EditResult:
     checks: CheckResult
     backup: Path | None = None  # резервная копия до правки (заполняет apply_edit)
     record_id: int | None = None  # id созданной записи (функции ввода из entry.py)
+    record_ids: list[int] = field(default_factory=list)  # id всех созданных (пакетный ввод)
     # мягкие предупреждения: запись сохранена, проблема — в журнале data_issue
     warnings: list[str] = field(default_factory=list)
 

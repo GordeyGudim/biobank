@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from biobank.checks import (
@@ -568,6 +569,30 @@ def _gear_id(conn: sqlite3.Connection, mesh: str | None, size: str | None) -> in
     return _insert(conn, "gear", gear_type=GEAR_TYPE, mesh_cm=mesh, size_m=size)
 
 
+def _extend_expedition_dates(
+    conn: sqlite3.Connection, expedition: sqlite3.Row, date: str
+) -> list[str]:
+    """Расширить даты экспедиции, чтобы они включали дату выезда (как при импорте: min/max).
+
+    Если дата выходит за уже записанные даты — предупреждение (возможно, опечатка в годе).
+    """
+    start, end = expedition["date_start"], expedition["date_end"]
+    new_start = min(start, date) if start else date
+    new_end = max(end, date) if end else date
+    if (new_start, new_end) == (start, end):
+        return []
+    conn.execute(
+        "UPDATE expedition SET date_start = ?, date_end = ? WHERE expedition_id = ?",
+        (new_start, new_end, expedition["expedition_id"]),
+    )
+    if not (start and end):
+        return []
+    return [
+        f"Дата выезда {date} вне дат экспедиции «{expedition['name']}» "
+        f"({start} – {end}); даты экспедиции изменены: {new_start} – {new_end}."
+    ]
+
+
 def create_event(
     conn: sqlite3.Connection,
     expedition_id: int,
@@ -619,20 +644,7 @@ def create_event(
             source_sheet=None, notes=clean_text(notes),
         )  # fmt: skip
 
-        warnings = []
-        start, end = expedition["date_start"], expedition["date_end"]
-        new_start = min(start, date) if start else date
-        new_end = max(end, date) if end else date
-        if (new_start, new_end) != (start, end):
-            conn.execute(
-                "UPDATE expedition SET date_start = ?, date_end = ? WHERE expedition_id = ?",
-                (new_start, new_end, expedition_id),
-            )
-            if start and end:
-                warnings.append(
-                    f"Дата выезда {date} вне дат экспедиции «{expedition['name']}» "
-                    f"({start} – {end}); даты экспедиции изменены: {new_start} – {new_end}."
-                )
+        warnings = _extend_expedition_dates(conn, expedition, date)
         if method == "траление" and gear_id is None:
             warnings.append("Сеть не указана (--mesh, --size) — её можно будет добавить позже.")
         message = (
@@ -686,6 +698,21 @@ def add_trawling(
         )  # fmt: skip
 
 
+def parse_coord_source(value) -> str | None:
+    """Источник координат как при импорте: по первому слову, без учёта регистра.
+
+    >>> parse_coord_source("garmin"), parse_coord_source("Google maps"), parse_coord_source("")
+    ('Garmin', 'Google Maps', None)
+    """
+    source = clean_text(value)
+    if source is None:
+        return None
+    if source.lower().split()[0] not in COORD_SOURCES:
+        names = ", ".join(COORD_SOURCES.values())
+        raise EditError(f"Источник координат «{source}» не подходит. Возможные: {names}.")
+    return COORD_SOURCES[source.lower().split()[0]]
+
+
 def add_water_measurement(
     conn: sqlite3.Connection,
     event_id: int,
@@ -718,12 +745,7 @@ def add_water_measurement(
         values[column] = parse_entry_number(numbers.get(column), what, minimum=low, maximum=high)
     if (values["lat"] is None) != (values["lon"] is None):
         raise EditError("Координаты нужны обе — широта и долгота — или ни одной.")
-    source = clean_text(coord_source)
-    if source is not None:
-        if source.lower().split()[0] not in COORD_SOURCES:
-            names = ", ".join(COORD_SOURCES.values())
-            raise EditError(f"Источник координат «{source}» не подходит. Возможные: {names}.")
-        source = COORD_SOURCES[source.lower().split()[0]]
+    source = parse_coord_source(coord_source)
 
     with write_transaction(conn):
         event = _event(conn, event_id)
@@ -763,6 +785,37 @@ def _series_of(suffix: str) -> tuple[str, str]:
     return parsed.suffix, parsed.series
 
 
+@dataclass
+class _Reserved:
+    """Что уже заняли строки пакетного ввода (create_specimens); у одиночного ввода — пусто.
+
+    Номера и метки из пакета ещё не записаны в базу, поэтому проверки «номер занят»,
+    «следующий свободный», «номер пропущен» смотрят и в базу, и сюда.
+    """
+
+    labels: dict[str, int] = field(default_factory=dict)  # номер пробы → строка пакета
+    # серия → номер → номера проб пакета с этим числом (явные — заранее, «авто» — по ходу)
+    numbers: dict[str, dict[int, set[str]]] = field(default_factory=dict)
+    sample_labels: dict[str, str] = field(default_factory=dict)  # метка образца → номер особи
+
+    def add_number(self, series: str, number: int, label: str) -> None:
+        self.numbers.setdefault(series, {}).setdefault(number, set()).add(label)
+
+
+def _top_number(conn: sqlite3.Connection, series: str, reserved: _Reserved | None) -> int:
+    """Наибольший номер серии в базе и в пакете (0 — номеров ещё нет)."""
+    top = conn.execute(
+        "SELECT max(series_no) FROM specimen WHERE series = ?", (series,)
+    ).fetchone()[0]
+    in_batch = reserved.numbers.get(series, {}) if reserved else {}
+    return max([top or 0, *in_batch])
+
+
+def _next_label(conn: sqlite3.Connection, suffix: str, reserved: _Reserved | None = None) -> str:
+    suffix, series = _series_of(clean_text(suffix) or "")
+    return f"{_top_number(conn, series, reserved) + 1} {suffix}".strip()
+
+
 def next_label(conn: sqlite3.Connection, suffix: str) -> str:
     """Следующий свободный номер пробы в серии суффикса.
 
@@ -770,26 +823,38 @@ def next_label(conn: sqlite3.Connection, suffix: str) -> str:
     на все суффиксы (e, sp, ph, mc и без суффикса), у Plotosus — своя («N pc») и т.д.
     Следующий номер = наибольший номер серии + 1 (пропуски не заполняются).
     """
-    suffix, series = _series_of(clean_text(suffix) or "")
-    top = conn.execute(
-        "SELECT max(series_no) FROM specimen WHERE series = ?", (series,)
-    ).fetchone()[0]
-    return f"{(top or 0) + 1} {suffix}".strip()
+    return _next_label(conn, suffix)
 
 
-def _numbering_warnings(conn: sqlite3.Connection, number: int, series: str) -> list[str]:
-    """Мягкие проблемы нумерации (их же найдёт checks.check_numbering)."""
-    rows = conn.execute(
-        "SELECT label FROM specimen WHERE series = ? AND series_no = ?", (series, number)
-    ).fetchall()
+def _numbering_warnings(
+    conn: sqlite3.Connection, number: int, series: str, label: str,
+    reserved: _Reserved | None = None, exclude_id: int | None = None,
+) -> list[str]:  # fmt: skip
+    """Мягкие проблемы нумерации (их же найдёт checks.check_numbering).
+
+    exclude_id — особь, которой меняют номер: её прежний номер не считается.
+    `IS NOT ?` с None — истина для всех строк.
+    """
+    in_batch = reserved.numbers.get(series, {}) if reserved else {}
+    same = [
+        r["label"]
+        for r in conn.execute(
+            "SELECT label FROM specimen WHERE series = ? AND series_no = ? "
+            "AND specimen_id IS NOT ?",
+            (series, number, exclude_id),
+        )
+    ]
+    same += sorted(in_batch.get(number, set()) - {label} - set(same))
     warnings = []
-    if rows:
-        same = ", ".join(r["label"] for r in rows)
-        warnings.append(f"Номер {number} в серии {series} уже есть с другим суффиксом: {same}")
+    if same:
+        listed = ", ".join(same)
+        warnings.append(f"Номер {number} в серии {series} уже есть с другим суффиксом: {listed}")
     top = conn.execute(
-        "SELECT max(series_no) FROM specimen WHERE series = ?", (series,)
+        "SELECT max(series_no) FROM specimen WHERE series = ? AND specimen_id IS NOT ?",
+        (series, exclude_id),
     ).fetchone()[0]
-    if number > (top or 0) + 1:
+    # пропуск — номер между последним в базе и введённым, которого нет и в пакете
+    if any(n not in in_batch for n in range((top or 0) + 1, number)):
         warnings.append(f"Номера пропущены в серии {series}: последний {top or 0}, введён {number}")
     return warnings
 
@@ -797,6 +862,218 @@ def _numbering_warnings(conn: sqlite3.Connection, number: int, series: str) -> l
 def _default_confidence(scientific_name: str) -> str:
     """Как при импорте: «Pangasius sp.» — до рода, иначе — точно."""
     return "до рода" if scientific_name.endswith(" sp.") else "точно"
+
+
+@dataclass
+class _SampleDraft:
+    """Проверенный образец, готовый к записи (add_sample, пакетный ввод)."""
+
+    values: dict  # колонки sample, кроме specimen_id
+    labs: list[tuple[int, str]]  # (lab_id, название) — куда сразу отправлен
+
+
+def _draft_sample(
+    conn: sqlite3.Connection,
+    specimen_label: str,
+    specimen_id: int | None,
+    sample_type: str,
+    *,
+    organ: str | None = None,
+    sample_label: str | None = None,
+    preservative: str | None = None,
+    notes: str | None = None,
+    labs: tuple[str, ...] | list[str] = (),
+    reserved: _Reserved | None = None,
+) -> _SampleDraft:
+    """Проверить образец до записи; specimen_id = None — особь ещё не записана (пакет)."""
+    if sample_type not in SAMPLE_TYPES:
+        raise EditError(
+            f"Тип образца «{sample_type}» не подходит. Возможные: {', '.join(SAMPLE_TYPES)}."
+        )
+    if isinstance(labs, str):  # одна лаборатория строкой, а не списком
+        labs = [labs]
+    tag = clean_text(sample_label) or specimen_label
+    # `IS NOT ?` с None — истина для всех строк: у новой особи образцов в базе ещё нет
+    other = conn.execute(
+        "SELECT sp.label FROM sample sa JOIN specimen sp USING (specimen_id) "
+        "WHERE sa.label = ? AND sa.specimen_id IS NOT ? LIMIT 1",
+        (tag, specimen_id),
+    ).fetchone()
+    owner = other["label"] if other else None
+    batch_owner = reserved.sample_labels.get(tag) if reserved else None
+    if owner is None and batch_owner not in (None, specimen_label):
+        owner = batch_owner  # у другой особи того же пакета
+    if owner:
+        raise EditError(f"Метка образца «{tag}» уже есть у особи {owner}.")
+    found = []
+    for lab in dict.fromkeys(labs):  # без повторов, порядок сохраняется
+        found.append((_lab_id(conn, lab)[0], clean_text(lab)))
+    values = dict(
+        sample_type=sample_type, organ=clean_text(organ), label=tag,
+        preservative=clean_text(preservative), raw_value=None, notes=clean_text(notes),
+    )  # fmt: skip
+    return _SampleDraft(values, found)
+
+
+def _write_sample(conn: sqlite3.Connection, specimen_id: int, draft: _SampleDraft) -> int:
+    sample_id = _insert(conn, "sample", specimen_id=specimen_id, **draft.values)
+    for lab_id, _ in draft.labs:
+        _insert(conn, "sample_shipment", sample_id=sample_id, lab_id=lab_id)
+    return sample_id
+
+
+@dataclass
+class _SpecimenDraft:
+    """Проверенная особь, готовая к записи (create_specimen, create_specimens)."""
+
+    label: str
+    series: str
+    number: int
+    specimen: dict  # колонки specimen
+    identification: dict  # колонки species_identification, кроме specimen_id
+    summary: str  # «Plotosus canius, точно» — для сообщения
+    warnings: list[str]
+    samples: list[_SampleDraft] = field(default_factory=list)
+
+
+def _draft_specimen(
+    conn: sqlite3.Connection,
+    event: sqlite3.Row,
+    species: str | None,
+    label: str | None = None,
+    *,
+    confidence: str | None = None,
+    tl_cm=None,
+    sl_cm=None,
+    mass_g=None,
+    mass_gutted_g=None,
+    sex: str | None = None,
+    is_dead: bool = False,
+    trawl_no: int | None = None,
+    capture_method: str | None = None,
+    capture_site_id: int | None = None,
+    capture_date: str | None = None,
+    identified_by: str | None = None,
+    notes: str | None = None,
+    limits: MeasurementLimits = FISH_LIMITS,
+    reserved: _Reserved | None = None,
+) -> _SpecimenDraft:
+    """Все проверки новой особи (жёсткие — EditError, мягкие — в warnings), без записи.
+
+    Только читает базу: годится и для предпросмотра (check_specimens).
+    reserved — номера и метки, уже занятые строками того же пакета.
+    """
+    species_text = clean_text(species)
+    if species_text in (None, "?", "-"):
+        species_text = None
+    if confidence is not None and confidence not in CONFIDENCES:
+        raise EditError(
+            f"Уверенность «{confidence}» не подходит. Возможные: {', '.join(CONFIDENCES)}."
+        )
+    if species_text is None and confidence not in (None, "не определён"):
+        raise EditError("Без вида можно указать только уверенность «не определён».")
+    if species_text is not None and confidence == "не определён":
+        raise EditError(
+            "При уверенности «не определён» вид не указывают: вместо вида напишите «?»."
+        )
+    if sex is not None and clean_text(sex) not in SEXES:
+        raise EditError(f"Пол «{sex}» не подходит. Возможные: {', '.join(SEXES)}.")
+    if trawl_no is not None and (not isinstance(trawl_no, int) or trawl_no <= 0):
+        raise EditError(f"Номер траления — целое число больше 0 (введено {trawl_no!r}).")
+    measured = {
+        column: parse_entry_number(value, MEASUREMENTS[column])
+        for column, value in (("tl_cm", tl_cm), ("sl_cm", sl_cm), ("mass_g", mass_g),
+                              ("mass_gutted_g", mass_gutted_g))
+    }  # fmt: skip
+    own_date = parse_entry_date(capture_date, "Дата поимки")
+
+    if species_text is None:
+        species_id, scientific_name, code = None, None, None
+        confidence = "не определён"
+    else:
+        row = find_species(conn, species_text)
+        species_id, scientific_name, code = row["species_id"], row["scientific_name"], row["code"]
+        confidence = confidence or _default_confidence(scientific_name)
+
+    if label is None:
+        if not code:
+            raise EditError(
+                f"У вида «{scientific_name or 'не определён'}» нет кода для номера пробы — "
+                "укажите номер явно (--label)."
+            )
+        label = _next_label(conn, code, reserved)
+    parsed = parse_label(clean_text(label))
+    if parsed is None:
+        known = ", ".join(s for s, _ in SUFFIXES.values() if s)
+        raise EditError(
+            f"Номер пробы «{label}» не распознан. Пишите «число суффикс», например "
+            f"«179 pc»; суффиксы: {known}; у Pangasius можно без суффикса."
+        )
+    if conn.execute("SELECT 1 FROM specimen WHERE label = ?", (parsed.label,)).fetchone():
+        free = _next_label(conn, parsed.suffix, reserved)
+        raise EditError(f"Номер «{parsed.label}» уже занят. Следующий свободный: {free}.")
+    if reserved and parsed.label in reserved.labels:
+        free = _next_label(conn, parsed.suffix, reserved)
+        row = reserved.labels[parsed.label]
+        raise EditError(
+            f"Номер «{parsed.label}» уже есть в этом вводе (строка {row}). "
+            f"Следующий свободный: {free}."
+        )
+
+    check = validate_specimen(
+        *measured.values(), suffix=parsed.suffix, species_code=code, limits=limits
+    )
+    if check.errors:
+        raise EditError(" ".join(check.errors))
+    warnings = check.warnings + _numbering_warnings(
+        conn, parsed.number, parsed.series, parsed.label, reserved
+    )
+
+    method_id = None
+    if clean_text(capture_method) is not None:
+        method_id = _method_id(conn, capture_method)
+        if method_id == event["capture_method_id"]:
+            method_id = None  # как у выезда — не записываем (правило импорта)
+    site_id = None
+    if capture_site_id is not None:
+        site_id = _site(conn, capture_site_id)["site_id"]
+        if site_id == event["site_id"]:
+            site_id = None
+    trawling_id = None
+    if trawl_no is not None:
+        if method_id is not None:
+            raise EditError(
+                "Особь получена не тралением (указан другой способ) — траление не указывают."
+            )
+        trawling_id = _trawling(conn, event, trawl_no)
+    if own_date == event["event_date"]:
+        own_date = None
+
+    specimen = dict(
+        label=parsed.label, label_raw=None,  # не из Excel
+        series=parsed.series, series_no=parsed.number, event_id=event["event_id"],
+        trawling_id=trawling_id, species_id=species_id, capture_method_id=method_id,
+        capture_site_id=site_id, capture_date=own_date, sex=clean_text(sex),
+        is_dead=int(bool(is_dead)), notes=clean_text(notes), source_row=None, **measured,
+    )  # fmt: skip
+    identification = dict(
+        species_id=species_id, method="морфология", confidence=confidence,
+        identified_by=clean_text(identified_by),
+        identified_on=own_date or event["event_date"], raw_text=species_text,
+    )  # fmt: skip
+    summary = f"{scientific_name or 'вид не определён'}, {confidence}"
+    return _SpecimenDraft(
+        parsed.label, parsed.series, parsed.number, specimen, identification, summary, warnings
+    )
+
+
+def _write_specimen(conn: sqlite3.Connection, draft: _SpecimenDraft) -> int:
+    """Записать особь, её первое определение вида и образцы; вернуть specimen_id."""
+    specimen_id = _insert(conn, "specimen", **draft.specimen)
+    _insert(conn, "species_identification", specimen_id=specimen_id, **draft.identification)
+    for sample in draft.samples:
+        _write_sample(conn, specimen_id, sample)
+    return specimen_id
 
 
 def create_specimen(
@@ -827,108 +1104,254 @@ def create_specimen(
     confidence — по умолчанию как при импорте: «точно», у «… sp.» — «до рода».
     capture_method / capture_site_id — только если отличаются от выезда (как при импорте;
     совпадающие с выездом не записываются). trawl_no — траление этого же выезда.
+    Несколько особей одним сохранением — create_specimens.
     """
-    species_text = clean_text(species)
-    if species_text in (None, "?", "-"):
-        species_text = None
-    if confidence is not None and confidence not in CONFIDENCES:
-        raise EditError(
-            f"Уверенность «{confidence}» не подходит. Возможные: {', '.join(CONFIDENCES)}."
-        )
-    if species_text is None and confidence not in (None, "не определён"):
-        raise EditError("Без вида можно указать только уверенность «не определён».")
-    if species_text is not None and confidence == "не определён":
-        raise EditError(
-            "При уверенности «не определён» вид не указывают: вместо вида напишите «?»."
-        )
-    if sex is not None and clean_text(sex) not in SEXES:
-        raise EditError(f"Пол «{sex}» не подходит. Возможные: {', '.join(SEXES)}.")
-    if trawl_no is not None and (not isinstance(trawl_no, int) or trawl_no <= 0):
-        raise EditError(f"Номер траления — целое число больше 0 (введено {trawl_no!r}).")
-    measured = {
-        column: parse_entry_number(value, MEASUREMENTS[column])
-        for column, value in (("tl_cm", tl_cm), ("sl_cm", sl_cm), ("mass_g", mass_g),
-                              ("mass_gutted_g", mass_gutted_g))
-    }  # fmt: skip
-    own_date = parse_entry_date(capture_date, "Дата поимки")
-
     with write_transaction(conn):
         event = _event(conn, event_id)
-        if species_text is None:
-            species_id, scientific_name, code = None, None, None
-            confidence = "не определён"
-        else:
-            row = find_species(conn, species_text)
-            species_id, scientific_name, code = (
-                row["species_id"],
-                row["scientific_name"],
-                row["code"],
-            )
-            confidence = confidence or _default_confidence(scientific_name)
+        draft = _draft_specimen(
+            conn, event, species, label, confidence=confidence, tl_cm=tl_cm, sl_cm=sl_cm,
+            mass_g=mass_g, mass_gutted_g=mass_gutted_g, sex=sex, is_dead=is_dead,
+            trawl_no=trawl_no, capture_method=capture_method, capture_site_id=capture_site_id,
+            capture_date=capture_date, identified_by=identified_by, notes=notes, limits=limits,
+        )  # fmt: skip
+        specimen_id = _write_specimen(conn, draft)
+        message = f"Добавлена особь {draft.label} (выезд {_title(event)}): {draft.summary}."
+        return _done(conn, message, specimen_id, draft.warnings)
 
-        if label is None:
-            if not code:
-                raise EditError(
-                    f"У вида «{scientific_name or 'не определён'}» нет кода для номера пробы — "
-                    "укажите номер явно (--label)."
-                )
-            label = next_label(conn, code)
-        parsed = parse_label(clean_text(label))
-        if parsed is None:
-            known = ", ".join(s for s, _ in SUFFIXES.values() if s)
-            raise EditError(
-                f"Номер пробы «{label}» не распознан. Пишите «число суффикс», например "
-                f"«179 pc»; суффиксы: {known}; у Pangasius можно без суффикса."
-            )
-        if conn.execute("SELECT 1 FROM specimen WHERE label = ?", (parsed.label,)).fetchone():
-            free = next_label(conn, parsed.suffix)
-            raise EditError(f"Номер «{parsed.label}» уже занят. Следующий свободный: {free}.")
 
-        check = validate_specimen(
-            *measured.values(), suffix=parsed.suffix, species_code=code, limits=limits
+# ---------------------------------------------------------------------------
+# Пакетный ввод особей «за столом после экспедиции»
+# ---------------------------------------------------------------------------
+
+# Поля строки пакета (create_specimens) — те же, что у create_specimen, плюс образцы
+SPECIMEN_ROW_FIELDS = (
+    "label", "species", "confidence", "tl_cm", "sl_cm", "mass_g", "mass_gutted_g", "sex",
+    "is_dead", "trawl_no", "capture_method", "capture_site_id", "capture_date",
+    "identified_by", "notes", "samples",
+)  # fmt: skip
+# Поля образца в строке пакета — как у add_sample
+SAMPLE_ROW_FIELDS = ("sample_type", "organ", "sample_label", "preservative", "notes", "labs")
+AUTO_LABELS = ("авто", "auto")  # вместо номера: следующий свободный в серии вида
+MAX_BATCH_ROWS = 500
+
+
+@dataclass
+class RowCheck:
+    """Итог проверки одной строки пакета."""
+
+    row: int  # номер строки, с 1 (как в форме)
+    label: str | None  # номер пробы; для «авто» — какой будет присвоен (None — не удалось)
+    errors: list[str] = field(default_factory=list)  # сохранить нельзя
+    warnings: list[str] = field(default_factory=list)  # сохранить можно, проблема → журнал
+
+
+@dataclass
+class BatchCheck:
+    """Итог проверки всего пакета: по записи на каждую непустую строку."""
+
+    rows: list[RowCheck]
+
+    @property
+    def ok(self) -> bool:
+        """Нет ни одной жёсткой ошибки — пакет можно сохранить."""
+        return not any(r.errors for r in self.rows)
+
+    @property
+    def error_rows(self) -> list[int]:
+        return [r.row for r in self.rows if r.errors]
+
+    @property
+    def warning_count(self) -> int:
+        return sum(len(r.warnings) for r in self.rows)
+
+
+class BatchError(EditError):
+    """В пакете есть жёсткие ошибки — ничего не записано; подробности по строкам — в check."""
+
+    def __init__(self, check: BatchCheck):
+        rows = ", ".join(map(str, check.error_rows))
+        where = "строке" if len(check.error_rows) == 1 else "строках"
+        details = "; ".join(f"строка {r.row}: {' '.join(r.errors)}" for r in check.rows if r.errors)
+        super().__init__(f"Ошибки в {where} {rows} — ничего не сохранено. {details}")
+        self.check = check
+
+
+def _row_int(value, what: str) -> int | None:
+    """Целое из формы: 3, «3», « 3 »; пусто — None.
+
+    >>> _row_int(" 3 ", "Траление"), _row_int("", "Траление"), _row_int(None, "Траление")
+    (3, None, None)
+    """
+    if value is None or isinstance(value, int) and not isinstance(value, bool):
+        return value
+    text = clean_text(value)
+    if text is None:
+        return None
+    if not text.isdigit():
+        raise EditError(f"{what}: «{text}» — не целое число.")
+    return int(text)
+
+
+def _row_flag(value) -> bool:
+    """Да/нет из формы: флажок (on), 1, «да»; пусто, 0, «нет» — нет.
+
+    >>> _row_flag("on"), _row_flag("да"), _row_flag(""), _row_flag("0"), _row_flag(None)
+    (True, True, False, False, False)
+    """
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    text = (clean_text(value) or "").lower()
+    if text in ("", "0", "нет", "false", "off"):
+        return False
+    if text in ("1", "да", "true", "on"):
+        return True
+    raise EditError(f"«Мёртвая»: «{value}» — напишите «да» или «нет».")
+
+
+def _is_blank_row(row) -> bool:
+    """Строка формы, в которой ничего не заполнено, — пропускается."""
+    return isinstance(row, Mapping) and all(
+        (clean_text(v) is None) if not isinstance(v, (list, tuple, bool)) else not v
+        for v in row.values()
+    )
+
+
+def _draft_row(
+    conn: sqlite3.Connection,
+    event: sqlite3.Row,
+    row: Mapping,
+    limits: MeasurementLimits,
+    reserved: _Reserved,
+) -> _SpecimenDraft:
+    """Одна строка пакета → черновик особи с образцами (EditError — жёсткая ошибка строки)."""
+    unknown = sorted(set(row) - set(SPECIMEN_ROW_FIELDS))
+    if unknown:
+        raise EditError(f"Неизвестные поля: {', '.join(unknown)}.")
+    label = clean_text(row.get("label"))
+    if label is not None and label.lower() in AUTO_LABELS:
+        label = None
+    draft = _draft_specimen(
+        conn, event, row.get("species"), label,
+        confidence=clean_text(row.get("confidence")),
+        tl_cm=row.get("tl_cm"), sl_cm=row.get("sl_cm"), mass_g=row.get("mass_g"),
+        mass_gutted_g=row.get("mass_gutted_g"), sex=clean_text(row.get("sex")),
+        is_dead=_row_flag(row.get("is_dead")),
+        trawl_no=_row_int(row.get("trawl_no"), "Номер траления"),
+        capture_method=row.get("capture_method"),
+        capture_site_id=_row_int(row.get("capture_site_id"), "Место поимки"),
+        capture_date=row.get("capture_date"), identified_by=row.get("identified_by"),
+        notes=row.get("notes"), limits=limits, reserved=reserved,
+    )  # fmt: skip
+    for sample in row.get("samples") or ():
+        if not isinstance(sample, Mapping):
+            raise EditError("Образец — набор полей (тип, орган, метка…).")
+        unknown = sorted(set(sample) - set(SAMPLE_ROW_FIELDS))
+        if unknown:
+            raise EditError(f"Неизвестные поля образца: {', '.join(unknown)}.")
+        if _is_blank_row(sample):
+            continue
+        sample_draft = _draft_sample(
+            conn, draft.label, None, clean_text(sample.get("sample_type")) or "",
+            organ=sample.get("organ"), sample_label=sample.get("sample_label"),
+            preservative=sample.get("preservative"), notes=sample.get("notes"),
+            labs=sample.get("labs") or (), reserved=reserved,
+        )  # fmt: skip
+        draft.samples.append(sample_draft)
+        reserved.sample_labels.setdefault(sample_draft.values["label"], draft.label)
+    return draft
+
+
+def _check_batch(
+    conn: sqlite3.Connection, event: sqlite3.Row, rows, limits: MeasurementLimits
+) -> tuple[BatchCheck, list[_SpecimenDraft]]:
+    """Проверить все строки пакета; черновики — только строк без ошибок."""
+    if isinstance(rows, (str, bytes, Mapping)) or not isinstance(rows, Sequence):
+        raise EditError("Строки пакета — список (по словарю полей на строку).")
+    numbered = [(i, row) for i, row in enumerate(rows, start=1) if not _is_blank_row(row)]
+    if not numbered:
+        raise EditError("Нет ни одной заполненной строки.")
+    if len(numbered) > MAX_BATCH_ROWS:
+        raise EditError(
+            f"Слишком много строк ({len(numbered)}): за раз не больше {MAX_BATCH_ROWS}."
         )
-        if check.errors:
-            raise EditError(" ".join(check.errors))
-        warnings = check.warnings + _numbering_warnings(conn, parsed.number, parsed.series)
 
-        method_id = None
-        if clean_text(capture_method) is not None:
-            method_id = _method_id(conn, capture_method)
-            if method_id == event["capture_method_id"]:
-                method_id = None  # как у выезда — не записываем (правило импорта)
-        site_id = None
-        if capture_site_id is not None:
-            site_id = _site(conn, capture_site_id)["site_id"]
-            if site_id == event["site_id"]:
-                site_id = None
-        trawling_id = None
-        if trawl_no is not None:
-            if method_id is not None:
-                raise EditError(
-                    "Особь получена не тралением (указан другой способ) — траление не указывают."
-                )
-            trawling_id = _trawling(conn, event, trawl_no)
-        if own_date == event["event_date"]:
-            own_date = None
+    reserved = _Reserved()
+    # явные номера пакета — заранее: «авто» не должен выдать номер, записанный ниже в пакете
+    for _, row in numbered:
+        text = clean_text(row.get("label")) if isinstance(row, Mapping) else None
+        parsed = parse_label(text) if text and text.lower() not in AUTO_LABELS else None
+        if parsed:
+            reserved.add_number(parsed.series, parsed.number, parsed.label)
 
-        specimen_id = _insert(
-            conn, "specimen", label=parsed.label, label_raw=None,  # не из Excel
-            series=parsed.series, series_no=parsed.number, event_id=event_id,
-            trawling_id=trawling_id, species_id=species_id, capture_method_id=method_id,
-            capture_site_id=site_id, capture_date=own_date, sex=clean_text(sex),
-            is_dead=int(bool(is_dead)), notes=clean_text(notes), source_row=None,
-            **measured,
-        )  # fmt: skip
-        _insert(
-            conn, "species_identification", specimen_id=specimen_id, species_id=species_id,
-            method="морфология", confidence=confidence, identified_by=clean_text(identified_by),
-            identified_on=own_date or event["event_date"], raw_text=species_text,
-        )  # fmt: skip
+    checks, drafts = [], []
+    for i, row in numbered:
+        try:
+            if not isinstance(row, Mapping):
+                raise EditError("Строка — набор полей (номер, вид, промеры…).")
+            draft = _draft_row(conn, event, row, limits, reserved)
+        except EditError as error:  # и NotFoundError: нет места поимки и т.п.
+            label = clean_text(row.get("label")) if isinstance(row, Mapping) else None
+            checks.append(RowCheck(i, label, [str(error)]))
+            continue
+        reserved.labels[draft.label] = i
+        reserved.add_number(draft.series, draft.number, draft.label)
+        checks.append(RowCheck(i, draft.label, [], draft.warnings))
+        drafts.append(draft)
+    return BatchCheck(checks), drafts
+
+
+def check_specimens(
+    conn: sqlite3.Connection,
+    event_id: int,
+    rows: Sequence[Mapping],
+    limits: MeasurementLimits = FISH_LIMITS,
+) -> BatchCheck:
+    """Проверить пакет особей БЕЗ записи — для предпросмотра в форме.
+
+    Только читает базу (подходит db.connect_read_only). Те же проверки, что у
+    create_specimens; номера «авто» показываются такими, какими их присвоит сохранение
+    (если до сохранения никто не добавит особей в ту же серию).
+    Нет выезда — NotFoundError; пустой пакет — EditError.
+    """
+    return _check_batch(conn, _event(conn, event_id), rows, limits)[0]
+
+
+def create_specimens(
+    conn: sqlite3.Connection,
+    event_id: int,
+    rows: Sequence[Mapping],
+    limits: MeasurementLimits = FISH_LIMITS,
+) -> EditResult:
+    """Несколько особей выезда одним сохранением: всё или ничего.
+
+    rows — список словарей, по одному на строку формы. Поля (SPECIMEN_ROW_FIELDS) — как
+    у create_specimen: label (номер; пусто или «авто» — следующий свободный в серии вида),
+    species, confidence, tl_cm, sl_cm, mass_g, mass_gutted_g, sex, is_dead, trawl_no,
+    capture_method, capture_site_id, capture_date, identified_by, notes; числа можно строкой.
+    samples — необязательный список образцов (SAMPLE_ROW_FIELDS, как у add_sample).
+    Пустые строки пропускаются; номер строки в сообщениях — как в форме (с 1).
+
+    Сначала проверяются все строки (в той же транзакции, что и запись): есть хоть одна
+    жёсткая ошибка — BatchError (подвид EditError) с разбором по строкам (error.check),
+    ничего не записано. Иначе — все особи записаны, журнал перепроверен один раз;
+    record_ids — id особей по порядку строк, warnings — «строка N (номер): …».
+    """
+    with write_transaction(conn):
+        event = _event(conn, event_id)
+        check, drafts = _check_batch(conn, event, rows, limits)
+        if not check.ok:
+            raise BatchError(check)
+        ids = [_write_specimen(conn, draft) for draft in drafts]
+        samples = sum(len(d.samples) for d in drafts)
         message = (
-            f"Добавлена особь {parsed.label} (выезд {_title(event)}): "
-            f"{scientific_name or 'вид не определён'}, {confidence}."
+            f"Добавлено особей: {len(ids)} (выезд {_title(event)}): "
+            f"{', '.join(d.label for d in drafts)}"
+            + (f"; образцов: {samples}." if samples else ".")
         )
-        return _done(conn, message, specimen_id, warnings)
+        warnings = [f"строка {r.row} ({r.label}): {w}" for r in check.rows for w in r.warnings]
+        result = _done(conn, message, None, warnings)
+        result.record_ids = ids
+        return result
 
 
 def update_measurements(
@@ -1010,24 +1433,12 @@ def add_sample(
         )
     with write_transaction(conn):
         specimen = find_specimen(conn, label)
-        tag = clean_text(sample_label) or specimen["label"]
-        other = conn.execute(
-            "SELECT sp.label FROM sample sa JOIN specimen sp USING (specimen_id) "
-            "WHERE sa.label = ? AND sa.specimen_id != ? LIMIT 1",
-            (tag, specimen["specimen_id"]),
-        ).fetchone()
-        if other:
-            raise EditError(f"Метка образца «{tag}» уже есть у особи {other['label']}.")
-        sample_id = _insert(
-            conn, "sample", specimen_id=specimen["specimen_id"], sample_type=sample_type,
-            organ=clean_text(organ), label=tag, preservative=clean_text(preservative),
-            raw_value=None, notes=clean_text(notes),
+        draft = _draft_sample(
+            conn, specimen["label"], specimen["specimen_id"], sample_type, organ=organ,
+            sample_label=sample_label, preservative=preservative, notes=notes, labs=labs,
         )  # fmt: skip
-        sent = []
-        for lab in dict.fromkeys(labs):  # без повторов, порядок сохраняется
-            lab_id, _ = _lab_id(conn, lab)
-            _insert(conn, "sample_shipment", sample_id=sample_id, lab_id=lab_id)
-            sent.append(clean_text(lab))
+        sample_id = _write_sample(conn, specimen["specimen_id"], draft)
+        tag, sent = draft.values["label"], [name for _, name in draft.labs]
         message = f"Добавлен образец №{sample_id} «{tag}» ({sample_type}) особи {specimen['label']}"
         message += f", отправлен: {', '.join(sent)}." if sent else "."
         return _done(conn, message, sample_id)

@@ -19,7 +19,9 @@ from dataclasses import dataclass
 
 from biobank.card import WATER_SQL
 from biobank.checks import summary_by_category
-from biobank.edit import NotFoundError, event_title
+from biobank.edit import CONFIDENCES, METHODS, NotFoundError, event_title
+from biobank.entry import COORD_SOURCES, POINT_TYPES, SAMPLE_TYPES, SEXES, SITE_TYPES
+from biobank.importer import CAPTURE_METHODS
 from biobank.parsing import _LOOKALIKES, parse_label
 from biobank.tables import CardSection, query_section
 
@@ -661,3 +663,295 @@ def issue_categories(conn: sqlite3.Connection) -> list[dict]:
     """Категории журнала со счётчиками: category, total, open, resolved
     (сначала категории с большим числом открытых)."""
     return [dict(r) for r in summary_by_category(conn)]
+
+
+def get_issue(conn: sqlite3.Connection, issue_id: int) -> dict:
+    """Одна запись журнала — все колонки data_issue (как в list_issues).
+
+    Нет такой записи — NotFoundError.
+    """
+    row = _require(
+        conn,
+        "SELECT issue_id, category, table_name, record_id, sheet_name, cell, object_label, "
+        "raw_value, description, resolved, resolution FROM data_issue WHERE issue_id = ?",
+        issue_id,
+        f"Проблемы №{issue_id} нет в журнале.",
+    )
+    return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Траление
+# ---------------------------------------------------------------------------
+
+TRAWLING_SQL = """
+SELECT t.*, e.event_date, e.source_sheet, e.expedition_id, x.name AS expedition
+FROM trawling t
+JOIN sampling_event e ON e.event_id = t.event_id
+JOIN expedition x     ON x.expedition_id = e.expedition_id
+WHERE t.trawling_id = ?
+"""
+
+TRAWLING_SPECIMENS_SQL = f"""
+SELECT s.label AS "№ пробы", coalesce(sp.scientific_name, '(не определён)') AS "вид",
+       s.tl_cm AS "TL, см", s.sl_cm AS "SL, см", s.mass_g AS "m, г",
+       s.mass_gutted_g AS "m без внутр., г",
+       (SELECT count(*) FROM sample sa WHERE sa.specimen_id = s.specimen_id) AS "образцов",
+       s.specimen_id AS _specimen_id, s.species_id AS _species_id
+FROM specimen s
+LEFT JOIN species sp ON sp.species_id = s.species_id
+WHERE s.trawling_id = ?
+ORDER BY {NATURAL_LABEL_ORDER}
+"""
+
+TRAWLING_CATCH_SQL = """
+SELECT c.taxon_text AS "кто", c.count_n AS "штук", c.mass_g AS "масса, г",
+       c.raw_text AS "в таблице записано", c.catch_id AS _catch_id
+FROM catch_record c
+WHERE c.trawling_id = ?
+ORDER BY c.catch_id
+"""
+
+# Проблемы траления: по id самого траления и его замеров воды, а записи импорта
+# (у них нет record_id) — по листу и подписи «траление N …» («траление 4 старт»).
+TRAWLING_ISSUES_SQL = """
+SELECT issue_id AS "id",
+       CASE table_name WHEN 'trawling' THEN 'траление'
+                       WHEN 'water_measurement' THEN 'замер воды'
+                       ELSE table_name END AS "к чему",
+       category AS "категория", cell AS "ячейка", object_label AS "объект",
+       raw_value AS "значение", description AS "описание",
+       CASE resolved WHEN 1 THEN 'решено: ' || coalesce(resolution, '') ELSE 'открыто' END
+           AS "статус",
+       issue_id AS _issue_id
+FROM data_issue
+WHERE (table_name = 'trawling' AND record_id = :trawling_id)
+   OR (table_name = 'water_measurement' AND record_id IN
+       (SELECT measurement_id FROM water_measurement WHERE trawling_id = :trawling_id))
+   OR (table_name IN ('trawling', 'water_measurement') AND sheet_name = :sheet
+       AND (object_label = :object
+            OR substr(object_label, 1, length(:object) + 1) = :object || ' '))
+ORDER BY resolved, issue_id
+"""
+
+
+def trawling_card(conn: sqlite3.Connection, trawling_id: int) -> list[CardSection]:
+    """Всё о тралении: сведения, замеры воды, привязанные особи, прилов, проблемы.
+
+    Разделы — CardSection; row_ids: event_id, expedition_id (в сведениях),
+    measurement_id, specimen_id, species_id, catch_id, issue_id.
+    Нет такого траления — NotFoundError.
+    """
+    t = _require(conn, TRAWLING_SQL, trawling_id, f"Траления №{trawling_id} нет.")
+    fields = [
+        ("траление", t["trawl_no"]),
+        ("выезд", event_title(t["source_sheet"], t["event_id"], t["event_date"])),
+        ("экспедиция", t["expedition"]),
+        ("дата", t["event_date"]),
+        ("старт", t["time_start"]),
+        ("финиш", t["time_end"]),
+        ("длительность, мин", t["duration_min"]),
+        ("скорость, км/ч", t["speed_kmh"]),
+        ("промежуточная глубина, м", t["intermediate_depth_m"]),
+        ("улов", t["catch_note"]),
+        ("примечания", t["notes"]),
+    ]
+    links = {
+        "траление": {"trawling_id": t["trawling_id"]},
+        "выезд": {"event_id": t["event_id"]},
+        "экспедиция": {"expedition_id": t["expedition_id"]},
+    }
+    main = CardSection(
+        "Траление",
+        ["поле", "значение"],
+        fields,
+        is_fields=True,
+        row_ids=[links.get(name, {}) for name, _ in fields],
+    )
+    tid = (trawling_id,)
+    issue_params = {
+        "trawling_id": trawling_id,
+        "sheet": t["source_sheet"],
+        "object": f"траление {t['trawl_no']}",
+    }
+    return [
+        main,
+        query_section(
+            conn, "Замеры воды", WATER_SQL.format(where="w.trawling_id = ?"), tid, "(замеров нет)"
+        ),
+        query_section(conn, "Особи из этого траления", TRAWLING_SPECIMENS_SQL, tid),
+        query_section(conn, "Прилов", TRAWLING_CATCH_SQL, tid),
+        query_section(conn, "Проблемы в журнале (траление и его замеры)", TRAWLING_ISSUES_SQL,
+                      issue_params),
+    ]  # fmt: skip
+
+
+# ---------------------------------------------------------------------------
+# Справочники для полей выбора в формах
+# ---------------------------------------------------------------------------
+
+
+def list_labs(conn: sqlite3.Connection) -> list[dict]:
+    """Лаборатории по id: lab_id, name, sample_count (сколько образцов туда отправлено)."""
+    rows = conn.execute(
+        """
+        SELECT l.lab_id, l.name,
+               (SELECT count(*) FROM sample_shipment sh WHERE sh.lab_id = l.lab_id)
+                   AS sample_count
+        FROM lab l
+        ORDER BY l.lab_id
+        """
+    )
+    return [dict(r) for r in rows]
+
+
+def list_gear(conn: sqlite3.Connection) -> list[dict]:
+    """Сети по id: gear_id, gear_type, mesh_cm, size_m, event_count (выездов с этой сетью)."""
+    rows = conn.execute(
+        """
+        SELECT g.gear_id, g.gear_type, g.mesh_cm, g.size_m,
+               (SELECT count(*) FROM sampling_event e WHERE e.gear_id = g.gear_id) AS event_count
+        FROM gear g
+        ORDER BY g.gear_id
+        """
+    )
+    return [dict(r) for r in rows]
+
+
+def list_regions(conn: sqlite3.Connection) -> list[dict]:
+    """Провинции по id: region_id, name, country, city_count."""
+    rows = conn.execute(
+        """
+        SELECT r.region_id, r.name, r.country,
+               (SELECT count(*) FROM city c WHERE c.region_id = r.region_id) AS city_count
+        FROM region r
+        ORDER BY r.region_id
+        """
+    )
+    return [dict(r) for r in rows]
+
+
+def list_cities(conn: sqlite3.Connection, region_id: int | None = None) -> list[dict]:
+    """Города (все или одной провинции) по названию: city_id, name, name_latin,
+    region_id, region, site_count (мест у города). Нет такой провинции — NotFoundError."""
+    conditions: list[str] = []
+    params: list = []
+    if region_id is not None:
+        _require(
+            conn,
+            "SELECT 1 FROM region WHERE region_id = ?",
+            region_id,
+            f"Провинции №{region_id} нет.",
+        )
+        conditions.append("c.region_id = ?")
+        params.append(region_id)
+    rows = conn.execute(
+        f"""
+        SELECT c.city_id, c.name, c.name_latin, c.region_id, r.name AS region,
+               (SELECT count(*) FROM sampling_site st WHERE st.city_id = c.city_id) AS site_count
+        FROM city c JOIN region r ON r.region_id = c.region_id
+        WHERE {_where(conditions)}
+        ORDER BY c.name, r.name
+        """,
+        params,
+    )
+    return [dict(r) for r in rows]
+
+
+def list_shipments(conn: sqlite3.Connection, sample_id: int) -> list[dict]:
+    """Куда отправлен образец: sample_id, lab_id, lab, sent_on (для кнопки «удалить отправку»).
+
+    Нет такого образца — NotFoundError.
+    """
+    _require(
+        conn, "SELECT 1 FROM sample WHERE sample_id = ?", sample_id, f"Образца №{sample_id} нет."
+    )
+    rows = conn.execute(
+        "SELECT sh.sample_id, sh.lab_id, l.name AS lab, sh.sent_on FROM sample_shipment sh "
+        "JOIN lab l ON l.lab_id = sh.lab_id WHERE sh.sample_id = ? ORDER BY l.name",
+        (sample_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+def field_choices() -> dict[str, list[str]]:
+    """Допустимые значения полей выбора — из тех же констант, по которым проверяет ввод.
+
+    site_type, point_type, sample_type, sex, coord_source (entry.py);
+    method, confidence — определения вида (edit.py); capture_method — четыре способа
+    получения (importer.py; список из базы — list_capture_methods).
+    """
+    return {
+        "site_type": list(SITE_TYPES),
+        "point_type": list(POINT_TYPES),
+        "sample_type": list(SAMPLE_TYPES),
+        "sex": list(SEXES),
+        "coord_source": list(COORD_SOURCES.values()),
+        "method": list(METHODS),
+        "confidence": list(CONFIDENCES),
+        "capture_method": list(CAPTURE_METHODS),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Текущие значения записи — чтобы заполнить форму правки
+# ---------------------------------------------------------------------------
+
+# вид записи → (запрос по id, как назвать в сообщении «нет такой записи»).
+# Колонки названы так же, как поля функций правки (records.update_…): значения
+# можно сразу подставить в форму и отправить обратно.
+RECORD_SQL = {
+    "expedition": ("SELECT * FROM expedition WHERE expedition_id = ?", "Экспедиции"),
+    "site": (
+        """SELECT st.*, c.name AS city, r.name AS region FROM sampling_site st
+           LEFT JOIN city c ON c.city_id = st.city_id
+           LEFT JOIN region r ON r.region_id = c.region_id WHERE st.site_id = ?""",
+        "Места",
+    ),
+    "event": (
+        """SELECT e.*, m.name AS capture_method, g.mesh_cm AS gear_mesh, g.size_m AS gear_size
+           FROM sampling_event e
+           JOIN capture_method m ON m.capture_method_id = e.capture_method_id
+           LEFT JOIN gear g ON g.gear_id = e.gear_id WHERE e.event_id = ?""",
+        "Выезда",
+    ),
+    "trawling": ("SELECT * FROM trawling WHERE trawling_id = ?", "Траления"),
+    "water_measurement": (
+        """SELECT w.*, t.trawl_no FROM water_measurement w
+           LEFT JOIN trawling t ON t.trawling_id = w.trawling_id WHERE w.measurement_id = ?""",
+        "Замера воды",
+    ),
+    "specimen": (
+        """SELECT s.*, t.trawl_no, m.name AS capture_method FROM specimen s
+           LEFT JOIN trawling t ON t.trawling_id = s.trawling_id
+           LEFT JOIN capture_method m ON m.capture_method_id = s.capture_method_id
+           WHERE s.specimen_id = ?""",
+        "Особи",
+    ),
+    "sample": ("SELECT * FROM sample WHERE sample_id = ?", "Образца"),
+    "catch_record": (
+        """SELECT c.*, t.trawl_no FROM catch_record c
+           LEFT JOIN trawling t ON t.trawling_id = c.trawling_id WHERE c.catch_id = ?""",
+        "Записи прилова",
+    ),
+    "identification": (
+        "SELECT * FROM species_identification WHERE identification_id = ?",
+        "Определения вида",
+    ),
+}
+
+
+def get_record(conn: sqlite3.Connection, kind: str, record_id: int) -> dict:
+    """Все колонки одной записи + понятные поля для формы правки.
+
+    kind — вид записи (ключ RECORD_SQL): expedition, site, event, trawling,
+    water_measurement, specimen, sample, catch_record, identification.
+    Дополнительно к колонкам таблицы: у места — city, region (названия); у выезда —
+    capture_method, gear_mesh, gear_size; у замера, особи, прилова — trawl_no; у особи —
+    capture_method (свой способ; None — как у выезда).
+    Неизвестный kind — ValueError; нет записи — NotFoundError.
+    """
+    if kind not in RECORD_SQL:
+        raise ValueError(f"Вид записи «{kind}» не известен. Возможные: {', '.join(RECORD_SQL)}.")
+    sql, what = RECORD_SQL[kind]
+    return dict(_require(conn, sql, record_id, f"{what} №{record_id} нет."))

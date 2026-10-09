@@ -1,8 +1,20 @@
 {% extends "base.html" %}
 {% from "_macros.html" import value %}
+{% from "_entry_macros.html" import entry_form, text, date, area, submit %}
 {% block title %}Экспедиции{% endblock %}
 {% block content %}
 <h1>Экспедиции</h1>
+{% set f = form_view(submitted, "f-expedition") %}
+{% call entry_form(f, url_for('expedition_new'), "Новая экспедиция",
+    "Даты можно не указывать: их заполнит первый выезд. Потом в карточке экспедиции добавьте выезды.") %}
+  <div class="form-grid">
+    {{ text(f, "name", "Название", required=true, placeholder="например Кантхо 2027", wide=true) }}
+    {{ date(f, "date_start", "Дата начала") }}
+    {{ date(f, "date_end", "Дата окончания") }}
+    {{ area(f, "notes", "Примечания") }}
+  </div>
+  {{ submit(f, "Создать экспедицию") }}
+{% endcall %}
 {% if expeditions %}
 <div class="table-wrap">
   <table class="list">

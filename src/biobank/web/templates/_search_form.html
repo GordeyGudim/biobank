@@ -1,0 +1,9 @@
+{#- Форма поиска особи по номеру. Метод GET: поиск ничего не меняет, адрес можно сохранить. -#}
+<form class="search" action="{{ url_for('search') }}" method="get">
+  <label for="label">Номер пробы</label>
+  <input id="label" name="label" type="search" value="{{ label or '' }}"
+         placeholder="например 26 ph, 155pc, 107" autocomplete="off" required
+         {% if error %}aria-invalid="true" aria-describedby="label-error"{% endif %}>
+  <button type="submit">Найти</button>
+  {% if error %}<p class="field-error" id="label-error">{{ error }}</p>{% endif %}
+</form>

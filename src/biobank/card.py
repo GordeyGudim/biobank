@@ -5,6 +5,9 @@ specimen_card() возвращает список разделов (CardSection 
 
 Разделы: особь (промеры, вид, выезд, место), история определений, образцы и
 лаборатории, результаты анализов, вода, проблемы из журнала data_issue.
+
+Для ссылок в вебе у разделов есть row_ids (id выезда, места, образца, проблемы…):
+в запросах это колонки с именем на «_», в терминале они не печатаются (tables.query_section).
 """
 
 from __future__ import annotations
@@ -17,7 +20,8 @@ from biobank.tables import CardSection, query_section, render_sections
 # Основные сведения. coalesce(a, b) — первое не-NULL: свой способ/место особи,
 # если записаны, иначе — как у выезда.
 SPECIMEN_SQL = """
-SELECT s.specimen_id, s.event_id, s.trawling_id,
+SELECT s.specimen_id, s.event_id, s.trawling_id, s.species_id, e.expedition_id,
+       coalesce(s.capture_site_id, e.site_id) AS site_id,
        s.label, s.label_raw, sp.scientific_name AS species,
        x.name AS expedition, e.source_sheet, e.event_date, s.capture_date,
        em.name AS event_method, cm.name AS own_method,
@@ -40,7 +44,8 @@ WHERE s.specimen_id = ?
 IDENTIFICATIONS_SQL = """
 SELECT si.identified_on AS "дата", si.method AS "метод", si.confidence AS "уверенность",
        coalesce(sp.scientific_name, '(не определён)') AS "вид",
-       si.identified_by AS "кто", si.raw_text AS "в таблице записано", si.notes AS "примечания"
+       si.identified_by AS "кто", si.raw_text AS "в таблице записано", si.notes AS "примечания",
+       si.identification_id AS _identification_id, si.species_id AS _species_id
 FROM species_identification si
 LEFT JOIN species sp ON sp.species_id = si.species_id
 WHERE si.specimen_id = ?
@@ -52,7 +57,8 @@ ORDER BY si.identification_id
 SAMPLES_SQL = """
 SELECT sa.sample_type AS "тип", sa.organ AS "орган", sa.label AS "метка",
        sa.preservative AS "фиксация", group_concat(l.name, '; ') AS "отправлен",
-       sa.raw_value AS "в таблице записано", sa.notes AS "примечания"
+       sa.raw_value AS "в таблице записано", sa.notes AS "примечания",
+       sa.sample_id AS _sample_id
 FROM sample sa
 LEFT JOIN sample_shipment sh ON sh.sample_id = sa.sample_id
 LEFT JOIN lab l              ON l.lab_id = sh.lab_id
@@ -63,7 +69,8 @@ ORDER BY sa.sample_id
 
 ANALYSES_SQL = """
 SELECT sa.label AS "образец", a.analysis_type AS "анализ", a.analysed_on AS "дата",
-       l.name AS "лаборатория", a.result AS "результат", a.accession AS "номер"
+       l.name AS "лаборатория", a.result AS "результат", a.accession AS "номер",
+       a.analysis_id AS _analysis_id, a.sample_id AS _sample_id
 FROM analysis a
 JOIN sample sa  ON sa.sample_id = a.sample_id
 LEFT JOIN lab l ON l.lab_id = a.lab_id
@@ -78,7 +85,8 @@ SELECT t.trawl_no AS "трал", w.point_type AS "точка", w.measured_time A
        w.lat AS "широта", w.lon AS "долгота", w.depth_m AS "глубина, м",
        w.o2_pct AS "O2, %", w.ppm AS "ppm", w.conductivity_ms AS "mS",
        w.conductivity_us AS "uS", w.ph AS "pH", w.water_temp_c AS "t воды",
-       w.notes AS "примечания"
+       w.notes AS "примечания",
+       w.measurement_id AS _measurement_id, w.trawling_id AS _trawling_id
 FROM water_measurement w
 LEFT JOIN trawling t ON t.trawling_id = w.trawling_id
 WHERE {where}
@@ -96,7 +104,8 @@ SELECT issue_id AS "id",
        category AS "категория", cell AS "ячейка", raw_value AS "значение",
        description AS "описание",
        CASE resolved WHEN 1 THEN 'решено: ' || coalesce(resolution, '') ELSE 'открыто' END
-           AS "статус"
+           AS "статус",
+       issue_id AS _issue_id
 FROM data_issue
 WHERE (table_name = 'specimen' AND record_id = :specimen_id)
    OR object_label = :label
@@ -138,7 +147,17 @@ def _main_section(s: sqlite3.Row) -> CardSection:
         ("примечания", s["notes"]),
         ("строка в Excel", s["source_row"]),
     ]
-    return CardSection("Особь", ["поле", "значение"], fields, is_fields=True)
+    # ссылки для веба: поле → id записи, на которую оно указывает
+    links = {
+        "номер пробы": {"specimen_id": s["specimen_id"]},
+        "вид (текущий)": {"species_id": s["species_id"]},
+        "экспедиция": {"expedition_id": s["expedition_id"]},
+        "выезд (лист)": {"event_id": s["event_id"]},
+        "место": {"site_id": s["site_id"]},
+        "траление": {"trawling_id": s["trawling_id"]},
+    }
+    row_ids = [links.get(name, {}) for name, _ in fields]
+    return CardSection("Особь", ["поле", "значение"], fields, is_fields=True, row_ids=row_ids)
 
 
 def _water_section(conn: sqlite3.Connection, s: sqlite3.Row) -> CardSection:

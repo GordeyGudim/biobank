@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Журнал проблем{% endblock %}
+{% block content %}
+<h1>Журнал проблем</h1>
+<p>Спорные значения в базе не исправляются молча — они записаны здесь. Когда проблема
+  разобрана, напишите, как решили, и нажмите «Решено». Резервная копия базы делается перед
+  каждой записью.</p>
+{% from "_macros.html" import value %}
+<section class="section">
+  <h2>{{ section.title }} <small>(строк: {{ section.rows | length }})</small></h2>
+  {% if section.rows %}
+  <div class="table-wrap">
+    <table class="issues">
+      <thead><tr>
+        {% for col in section.columns %}<th scope="col">{{ col }}</th>{% endfor %}
+        <th scope="col">решение</th>
+      </tr></thead>
+      <tbody>
+      {% for row in section.rows %}
+        {% set issue_id = row[id_index] %}
+        <tr id="issue-{{ issue_id }}">
+          {% for v in row %}<td>{{ value(v) }}</td>{% endfor %}
+          <td class="action">{% include "_resolve_form.html" %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">{{ section.empty_text }}</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -101,6 +101,7 @@ cd biobank
 python -m venv .venv                 # создать окружение (один раз)
 source .venv/bin/activate            # включать в каждом новом терминале
 pip install -e '.[dev]'              # установить проект и инструменты разработки
+pip install -e '.[web]'              # (по желанию) сайт: python -m biobank web
 ```
 
 Для просмотра базы удобно поставить (Arch Linux; в других системах — аналогичные пакеты):
@@ -123,6 +124,19 @@ python -m biobank export                    # всё в Excel: output/biobank.xl
 ```
 
 Справка по любой команде: `python -m biobank --help`, `python -m biobank identify --help`.
+
+### Сайт (первая версия)
+
+```bash
+python -m biobank web                      # затем открыть в браузере http://127.0.0.1:5000/
+python -m biobank --db копия.db web        # лучше пробовать на копии базы
+python -m biobank web --port 5001          # если порт 5000 занят
+```
+
+Что есть: поиск по номеру пробы (`155pc`, `26 ph` — в любом написании) и карточка особи,
+отчёты, журнал проблем с кнопкой «Решено». Сайт открывается **только на этом компьютере**
+(адрес 127.0.0.1), входа по паролю пока нет. Кнопка «Решено» меняет базу по-настоящему —
+перед этим делается резервная копия, как у команд правки. Остановить сайт — `Ctrl+C`.
 
 ## 3. Команды
 
@@ -413,7 +427,7 @@ ORDER BY i.identification_id;
 ## 8. Для разработки
 
 ```bash
-pytest              # все тесты (≈750; используют data/source.xlsx, но не трогают output/)
+pytest              # все тесты (≈815; используют data/source.xlsx, но не трогают output/)
 pytest -k histology # только тесты со словом histology в имени
 ruff check .        # стиль кода
 ruff format .       # автоформатирование
@@ -429,6 +443,8 @@ ruff format .       # автоформатирование
 | `src/biobank/entry.py` | ввод новых данных (`create_…`, `add_…`), проверки при вводе (`validate_specimen`) |
 | `src/biobank/export.py`, `reports.py` | выгрузка и отчёты |
 | `src/biobank/card.py`, `tables.py` | карточка особи; разделы-таблицы (`CardSection`) и их печать |
+| `src/biobank/browse.py` | списки и карточки для сайта: особи с фильтрами, выезды, места, журнал (только чтение) |
+| `src/biobank/web/` | сайт: Flask (`app.py`), шаблоны Jinja2 (`templates/`), HTMX и стили (`static/`) |
 | `src/biobank/db.py`, `__main__.py` | подключение к базе (и только на чтение), резервные копии; командная строка |
 | `tests/` | тесты pytest; `conftest.py` — общий импорт книги на весь прогон |
 | `legacy/` | старая версия (схема v1) — для справки |

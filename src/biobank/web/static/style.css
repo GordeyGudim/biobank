@@ -1,0 +1,123 @@
+/* Оформление сайта biobank: простое, читаемое на ноутбуке и телефоне. Без внешних шрифтов. */
+
+:root {
+  --text: #1f2933;
+  --muted: #6b7680;
+  --line: #d5dbe1;
+  --head: #eef2f5;
+  --accent: #1d5f8a;
+  --error-bg: #fdecea;
+  --error: #9b1c1c;
+  --ok-bg: #e7f5ea;
+  --ok: #1e6b34;
+  --warn-bg: #fff4d6;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+  font-size: 16px;
+  line-height: 1.45;
+  color: var(--text);
+  background: #fff;
+}
+
+/* --- верхнее меню --- */
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.5rem;
+  padding: 0.6rem 1rem;
+  background: var(--accent);
+}
+.top a { color: #fff; text-decoration: none; }
+.brand { font-weight: 700; font-size: 1.15rem; }
+.top nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; }
+.top nav a { padding: 0.2rem 0.4rem; border-radius: 4px; }
+.top nav a:hover, .top nav a[aria-current="page"] { background: rgba(255, 255, 255, 0.2); }
+
+main { max-width: 1400px; margin: 0 auto; padding: 1rem; }
+
+h1 { font-size: 1.5rem; margin: 0.5rem 0 1rem; }
+h2 { font-size: 1.15rem; margin: 1.5rem 0 0.5rem; }
+h2 small { font-weight: normal; color: var(--muted); font-size: 0.85rem; }
+a { color: var(--accent); }
+.crumbs { margin: 0; color: var(--muted); }
+.note { margin: 0 0 0.5rem; color: var(--muted); font-style: italic; }
+.small { font-size: 0.85rem; color: var(--muted); }
+
+/* --- таблицы: широкие прокручиваются по горизонтали внутри своей рамки --- */
+.table-wrap {
+  overflow-x: auto;
+  max-height: 75vh;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+th, td {
+  border-bottom: 1px solid var(--line);
+  padding: 0.35rem 0.55rem;
+  text-align: left;
+  vertical-align: top;
+}
+thead th {
+  position: sticky; /* шапка остаётся видна при прокрутке */
+  top: 0;
+  background: var(--head);
+  white-space: nowrap;
+}
+tbody tr:nth-child(even) { background: #f8fafb; }
+tbody tr:hover { background: #eef5fb; }
+table.fields { width: auto; min-width: 50%; }
+table.fields th { background: var(--head); white-space: nowrap; width: 1%; }
+.empty { color: var(--muted); }
+:target { outline: 2px solid var(--accent); } /* строка журнала, на которую ведёт ссылка #issue-N */
+
+/* --- формы --- */
+label { display: block; font-weight: 600; margin-bottom: 0.2rem; }
+input[type="text"], input[type="search"] {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #9aa5b1;
+  border-radius: 4px;
+  max-width: 100%;
+}
+input[aria-invalid="true"] { border-color: var(--error); }
+button {
+  font: inherit;
+  padding: 0.35rem 0.9rem;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+button[disabled] { opacity: 0.5; cursor: wait; }
+.search { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 1rem 0; }
+.search label { width: 100%; }
+.search input { width: 22rem; }
+.field-error { width: 100%; margin: 0.25rem 0 0; color: var(--error); }
+
+/* форма «Решено» в журнале */
+td.action { min-width: 16rem; }
+.resolve label { font-weight: normal; font-size: 0.85rem; color: var(--muted); }
+.resolve input { width: 100%; margin-bottom: 0.3rem; }
+.resolved { background: var(--ok-bg); color: var(--ok); padding: 0.3rem 0.5rem; border-radius: 4px; }
+
+/* --- сообщения --- */
+.flash { padding: 0.5rem 0.75rem; border-radius: 4px; }
+.flash-error { background: var(--error-bg); color: var(--error); }
+.flash-ok { background: var(--ok-bg); color: var(--ok); }
+.badge-warn { background: var(--warn-bg); padding: 0.5rem 0.75rem; border-radius: 4px; }
+
+.links li { margin: 0.3rem 0; }
+
+@media (max-width: 600px) {
+  main { padding: 0.5rem; }
+  .search input { width: 100%; }
+  table { font-size: 0.85rem; }
+}

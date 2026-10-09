@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Особь не найдена{% endblock %}
+{% block content %}
+<h1>Особь не найдена</h1>
+<p class="flash flash-error">{{ message }}</p>
+<p>Проверьте номер и попробуйте ещё раз.</p>
+{% include "_search_form.html" %}
+{% endblock %}

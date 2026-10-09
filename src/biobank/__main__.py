@@ -1,6 +1,7 @@
 """Командная строка: python -m biobank <команда>.
 
-Команды: init, import, check, export, report, sql, show, link-trawl, identify, resolve-issue;
+Команды: init, import, check, export, report, sql, show, link-trawl, identify, resolve-issue,
+web (сайт);
 ввод новых данных (entry.py): add-expedition, add-site, add-event, add-trawling, add-water,
 next-label, add-specimen, update-measurements, add-sample, ship-sample, add-analysis, add-catch.
 """
@@ -54,6 +55,8 @@ from biobank.export import export_csv, export_xlsx
 from biobank.importer import prepare_import
 from biobank.reports import REPORTS, render_report
 from biobank.tables import format_table, run_query
+
+WEB_HOST = "127.0.0.1"  # сайт доступен только с этого компьютера (до входа по паролю)
 
 
 def ask_yes_no(question: str) -> bool:
@@ -230,6 +233,23 @@ def cmd_show(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     print(render_card(sections, args.width, screen_width()))
+    return 0
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    """Запустить сайт на этом компьютере: http://127.0.0.1:<порт>/."""
+    if not _require_db(args.db):
+        return 1
+    try:
+        # Flask — необязательная зависимость: импортируем только здесь, чтобы
+        # остальные команды работали и без него
+        from biobank.web.app import create_app
+    except ImportError:
+        print("Для сайта нужен Flask: .venv/bin/pip install -e '.[web]'", file=sys.stderr)
+        return 1
+    print(f"Сайт: http://{WEB_HOST}:{args.port}/  (остановить — Ctrl+C)")
+    # только 127.0.0.1: входа по паролю пока нет, из сети сайт открываться не должен
+    create_app(args.db).run(host=WEB_HOST, port=args.port, debug=False)
     return 0
 
 
@@ -612,6 +632,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_resolve.add_argument("issue_id", type=int, help="номер проблемы (report issues)")
     p_resolve.add_argument("resolution", help="как решили, в кавычках")
     p_resolve.set_defaults(func=cmd_resolve_issue)
+
+    p_web = sub.add_parser("web", help="веб-интерфейс на этом компьютере (127.0.0.1)")
+    p_web.add_argument("--port", type=int, default=5000, help="порт (по умолчанию 5000)")
+    p_web.set_defaults(func=cmd_web)
 
     _add_entry_parsers(sub)
     return parser

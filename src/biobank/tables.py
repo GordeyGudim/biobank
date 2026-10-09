@@ -11,12 +11,17 @@ from __future__ import annotations
 import sqlite3
 import textwrap
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
 class CardSection:
-    """Раздел карточки или отчёта: таблица с заголовком."""
+    """Раздел карточки или отчёта: таблица с заголовком.
+
+    row_ids — служебные id записей для ссылок в вебе, по словарю на строку rows
+    (в том же порядке): {"sample_id": 12}, {"event_id": 3, "site_id": 5}, {} — ссылок нет.
+    В терминале не печатаются. Пустой список — у раздела ссылок нет вообще.
+    """
 
     title: str
     columns: list[str]
@@ -24,6 +29,12 @@ class CardSection:
     empty_text: str = "(нет)"
     note: str | None = None  # пояснение под заголовком
     is_fields: bool = False  # таблица «поле — значение» (одна запись), а не список строк
+    row_ids: list[dict[str, int | None]] = field(default_factory=list)
+
+
+# Колонки запроса с именем на «_» — служебные id: их не показывают, а переносят в row_ids.
+# Например, sa.sample_id AS "_sample_id" → row_ids[i]["sample_id"].
+HIDDEN_PREFIX = "_"
 
 
 def query_section(
@@ -33,9 +44,27 @@ def query_section(
     params: Sequence | dict = (),
     empty_text: str = "(нет)",
 ) -> CardSection:
-    """Выполнить запрос и вернуть результат как раздел."""
+    """Выполнить запрос и вернуть результат как раздел.
+
+    Колонки с именем на «_» (служебные id) уходят из таблицы в row_ids.
+
+    >>> conn = sqlite3.connect(":memory:")
+    >>> sec = query_section(conn, "Образцы", "SELECT 7 AS _sample_id, 'печень' AS орган")
+    >>> sec.columns, sec.rows, sec.row_ids
+    (['орган'], [('печень',)], [{'sample_id': 7}])
+    """
     columns, rows = run_query(conn, sql, params)
-    return CardSection(title, columns, [tuple(r) for r in rows], empty_text)
+    hidden = [i for i, c in enumerate(columns) if c.startswith(HIDDEN_PREFIX)]
+    if not hidden:
+        return CardSection(title, columns, [tuple(r) for r in rows], empty_text)
+    shown = [i for i in range(len(columns)) if i not in hidden]
+    return CardSection(
+        title,
+        [columns[i] for i in shown],
+        [tuple(r[i] for i in shown) for r in rows],
+        empty_text,
+        row_ids=[{columns[i][len(HIDDEN_PREFIX) :]: r[i] for i in hidden} for r in rows],
+    )
 
 
 def _cell_text(value, max_width: int) -> str:

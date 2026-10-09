@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% from "_macros.html" import section_table %}
+{#- sections — разделы specimen_card: первый — «Особь» (поле — значение),
+    последний — проблемы из журнала (особь и её выезд). Номер — первое поле раздела «Особь». -#}
+{% block title %}Особь {{ (sections[0].rows | first)[1] }}{% endblock %}
+{% block content %}
+<h1>Особь {{ (sections[0].rows | first)[1] }}</h1>
+{% set issues = sections[-1] %}
+{% set status = issues.columns.index("статус") %}
+{% set open_count = issues.rows | selectattr(status, "equalto", "открыто") | list | length %}
+{% if open_count %}
+<p class="badge-warn"><a href="#issues">Открытых проблем в журнале: {{ open_count }}</a>
+  — значения показаны как в базе, без исправлений.</p>
+{% endif %}
+{% for sec in sections %}
+  {% if loop.last %}<div id="issues">{{ section_table(sec, issue_links=true) }}</div>
+  {% else %}{{ section_table(sec) }}{% endif %}
+{% endfor %}
+{% include "_search_form.html" %}
+{% endblock %}

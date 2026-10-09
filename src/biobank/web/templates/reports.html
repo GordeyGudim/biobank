@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Отчёты{% endblock %}
+{% block content %}
+<h1>Отчёты</h1>
+<ul class="links">
+  {% for name, title in titles.items() %}
+  <li><a href="{{ url_for('report', name=name) }}">{{ title }}</a></li>
+  {% endfor %}
+</ul>
+{% endblock %}

@@ -1,0 +1,49 @@
+{#- Макрос — «функция» шаблона: таблица раздела (CardSection) пишется один раз,
+    а используется в карточке особи, отчётах и журнале. -#}
+
+{#- Значение ячейки: пустое (NULL) — серый прочерк «—» с подсказкой, а не пустота. -#}
+{% macro value(v) -%}
+  {%- set text = v | cell -%}
+  {%- if text is none -%}<span class="empty" title="не заполнено">—</span>
+  {%- else -%}{{ text }}{%- endif -%}
+{%- endmacro %}
+
+{#- Раздел: заголовок, пояснение, таблица. Все колонки показываются, даже пустые
+    (решение пользователя: у всех особей одинаковый вид, сразу видно, что не заполнено).
+    issue_links — первая колонка «id» ведёт в журнал проблем. -#}
+{% macro section_table(sec, issue_links=false) %}
+<section class="section">
+  <h2>{{ sec.title }}{% if not sec.is_fields %} <small>(строк: {{ sec.rows | length }})</small>{% endif %}</h2>
+  {% if sec.note %}<p class="note">{{ sec.note }}</p>{% endif %}
+  {% if sec.rows %}
+  <div class="table-wrap">
+    {% if sec.is_fields %}
+    <table class="fields">
+      {% for name, v in sec.rows %}
+      <tr><th scope="row">{{ name }}</th><td>{{ value(v) }}</td></tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <table>
+      <thead><tr>{% for col in sec.columns %}<th scope="col">{{ col }}</th>{% endfor %}</tr></thead>
+      <tbody>
+      {% for row in sec.rows %}
+        <tr>
+        {% for v in row %}
+          {% if issue_links and sec.columns[loop.index0] == "id" %}
+          <td><a href="{{ url_for('issues', _anchor='issue-' ~ v) }}" title="открыть в журнале проблем">№{{ v }}</a></td>
+          {% else %}
+          <td>{{ value(v) }}</td>
+          {% endif %}
+        {% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+  {% else %}
+  <p class="empty">{{ sec.empty_text }}</p>
+  {% endif %}
+</section>
+{% endmacro %}

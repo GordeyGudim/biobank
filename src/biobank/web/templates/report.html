@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% from "_macros.html" import section_table %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('reports') }}">Отчёты</a> /</p>
+<h1>{{ title }}</h1>
+{% for sec in sections %}{{ section_table(sec, issue_links=(name == "issues")) }}{% endfor %}
+{% endblock %}

@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="flash flash-error">{{ message }}</p>
+<p><a href="{{ url_for('index') }}">На страницу поиска</a></p>
+{% endblock %}

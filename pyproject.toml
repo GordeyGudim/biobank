@@ -12,12 +12,18 @@ dependencies = ["openpyxl>=3.1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5"]
+# веб-интерфейс (python -m biobank web): pip install -e '.[web]'
+web = ["flask>=3.0"]
 
 [project.scripts]
 biobank = "biobank.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# шаблоны и статика сайта — не .py, их надо явно включить в пакет
+[tool.setuptools.package-data]
+"biobank.web" = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "src"]

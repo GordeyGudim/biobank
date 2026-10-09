@@ -1,0 +1,18 @@
+{#- Форма «Решено» для одной проблемы. Фрагмент: вставляется в журнал и возвращается
+    сервером заново, если запись не удалась (с текстом ошибки рядом с полем).
+
+    hx-post — HTMX отправит форму запросом POST без перезагрузки страницы;
+    hx-swap="outerHTML" — ответ сервера заменит эту форму целиком;
+    hx-sync="this:drop" — пока запрос идёт, повторные нажатия игнорируются;
+    hx-disabled-elt — на время запроса кнопка и поле неактивны (защита от двойного нажатия).
+    Без JavaScript форма тоже работает: обычный POST и возврат на журнал. -#}
+<form class="resolve" method="post" action="{{ url_for('resolve', issue_id=issue_id) }}"
+      hx-post="{{ url_for('resolve', issue_id=issue_id) }}" hx-swap="outerHTML"
+      hx-sync="this:drop" hx-disabled-elt="find button, find input">
+  <label for="resolution-{{ issue_id }}">Как решили (№{{ issue_id }})</label>
+  <input id="resolution-{{ issue_id }}" name="resolution" type="text" required
+         value="{{ resolution or '' }}"
+         {% if error %}aria-invalid="true" aria-describedby="resolution-error-{{ issue_id }}"{% endif %}>
+  <button type="submit">Решено</button>
+  {% if error %}<p class="field-error" id="resolution-error-{{ issue_id }}" role="alert">{{ error }}</p>{% endif %}
+</form>

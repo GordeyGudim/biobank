@@ -16,7 +16,7 @@
       {% for issue in page.items %}
         {% set issue_id = issue.issue_id %}
         <tr id="issue-{{ issue_id }}">
-          <td class="num">{{ issue_id }}</td>
+          <td class="num"><a href="{{ url_for('issue', issue_id=issue_id) }}">{{ issue_id }}</a></td>
           <td>{{ issue.category }}</td>
           <td>{{ value(issue.table_title) }}</td>
           <td>{% if issue.object_url %}<a href="{{ issue.object_url }}">{{ issue.object_label }}</a>{% else %}{{ value(issue.object_label) }}{% endif %}</td>

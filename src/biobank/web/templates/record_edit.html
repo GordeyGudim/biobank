@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% from "_entry_macros.html" import entry_form, text, date, select, area, check, submit %}
+{#- Форма правки одной записи (record_forms.py). Поля — из KINDS[вид].fields, заполнены
+    из базы (browse.get_record). Скрытые поля old_… — что было показано: сервер сравнит
+    и отправит в records.update_… только исправленное. Пустое поле — стереть значение. -#}
+{% block title %}Изменить: {{ title }}{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ back }}">← назад, без изменений</a></p>
+<h1>Изменить: {{ title }}</h1>
+{% call entry_form(f, request.path, "Изменить " ~ kind.title,
+    "Меняются только исправленные поля. Пустое поле — значение будет стёрто. Числа можно с запятой.") %}
+  <div class="form-grid">
+    {% for fld in kind.fields %}
+      {% if fld.widget == "select" %}
+        {{ select(f, fld.name, fld.label, choices.get(fld.choices, []), required=fld.required, empty=fld.empty, hint=fld.hint) }}
+      {% elif fld.widget == "date" %}
+        {{ date(f, fld.name, fld.label, required=fld.required, hint=fld.hint) }}
+      {% elif fld.widget == "area" %}
+        {{ area(f, fld.name, fld.label, hint=fld.hint) }}
+      {% elif fld.widget == "check" %}
+        {{ check(f, fld.name, fld.label, hint=fld.hint) }}
+      {% else %}
+        {{ text(f, fld.name, fld.label, required=fld.required, hint=fld.hint,
+                placeholder=fld.placeholder or ("9:30" if fld.widget == "time" else none),
+                number=(fld.widget == "number"), list=("dl-" ~ fld.datalist if fld.datalist else none)) }}
+      {% endif %}
+    {% endfor %}
+    {% if kind_name == "site" %}
+      {#- галочки — как в форме нового места: новая провинция и «это другое место» только явно -#}
+      {% set g = {"id": f.id, "data": extra, "error": f.error} %}
+      {{ check(g, "new_region", "Это новая провинция", hint="отметьте, только если провинции точно нет в списке") }}
+      {{ check(g, "allow_nearby", "Это действительно другое место", hint="если рядом есть похожее место, а это другое") }}
+    {% endif %}
+  </div>
+  {% for fld in kind.fields %}{% if fld.datalist %}
+  <datalist id="dl-{{ fld.datalist }}">{% for value, _ in choices.get(fld.datalist, []) %}<option value="{{ value }}">{% endfor %}</datalist>
+  {% endif %}{% endfor %}
+  {% for name, v in f.old.items() %}<input type="hidden" name="old_{{ name }}" value="{{ v }}">{% endfor %}
+  {{ submit(f, "Сохранить изменения") }}
+{% endcall %}
+{% endblock %}

@@ -14,8 +14,10 @@
 Числа («25,4»), даты («15.09.2026»), время («9.30») здесь не разбираются — текст из формы
 передаётся в функции entry.py как есть, они его проверяют и разбирают.
 
-Две «предварительные» проверки (только чтение, до записи) — особь и промеры (мягкие
-предупреждения ждут кнопки «Всё равно сохранить») и место (похожее место уже есть).
+Предварительные проверки (только чтение, до записи) делает логика, а не сайт:
+entry.check_specimen и entry.check_measurements_update (мягкие предупреждения ждут кнопки
+«Всё равно сохранить»), entry.preview_site (похожее место уже есть). Проверки те же,
+что при записи, — тексты ошибок и предупреждений совпадают.
 """
 
 from __future__ import annotations
@@ -25,8 +27,8 @@ from dataclasses import dataclass, field
 from flask import Flask, current_app, flash, redirect, render_template, request, url_for
 
 from biobank import entry
-from biobank.edit import EditError, NotFoundError, apply_edit, find_species
-from biobank.parsing import SUFFIXES, normalize_city, parse_label
+from biobank.edit import EditError, NotFoundError, apply_edit
+from biobank.parsing import SUFFIXES
 
 # ---------------------------------------------------------------------------
 # Состояние отправленной формы
@@ -131,10 +133,6 @@ SITE_GROUPS = (
     ("аквахозяйство", "Аквахозяйства"),
 )
 
-# Подсказки для полей образца (datalist): можно выбрать или написать своё.
-# Это не проверка — список лабораторий проверяет entry.add_sample / ship_sample.
-PRESERVATIVE_HINTS = ("этанол 96%", "этанол 96% (фиксация)", "формалин 10%", "заморозка")
-
 
 def grouped_sites(sites: list[dict]) -> list[tuple[str, list[dict]]]:
     """Места, разложенные по типу: [(заголовок группы, [места])…]; пустые группы пропущены."""
@@ -177,32 +175,6 @@ def site_hints(sites: list[dict]) -> dict[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def specimen_precheck(conn, values: dict) -> tuple[str | None, list[str]]:
-    """Номер пробы, под которым особь будет записана, и мягкие предупреждения о ней.
-
-    Повторяет то, что create_specimen проверит сама (validate_specimen), но без записи:
-    так предупреждения можно показать ДО сохранения. Жёсткая ошибка — EditError.
-    Номер: введённый, а если пусто — следующий свободный в серии кода вида (next_label);
-    None — подобрать нельзя (вид без кода), create_specimen сама объяснит, что делать.
-    """
-    numbers = {
-        column: entry.parse_entry_number(values[column], what)
-        for column, what in entry.MEASUREMENTS.items()
-    }
-    species = values["species"]
-    code = None
-    if species and species not in ("?", "-"):
-        code = find_species(conn, species)["code"]
-    label = values["label"] or (entry.next_label(conn, code) if code else None)
-    parsed = parse_label(label) if label else None
-    check = entry.validate_specimen(
-        *numbers.values(), suffix=parsed.suffix if parsed else None, species_code=code
-    )
-    if check.errors:
-        raise EditError(" ".join(check.errors))
-    return (parsed.label if parsed else label), check.warnings
-
-
 def confirmed(warnings: list[str]) -> bool:
     """Все ли эти предупреждения пользователь уже видел и подтвердил кнопкой.
 
@@ -210,22 +182,6 @@ def confirmed(warnings: list[str]) -> bool:
     подтверждения значения изменили и появилось новое предупреждение — спросим снова.
     """
     return set(warnings) <= set(request.form.getlist("confirmed"))
-
-
-def site_precheck(conn, values: dict) -> list:
-    """Похожие места (entry.find_nearby_sites), которые уже есть в базе.
-
-    Название и координаты готовятся так же, как в entry.create_site (название по
-    умолчанию — по правилам импорта, «Участок у <город>»). Если чего-то не хватает —
-    пустой список: create_site сама проверит ввод и объяснит ошибку.
-    """
-    lat = entry.parse_entry_number(values["lat"], "Широта", minimum=-90, maximum=90)
-    lon = entry.parse_entry_number(values["lon"], "Долгота", minimum=-180, maximum=180)
-    if (lat is None) != (lon is None) or values["site_type"] not in entry.SITE_TYPES:
-        return []
-    city = normalize_city(values["city"]).name if values["city"] else None
-    name = values["name"] or entry.default_site_name(values["site_type"], city, lat, lon)
-    return entry.find_nearby_sites(conn, values["site_type"], lat, lon, name)
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +233,12 @@ def register_entry_routes(app: Flask, pages) -> None:
         def page(status=400, **state):
             return pages.sites_page(Submitted("f-site", values, **state), status)
 
-        try:
-            nearby = site_precheck(pages.read_db(), values)
+        try:  # что сделает create_site — без записи: название, похожие места
+            _name, nearby = entry.preview_site(
+                pages.read_db(), values["site_type"], name=values["name"], lat=values["lat"],
+                lon=values["lon"], city=values["city"], region=values["region"],
+                new_region=checked("new_region"),
+            )  # fmt: skip
         except EditError as error:
             return page(error=str(error))
         # «Всё равно создать новое» — кнопка с номерами показанных похожих мест;
@@ -416,23 +376,34 @@ def register_entry_routes(app: Flask, pages) -> None:
         try:
             trawl_no = to_int(values["trawl_no"])
             site_id = to_int(values["capture_site_id"])
-            label, warnings = specimen_precheck(pages.read_db(), values)
-        except EditError as error:  # не число, TL ≤ 0, вида нет в справочнике…
+        except EditError as error:
             return page(error=str(error))
-        if warnings and not confirmed(warnings):
+        # одни и те же аргументы — для проверки без записи и для самой записи
+        arguments = dict(
+            confidence=values["confidence"] or None,
+            **{column: values[column] for column in entry.MEASUREMENTS},
+            sex=values["sex"] or None, is_dead=checked("is_dead"), trawl_no=trawl_no,
+            capture_method=values["capture_method"] or None, capture_site_id=site_id,
+            capture_date=values["capture_date"], identified_by=values["identified_by"],
+            notes=values["notes"],
+        )  # fmt: skip
+        try:  # не число, вида нет в справочнике… (нет выезда — NotFoundError → 404)
+            label, check = entry.check_specimen(
+                pages.read_db(), event_id, values["species"], values["label"] or None,
+                **arguments,
+            )  # fmt: skip
+        except NotFoundError:
+            raise
+        except EditError as error:
+            return page(error=str(error))
+        if check.errors:  # TL ≤ 0, номер занят, траления нет…
+            return page(error=" ".join(check.errors))
+        if check.warnings and not confirmed(check.warnings):
             values["label"] = label or ""  # номер, который будет записан, — виден сразу
-            return page(200, warnings=warnings)
+            return page(200, warnings=check.warnings)
 
         def action(conn):
-            return entry.create_specimen(
-                conn, event_id, values["species"] or None, label,
-                confidence=values["confidence"] or None,
-                **{column: values[column] for column in entry.MEASUREMENTS},
-                sex=values["sex"] or None, is_dead=checked("is_dead"), trawl_no=trawl_no,
-                capture_method=values["capture_method"] or None, capture_site_id=site_id,
-                capture_date=values["capture_date"], identified_by=values["identified_by"],
-                notes=values["notes"],
-            )  # fmt: skip
+            return entry.create_specimen(conn, event_id, values["species"], label, **arguments)
 
         # номер известен заранее (введён или подобран выше) — по нему откроем карточку;
         # без номера (вид без кода) create_specimen откажет и объяснит, что указать
@@ -497,14 +468,15 @@ def register_entry_routes(app: Flask, pages) -> None:
         changes = {name: values[name] for name in names if values[name] != values[f"old_{name}"]}
         if not changes:
             return page(error="Промеры не изменены — исправьте нужное поле и сохраните снова.")
-        try:
-            numbers = [entry.parse_entry_number(values[n], entry.MEASUREMENTS[n]) for n in names]
-        except EditError as error:
+        try:  # все четыре промера — какими станут после правки (без записи)
+            check = entry.check_measurements_update(pages.read_db(), label, **changes)
+        except NotFoundError:
+            raise
+        except EditError as error:  # «abc» — не число
             return page(error=str(error))
-        check = entry.validate_specimen(*numbers)  # все четыре промера — как будут в базе
         if check.errors:
             return page(error=" ".join(check.errors))
-        if changes and check.warnings and not confirmed(check.warnings):
+        if check.warnings and not confirmed(check.warnings):
             return page(200, warnings=check.warnings)
 
         def action(conn):

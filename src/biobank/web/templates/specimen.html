@@ -11,6 +11,10 @@
 <p class="crumbs"><a href="{{ url_for('specimens') }}">Особи</a> /
   <a href="{{ url_for('specimens', expedition=ids.expedition_id, event=ids.event_id) }}">все особи этого выезда</a></p>
 <h1>Особь {{ label }}</h1>
+{#- «Изменить» — номер, выезд, траление, пол… (промеры и вид — своими формами ниже) -#}
+<p class="record-actions">
+  {% for text, url in own_actions %}<a class="button-link{% if text == 'Удалить' %} danger{% endif %}" href="{{ url }}">{{ text }} {{ "сведения об особи" if text == "Изменить" else "особь" }}</a>{% endfor %}
+</p>
 {% set issues = views[-1].section %}
 {% set status = issues.columns.index("статус") %}
 {% set open_count = issues.rows | selectattr(status, "equalto", "открыто") | list | length %}
@@ -25,12 +29,26 @@
   {% include "_flashes.html" %}
   <p class="small">Перед каждой записью делается резервная копия базы. Изменения проверяются;
     если что-то не так — база не меняется, а причина написана у формы.</p>
-  {% include "_link_trawl_form.html" %}
+  {#- особь получена не тралением (рынок, рыбак, аквахозяйство) — привязывать не к чему -#}
+  {% if is_trawled or link_error %}{% include "_link_trawl_form.html" %}{% endif %}
   {% include "_identify_form.html" %}
   {% include "_form_measurements.html" %}
   {% include "_form_sample.html" %}
   {% include "_form_ship.html" %}
-  <p><a href="{{ url_for('event', event_id=ids.event_id, form='specimen', _anchor='f-specimen') }}">Ввести ещё одну особь этого выезда →</a></p>
+  {% if shipments %}
+  <details class="edit-form" id="shipments">
+    <summary>Отметки об отправке в лаборатории</summary>
+    <p class="small">Ошибочную отметку можно удалить (сам образец останется).</p>
+    <ul class="links">
+      {% for sample, sh in shipments %}
+      <li>{{ sample["метка"] }} ({{ sample["тип"] }}) → {{ sh.lab }}{% if sh.sent_on %}, {{ sh.sent_on }}{% endif %}
+        <a class="button-link small-button danger" href="{{ url_for('shipment_delete', sample_id=sh.sample_id, lab_id=sh.lab_id) }}">Удалить отметку</a></li>
+      {% endfor %}
+    </ul>
+  </details>
+  {% endif %}
+  <p><a href="{{ url_for('event', event_id=ids.event_id, form='specimen', _anchor='f-specimen') }}">Ввести ещё одну особь этого выезда →</a>
+    · <a href="{{ url_for('specimen_batch', event_id=ids.event_id) }}">ввести несколько особей таблицей →</a></p>
 </section>
 
 {% for view in views[1:] %}

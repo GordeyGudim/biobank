@@ -13,6 +13,14 @@
   {%- if url -%}<a href="{{ url }}">{{ value(v) }}</a>{%- else -%}{{ value(v) }}{%- endif -%}
 {%- endmacro %}
 
+{#- Кнопки «Изменить» / «Удалить» — обычные ссылки (GET): открывают страницу с формой
+    правки или с вопросом «Вы уверены?». Сама запись — только кнопкой на той странице (POST). -#}
+{% macro action_links(buttons) -%}
+  {%- for text, url in buttons -%}
+  <a class="button-link small-button{% if text == 'Удалить' %} danger{% endif %}" href="{{ url }}">{{ text }}</a>
+  {%- endfor -%}
+{%- endmacro %}
+
 {#- Раздел: заголовок, пояснение, таблица. Все колонки показываются, даже пустые
     (решение пользователя: у всех записей одинаковый вид, сразу видно, что не заполнено).
     view — SectionView (views.py): раздел + адреса ссылок и якоря строк. -#}
@@ -31,13 +39,15 @@
     </table>
     {% else %}
     <table>
-      <thead><tr>{% for col in sec.columns %}<th scope="col">{{ col }}</th>{% endfor %}</tr></thead>
+      <thead><tr>{% for col in sec.columns %}<th scope="col">{{ col }}</th>{% endfor %}
+        {%- if view.has_actions %}<th scope="col"><span class="visually-hidden">действия</span></th>{% endif %}</tr></thead>
       <tbody>
       {% for row in sec.rows %}
         {% set links = view.links[loop.index0] %}
         {% set anchor = view.anchors[loop.index0] %}
         <tr{% if anchor %} id="{{ anchor }}"{% endif %}>
         {% for v in row %}<td>{{ linked(v, links.get(loop.index0)) }}</td>{% endfor %}
+        {%- if view.has_actions %}<td class="row-actions">{{ action_links(view.actions[loop.index0]) }}</td>{% endif %}
         </tr>
       {% endfor %}
       </tbody>

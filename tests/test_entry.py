@@ -199,7 +199,10 @@ def test_far_site_is_not_nearby(entry_db):
         ({"site_type": "точка рыбака", "lat": 95, "lon": 106}, "Широта не может быть больше 90"),
         ({"site_type": "участок реки"}, "Укажите название"),
         ({"site_type": "участок реки", "city": "Тест"}, "провинцию"),
-        ({"site_type": "участок реки", "city": "Тест", "region": "Нет такой"}, "--new-region"),
+        (
+            {"site_type": "участок реки", "city": "Тест", "region": "Нет такой"},
+            "это новая провинция",
+        ),
         ({"site_type": "рынок", "name": "Рынок X", "region": "Кантхо"}, "вместе с городом"),
     ],
 )
@@ -639,7 +642,7 @@ def test_ship_sample(entry_db):
     assert count(entry_db, "SELECT sent_on FROM sample_shipment WHERE sample_id = ?",
                  sample) == "2026-09-20"  # fmt: skip
     expect_error(entry_db, "уже отмечен", entry.ship_sample, sample, "Кантхо (секвенирование)")
-    expect_error(entry_db, "--new-lab", entry.ship_sample, sample, "Новая лаборатория")
+    expect_error(entry_db, "это новая лаборатория", entry.ship_sample, sample, "Новая лаборатория")
     result = entry.ship_sample(entry_db, sample, "Новая лаборатория", new_lab=True)
     assert "новая лаборатория" in result.message
     expect_error(entry_db, "Образца №999999", entry.ship_sample, 999999, "Россия",

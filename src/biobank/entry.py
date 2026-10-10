@@ -45,7 +45,7 @@ from biobank.edit import (
     find_specimen,
     write_transaction,
 )
-from biobank.importer import CAPTURE_METHODS, SAME_SITE_KM, SITE_TYPE
+from biobank.importer import CAPTURE_METHODS, SAME_SITE_KM, SITE_TYPE, SMEAR_PRESERVATIVE
 from biobank.parsing import (
     SUFFIXES,
     distance_km,
@@ -62,6 +62,9 @@ SITE_TYPES = tuple(SITE_TYPE.values())  # 'участок реки', 'рынок
 SAMPLE_TYPES = ("ДНК", "гистология", "мазок крови", "кишечник", "целая особь", "другое")
 POINT_TYPES = ("старт", "финиш", "точка")
 SEXES = ("самка", "самец")
+# Фиксация образцов — в том написании, что при импорте (мазки, гистология и внутренности
+# креветок, целые особи в спирте). Поле свободное: это подсказки для формы, а не запрет.
+PRESERVATIVES = (SMEAR_PRESERVATIVE, "формалин 10%", "заморозка", "этанол")
 # первое слово (в нижнем регистре) → как записано при импорте
 COORD_SOURCES = {"garmin": "Garmin", "google": "Google Maps"}
 GEAR_TYPE = "трал"
@@ -298,10 +301,7 @@ def _expedition(conn: sqlite3.Connection, expedition_id: int) -> sqlite3.Row:
         (expedition_id,),
     ).fetchone()
     if row is None:
-        raise NotFoundError(
-            f"Экспедиции №{expedition_id} нет. Список: "
-            'python -m biobank sql "SELECT expedition_id, name FROM expedition"'
-        )
+        raise NotFoundError(f"Экспедиции №{expedition_id} нет.")
     return row
 
 
@@ -310,7 +310,7 @@ def _site(conn: sqlite3.Connection, site_id: int) -> sqlite3.Row:
         "SELECT site_id, name, site_type FROM sampling_site WHERE site_id = ?", (site_id,)
     ).fetchone()
     if row is None:
-        raise NotFoundError(f"Места №{site_id} нет. Список: python -m biobank report sites")
+        raise NotFoundError(f"Места №{site_id} нет.")
     return row
 
 
@@ -325,10 +325,7 @@ _EVENT_SQL = """
 def _event(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row:
     row = conn.execute(_EVENT_SQL, (event_id,)).fetchone()
     if row is None:
-        raise NotFoundError(
-            f"Выезда №{event_id} нет. Список: python -m biobank sql "
-            '"SELECT event_id, event_date, source_sheet FROM sampling_event"'
-        )
+        raise NotFoundError(f"Выезда №{event_id} нет.")
     return row
 
 
@@ -355,9 +352,7 @@ def _trawling(conn: sqlite3.Connection, event: sqlite3.Row, trawl_no: int) -> in
         if row["trawl_no"] == trawl_no:
             return row["trawling_id"]
     if not rows:
-        raise EditError(
-            f"У выезда {_title(event)} нет тралений. Сначала: python -m biobank add-trawling …"
-        )
+        raise EditError(f"У выезда {_title(event)} нет тралений — сначала добавьте траление.")
     numbers = ", ".join(str(r["trawl_no"]) for r in rows)
     raise EditError(f"На выезде {_title(event)} нет траления {trawl_no}. Есть: {numbers}.")
 
@@ -374,7 +369,8 @@ def _lab_id(conn: sqlite3.Connection, name: str, create: bool = False) -> tuple[
         names = "; ".join(r[0] for r in conn.execute("SELECT name FROM lab ORDER BY lab_id"))
         raise EditError(
             f"Лаборатории «{name}» нет в справочнике. Есть: {names}. "
-            "Новую добавьте с флагом --new-lab (проверьте, что это не опечатка)."
+            "Если это новая лаборатория — отметьте «это новая лаборатория» "
+            "(проверьте, что это не опечатка)."
         )
     return _insert(conn, "lab", name=name), True
 
@@ -461,43 +457,115 @@ def find_nearby_sites(
     return found
 
 
-def _city_id(
+@dataclass
+class _CityPlan:
+    """Что сделать с городом места: найти существующий или создать (и провинцию)."""
+
+    region: str  # название провинции
+    region_id: int | None  # None — провинции нет, будет создана
+    city: str  # название города, как при импорте («Хонг-на» → «Хонг-нгу»)
+    city_latin: str | None
+    city_id: int | None  # None — города нет, будет создан
+
+    @property
+    def created(self) -> list[str]:
+        """Что будет создано — для сообщения («провинция «…»», «город «…»»)."""
+        items = [] if self.region_id else [f"провинция «{self.region}»"]
+        return items + ([] if self.city_id else [f"город «{self.city}»"])
+
+
+def _city_plan(
     conn: sqlite3.Connection, city: str | None, region: str | None, new_region: bool
-) -> tuple[int | None, list[str]]:
-    """id города (найти или создать) и список того, что создано, — для сообщения."""
+) -> _CityPlan | None:
+    """Проверить город и провинцию места, ничего не записывая (годится для предпросмотра).
+
+    None — город не указан. Ошибки — EditError: провинция без города, город без провинции,
+    провинции нет в справочнике, а new_region не разрешает её создать.
+    """
     city, region = clean_text(city), clean_text(region)
     if city is None:
         if region is not None:
             raise EditError(
                 "Провинция указывается вместе с городом (у места хранится только город)."
             )
-        return None, []
+        return None
     if region is None:
-        raise EditError(f"Укажите провинцию города «{city}» (--region).")
-    created = []
+        raise EditError(f"Укажите провинцию города «{city}».")
     row = conn.execute("SELECT region_id FROM region WHERE name = ?", (region,)).fetchone()
-    if row:
-        region_id = row["region_id"]
-    elif new_region:
-        region_id = _insert(conn, "region", name=region)
-        created.append(f"провинция «{region}»")
-    else:
+    if row is None and not new_region:
         names = ", ".join(r[0] for r in conn.execute("SELECT name FROM region ORDER BY region_id"))
         raise EditError(
             f"Провинции «{region}» нет. Есть: {names}. "
-            "Новую добавьте с флагом --new-region (проверьте, что это не опечатка)."
+            "Если это новая провинция — отметьте «это новая провинция» "
+            "(проверьте, что это не опечатка)."
         )
+    region_id = row["region_id"] if row else None
     normalized = normalize_city(city)  # «Хонг-на» → «Хонг-нгу», как при импорте
     row = conn.execute(
         "SELECT city_id FROM city WHERE region_id = ? AND name = ?", (region_id, normalized.name)
     ).fetchone()
-    if row:
-        return row["city_id"], created
-    city_id = _insert(
-        conn, "city", region_id=region_id, name=normalized.name, name_latin=normalized.name_latin
+    city_id = row["city_id"] if row else None
+    return _CityPlan(region, region_id, normalized.name, normalized.name_latin, city_id)
+
+
+def _city_id(
+    conn: sqlite3.Connection, city: str | None, region: str | None, new_region: bool
+) -> tuple[int | None, list[str]]:
+    """id города (найти или создать) и список того, что создано, — для сообщения."""
+    plan = _city_plan(conn, city, region, new_region)
+    if plan is None:
+        return None, []
+    created = plan.created
+    region_id = plan.region_id or _insert(conn, "region", name=plan.region)
+    city_id = plan.city_id or _insert(
+        conn, "city", region_id=region_id, name=plan.city, name_latin=plan.city_latin
     )
-    created.append(f"город «{normalized.name}»")
     return city_id, created
+
+
+def _site_values(
+    site_type: str, name: str | None, lat, lon, city: str | None
+) -> tuple[str, float | None, float | None]:
+    """Проверить тип и координаты места, подобрать название — (название, широта, долгота).
+
+    Общая часть create_site и preview_site (без базы). Название по умолчанию —
+    по правилам импорта («Участок у <город>»).
+    """
+    if site_type not in SITE_TYPES:
+        raise EditError(f"Тип места «{site_type}» не подходит. Возможные: {', '.join(SITE_TYPES)}.")
+    lat = parse_entry_number(lat, "Широта", minimum=-90, maximum=90)
+    lon = parse_entry_number(lon, "Долгота", minimum=-180, maximum=180)
+    if (lat is None) != (lon is None):
+        raise EditError("Координаты нужны обе — широта и долгота — или ни одной.")
+    city_text = clean_text(city)
+    city_name = normalize_city(city_text).name if city_text else None
+    name = clean_text(name) or default_site_name(site_type, city_name, lat, lon)
+    if name is None:
+        raise EditError("Укажите название места или город с провинцией.")
+    return name, lat, lon
+
+
+def preview_site(
+    conn: sqlite3.Connection,
+    site_type: str,
+    *,
+    name: str | None = None,
+    lat=None,
+    lon=None,
+    city: str | None = None,
+    region: str | None = None,
+    new_region: bool = False,
+) -> tuple[str, list[NearbySite]]:
+    """Что сделает create_site с этими значениями — БЕЗ записи (для предпросмотра формы).
+
+    Возвращает (название, которое получит место; похожие места, из-за которых create_site
+    без allow_nearby откажет). Только читает базу (подходит db.connect_read_only).
+    Ошибки ввода — EditError с тем же текстом, что у create_site (тип, координаты,
+    нет названия, город без провинции, неизвестная провинция без new_region).
+    """
+    name, lat, lon = _site_values(site_type, name, lat, lon, city)
+    _city_plan(conn, city, region, new_region)
+    return name, find_nearby_sites(conn, site_type, lat, lon, name)
 
 
 def create_site(
@@ -518,28 +586,19 @@ def create_site(
     Если такое место уже есть (find_nearby_sites: тот же тип и ближе 200 м или то же
     название) — EditError со списком: экспедиции возвращаются на те же точки, и новый
     выезд нужно привязать к существующему месту, а не плодить дубли. Если это всё же
-    другое место — allow_nearby=True (в CLI флаг --new).
+    другое место — allow_nearby=True (на сайте — кнопка «Всё равно создать новое»,
+    в командной строке — флаг --new). Предпросмотр без записи — preview_site.
     Название по умолчанию — по правилам импорта («Участок у <город>»).
     """
-    if site_type not in SITE_TYPES:
-        raise EditError(f"Тип места «{site_type}» не подходит. Возможные: {', '.join(SITE_TYPES)}.")
-    lat = parse_entry_number(lat, "Широта", minimum=-90, maximum=90)
-    lon = parse_entry_number(lon, "Долгота", minimum=-180, maximum=180)
-    if (lat is None) != (lon is None):
-        raise EditError("Координаты нужны обе — широта и долгота — или ни одной.")
-    city_text = clean_text(city)
-    city_name = normalize_city(city_text).name if city_text else None
-    name = clean_text(name) or default_site_name(site_type, city_name, lat, lon)
-    if name is None:
-        raise EditError("Укажите название места (--name) или город (--city и --region).")
+    name, lat, lon = _site_values(site_type, name, lat, lon, city)
 
     with write_transaction(conn):
         nearby = find_nearby_sites(conn, site_type, lat, lon, name)
         if nearby and not allow_nearby:
             listed = "; ".join(site.describe() for site in nearby)
             raise EditError(
-                f"Такое место, похоже, уже есть: {listed}. Укажите его номер при вводе выезда "
-                "(add-event … <место>). Если это действительно другое место — повторите с --new."
+                f"Такое место, похоже, уже есть: {listed}. Выберите его при вводе выезда. "
+                "Если это действительно другое место — подтвердите создание нового места."
             )
         city_id, created = _city_id(conn, city, region, new_region)
         site_id = _insert(
@@ -646,7 +705,7 @@ def create_event(
 
         warnings = _extend_expedition_dates(conn, expedition, date)
         if method == "траление" and gear_id is None:
-            warnings.append("Сеть не указана (--mesh, --size) — её можно будет добавить позже.")
+            warnings.append("Сеть не указана — её можно будет добавить позже.")
         message = (
             f"Создан выезд №{event_id}: {date}, «{site['name']}», {method} "
             f"(экспедиция «{expedition['name']}»)."
@@ -999,7 +1058,7 @@ def _draft_specimen(
         if not code:
             raise EditError(
                 f"У вида «{scientific_name or 'не определён'}» нет кода для номера пробы — "
-                "укажите номер явно (--label)."
+                "укажите номер явно."
             )
         label = _next_label(conn, code, reserved)
     parsed = parse_label(clean_text(label))
@@ -1117,6 +1176,62 @@ def create_specimen(
         specimen_id = _write_specimen(conn, draft)
         message = f"Добавлена особь {draft.label} (выезд {_title(event)}): {draft.summary}."
         return _done(conn, message, specimen_id, draft.warnings)
+
+
+def _typed_label(label: str | None) -> str | None:
+    """Введённый номер пробы в виде, как он хранится в базе; не распознан — как есть.
+
+    >>> _typed_label("155pc"), _typed_label(" ХХ "), _typed_label(""), _typed_label(None)
+    ('155 pc', 'ХХ', None, None)
+    """
+    text = clean_text(label)
+    parsed = parse_label(text) if text else None
+    return parsed.label if parsed else text
+
+
+def check_specimen(
+    conn: sqlite3.Connection,
+    event_id: int,
+    species: str | None,
+    label: str | None = None,
+    *,
+    confidence: str | None = None,
+    tl_cm=None,
+    sl_cm=None,
+    mass_g=None,
+    mass_gutted_g=None,
+    sex: str | None = None,
+    is_dead: bool = False,
+    trawl_no: int | None = None,
+    capture_method: str | None = None,
+    capture_site_id: int | None = None,
+    capture_date: str | None = None,
+    identified_by: str | None = None,
+    notes: str | None = None,
+    limits: MeasurementLimits = FISH_LIMITS,
+) -> tuple[str | None, SpecimenCheck]:
+    """Проверить новую особь БЕЗ записи — для предпросмотра формы перед create_specimen.
+
+    Параметры — те же, что у create_specimen, и проверки те же (_draft_specimen).
+    Возвращает (номер пробы, SpecimenCheck):
+    - номер — под которым create_specimen запишет особь (для пустого label — следующий
+      свободный в серии вида); при жёсткой ошибке — введённый номер (или None);
+    - errors — жёсткие ошибки (сохранить нельзя; create_specimen выдаст тот же текст),
+      warnings — мягкие (запись сохранится, проблема попадёт в журнал) — тот же список,
+      что потом будет в EditResult.warnings.
+    Только читает базу (подходит db.connect_read_only). Нет выезда — NotFoundError.
+    """
+    event = _event(conn, event_id)
+    try:
+        draft = _draft_specimen(
+            conn, event, species, label, confidence=confidence, tl_cm=tl_cm, sl_cm=sl_cm,
+            mass_g=mass_g, mass_gutted_g=mass_gutted_g, sex=sex, is_dead=is_dead,
+            trawl_no=trawl_no, capture_method=capture_method, capture_site_id=capture_site_id,
+            capture_date=capture_date, identified_by=identified_by, notes=notes, limits=limits,
+        )  # fmt: skip
+    except EditError as error:  # и NotFoundError: нет места поимки и т.п.
+        return _typed_label(label), SpecimenCheck(errors=[str(error)])
+    return draft.label, SpecimenCheck(warnings=draft.warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -1354,37 +1469,86 @@ def create_specimens(
         return result
 
 
-def update_measurements(
-    conn: sqlite3.Connection,
-    label: str,
-    limits: MeasurementLimits = FISH_LIMITS,
-    **changes,
-) -> EditResult:
-    """Изменить промеры особи: tl_cm=…, sl_cm=…, mass_g=…, mass_gutted_g=….
-
-    Меняются только переданные промеры; None (или «-») — стереть значение.
-    Жёсткие ошибки (TL ≤ 0, масса < 0) — EditError; мягкие (SL > TL…) — в журнал.
-    Исправленная опечатка закрывает свою проблему в журнале автоматически (run_checks).
-    """
+def _parse_measurements(changes: dict) -> dict[str, float | None]:
+    """Промеры из правки → числа (только переданные); ошибки ввода — EditError."""
     unknown = sorted(set(changes) - set(MEASUREMENTS))
     if unknown:
         raise EditError(
             f"Неизвестные промеры: {', '.join(unknown)}. Есть: {', '.join(MEASUREMENTS)}."
         )
     if not changes:
-        raise EditError("Укажите, какие промеры изменить (--tl, --sl, --mass, --gutted).")
-    new = {
+        raise EditError("Укажите, какие промеры изменить.")
+    return {
         column: parse_entry_number(value, MEASUREMENTS[column]) for column, value in changes.items()
     }
 
-    with write_transaction(conn):
-        specimen = find_specimen(conn, label)
-        old = conn.execute(
-            "SELECT tl_cm, sl_cm, mass_g, mass_gutted_g FROM specimen WHERE specimen_id = ?",
-            (specimen["specimen_id"],),
+
+def _find_specimen(conn: sqlite3.Connection, label_or_id: str | int) -> sqlite3.Row:
+    """Особь по номеру пробы (строка, как в find_specimen) или по specimen_id (целое число)."""
+    if isinstance(label_or_id, int) and not isinstance(label_or_id, bool):
+        row = conn.execute(
+            "SELECT specimen_id, label FROM specimen WHERE specimen_id = ?", (label_or_id,)
         ).fetchone()
-        merged = {column: new.get(column, old[column]) for column in MEASUREMENTS}
-        check = validate_specimen(*merged.values(), limits=limits)
+        if row is None:
+            raise NotFoundError(f"Особи №{label_or_id} нет.")
+        return row
+    return find_specimen(conn, label_or_id)
+
+
+def _measurements_check(
+    conn: sqlite3.Connection, specimen_id: int, new: dict, limits: MeasurementLimits
+) -> tuple[sqlite3.Row, SpecimenCheck]:
+    """Прежние промеры особи и проверка всех четырёх — какими они станут после правки."""
+    old = conn.execute(
+        "SELECT tl_cm, sl_cm, mass_g, mass_gutted_g FROM specimen WHERE specimen_id = ?",
+        (specimen_id,),
+    ).fetchone()
+    merged = {column: new.get(column, old[column]) for column in MEASUREMENTS}
+    return old, validate_specimen(*merged.values(), limits=limits)
+
+
+def check_measurements_update(
+    conn: sqlite3.Connection,
+    label_or_id: str | int,
+    limits: MeasurementLimits = FISH_LIMITS,
+    **changes,
+) -> SpecimenCheck:
+    """Проверить исправление промеров БЕЗ записи — для предпросмотра перед update_measurements.
+
+    label_or_id — номер пробы (строка) или specimen_id (целое число); changes — как у
+    update_measurements (tl_cm=…, sl_cm=…, mass_g=…, mass_gutted_g=…; None или «-» —
+    стереть). Проверяются все четыре промера такими, какими они станут после правки.
+    errors — жёсткие ошибки (update_measurements откажет с тем же текстом), warnings —
+    мягкие (тот же список, что потом в EditResult.warnings).
+    Только читает базу (подходит db.connect_read_only). Нет особи — NotFoundError.
+    """
+    specimen = _find_specimen(conn, label_or_id)
+    try:
+        new = _parse_measurements(changes)
+    except EditError as error:
+        return SpecimenCheck(errors=[str(error)])
+    return _measurements_check(conn, specimen["specimen_id"], new, limits)[1]
+
+
+def update_measurements(
+    conn: sqlite3.Connection,
+    label: str | int,
+    limits: MeasurementLimits = FISH_LIMITS,
+    **changes,
+) -> EditResult:
+    """Изменить промеры особи: tl_cm=…, sl_cm=…, mass_g=…, mass_gutted_g=….
+
+    label — номер пробы (строка) или specimen_id (целое число).
+    Меняются только переданные промеры; None (или «-») — стереть значение.
+    Жёсткие ошибки (TL ≤ 0, масса < 0) — EditError; мягкие (SL > TL…) — в журнал.
+    Исправленная опечатка закрывает свою проблему в журнале автоматически (run_checks).
+    Предпросмотр без записи — check_measurements_update.
+    """
+    new = _parse_measurements(changes)
+
+    with write_transaction(conn):
+        specimen = _find_specimen(conn, label)
+        old, check = _measurements_check(conn, specimen["specimen_id"], new, limits)
         if check.errors:
             raise EditError(" ".join(check.errors))
         # список колонок — только из MEASUREMENTS (проверено выше), значения — через «?»
@@ -1451,9 +1615,7 @@ def _sample(conn: sqlite3.Connection, sample_id: int) -> sqlite3.Row:
         (sample_id,),
     ).fetchone()
     if row is None:
-        raise NotFoundError(
-            f"Образца №{sample_id} нет. Номера образцов — в карточке: show <номер>."
-        )
+        raise NotFoundError(f"Образца №{sample_id} нет. Номера образцов — в карточке особи.")
     return row
 
 

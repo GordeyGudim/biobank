@@ -977,8 +977,9 @@ def test_field_choices():
     assert choices["site_type"] == ["участок реки", "рынок", "аквахозяйство", "точка рыбака"]
     assert set(choices) == {
         "site_type", "point_type", "sample_type", "sex", "coord_source", "method",
-        "confidence", "capture_method",
+        "confidence", "capture_method", "preservative",
     }  # fmt: skip
+    assert "этанол 96% (фиксация)" in choices["preservative"]
 
 
 @pytest.mark.parametrize("kind", list(browse.RECORD_SQL))

@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{#- Пакетный ввод особей выезда (record_forms.py): таблица-форма, строка = особь.
+    «Проверить» — только чтение (entry.check_specimens): ошибки и предупреждения
+    подсвечиваются в своих строках, номера «авто» показываются заранее.
+    «Сохранить» — entry.create_specimens: всё или ничего. Пустые строки не считаются.
+    С клавиатуры: Tab — следующее поле строки; числа можно с запятой (25,4). -#}
+{% block title %}Несколько особей — выезд {{ event_title }}{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('expeditions') }}">Экспедиции</a> /
+  <a href="{{ url_for('expedition', expedition_id=expedition_id) }}">экспедиция</a> /
+  <a href="{{ url_for('event', event_id=event_id) }}">выезд {{ event_title }}</a> /</p>
+<h1>Несколько особей: выезд {{ event_title }}</h1>
+<p class="small">Номер пусто (или «авто») — следующий свободный в серии вида. Вид обязателен;
+  неизвестен — «? — не определён» (тогда номер укажите сами). Пустой промер — не измеряли.
+  ДНК и мазок крови — образцы с меткой = номер особи. Сначала «Проверить» — в базу ничего не пишется.</p>
+
+<div id="batch">
+<form method="post" action="{{ url_for('specimen_batch', event_id=event_id) }}"
+      hx-post="{{ url_for('specimen_batch', event_id=event_id) }}"
+      hx-target="#batch" hx-select="#batch" hx-swap="outerHTML"
+      hx-sync="this:drop" hx-disabled-elt="find button">
+  {% if error %}<p class="flash flash-error field-error" role="alert">{{ error }}</p>{% endif %}
+  {% if warnings %}
+  <div class="flash flash-warn" role="alert">
+    <p><strong>Проверьте, пожалуйста.</strong> Пока ничего не сохранено:</p>
+    <ul>{% for w in warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+    <p class="small">Если так и записано в полевом журнале — «Всё равно сохранить»: особи
+      сохранятся, проблемы попадут в журнал. Опечатку — исправьте в строке.</p>
+    {% for w in warnings %}<input type="hidden" name="confirmed" value="{{ w }}">{% endfor %}
+  </div>
+  {% elif statuses and not error %}
+  <p class="flash flash-ok" role="status">Проверено: ошибок нет. Можно сохранять.</p>
+  {% endif %}
+  <div class="table-wrap batch-wrap">
+    <table class="batch">
+      <thead><tr>
+        <th scope="col">№</th><th scope="col">№ пробы</th><th scope="col">вид *</th>
+        {% for name, (title, _) in text_fields.items() if name != "label" %}<th scope="col">{{ title }}</th>{% endfor %}
+        {% if trawls %}<th scope="col">траление</th>{% endif %}
+        {% for name, title in checks.items() %}<th scope="col">{{ title }}</th>{% endfor %}
+        <th scope="col">примечание</th><th scope="col">проверка</th>
+      </tr></thead>
+      <tbody id="batch-rows">
+      {% for row in rows %}
+        {% with i = loop.index, status = statuses.get(loop.index), oob = false %}{% include "_batch_row.html" %}{% endwith %}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <input type="hidden" id="batch-next" name="next" value="{{ rows | length + 1 }}">
+  <div class="buttons">
+    {#- первая кнопка срабатывает по Enter — это «Проверить»: случайный Enter ничего не запишет -#}
+    <button type="submit" name="action" value="check">Проверить</button>
+    <button type="submit" name="action" value="save">{% if warnings %}Всё равно сохранить{% else %}Сохранить{% endif %}</button>
+    {#- атрибуты hx-… формы наследуются кнопкой; «unset» — не брать их у формы: ответ здесь —
+        одна строка таблицы, её добавляют в конец (beforeend), а не заменяют всю форму -#}
+    <button type="button" class="secondary" hx-get="{{ url_for('specimen_batch_row', event_id=event_id) }}"
+            hx-include="#batch-next" hx-target="#batch-rows" hx-swap="beforeend"
+            hx-select="unset" hx-sync="unset" hx-disabled-elt="this">Добавить строку</button>
+    <button type="submit" name="action" value="more" class="secondary" formnovalidate>Ещё 10 строк</button>
+    <span class="small">Перед записью делается резервная копия базы.</span>
+  </div>
+</form>
+</div>
+{% endblock %}

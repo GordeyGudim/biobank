@@ -87,7 +87,7 @@ def apply_edit(
     """
     db_path = Path(db_path)
     if not db_path.exists():
-        raise NotFoundError(f"Базы нет: {db_path}. Сначала: python -m biobank import …")
+        raise NotFoundError(f"Базы нет: {db_path}. Сначала создайте её импортом из Excel.")
     backup = None
     try:
         backup = backup_database(db_path)
@@ -116,7 +116,7 @@ def check_database(db_path: Path | str) -> CheckResult:
     """
     db_path = Path(db_path)
     if not db_path.exists():
-        raise NotFoundError(f"Базы нет: {db_path}. Сначала: python -m biobank import …")
+        raise NotFoundError(f"Базы нет: {db_path}. Сначала создайте её импортом из Excel.")
     conn = connect(db_path)
     try:
         with write_transaction(conn):
@@ -334,9 +334,7 @@ def resolve_issue(conn: sqlite3.Connection, issue_id: int, resolution: str) -> E
             (issue_id,),
         ).fetchone()
         if issue is None:
-            raise NotFoundError(
-                f"Проблемы №{issue_id} нет в журнале. Список: python -m biobank report issues"
-            )
+            raise NotFoundError(f"Проблемы №{issue_id} нет в журнале.")
         if issue["resolved"]:
             raise EditError(f"Проблема №{issue_id} уже решена: {issue['resolution']}")
         conn.execute(

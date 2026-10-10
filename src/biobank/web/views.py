@@ -29,33 +29,70 @@ LINK_COLUMNS = {
     "species_id": ("вид",),
     "event_id": ("выезд",),
     "expedition_id": ("экспедиция",),
-    "trawling_id": ("трал", "траление"),
+    "trawling_id": ("трал", "траление", "№"),
     "issue_id": ("id",),
 }
 
 
 @dataclass
 class SectionView:
-    """Раздел (CardSection) + где в нём ссылки.
+    """Раздел (CardSection) + где в нём ссылки и кнопки.
 
     links — по словарю на строку: номер колонки → адрес ссылки;
-    anchors — по строке: id HTML-строки (для ссылок вида «…#trawling-5») или None.
+    anchors — по строке: id HTML-строки (для ссылок вида «…#trawling-5») или None;
+    actions — по строке: кнопки [(текст, адрес)…] — «Изменить», «Удалить» (пусто — нет).
     """
 
     section: CardSection
     links: list[dict[int, str]] = field(default_factory=list)
     anchors: list[str | None] = field(default_factory=list)
+    actions: list[list[tuple[str, str]]] = field(default_factory=list)
+
+    @property
+    def has_actions(self) -> bool:
+        """Нужна ли колонка «действия» (хоть у одной строки есть кнопки)."""
+        return any(self.actions)
 
 
-def issue_url(issue_id: int, category: str | None = None, resolved: bool = False) -> str:
-    """Адрес проблемы в журнале: её категория и статус + якорь #issue-N на строку.
+def issue_url(issue_id: int) -> str:
+    """Адрес страницы одной проблемы журнала (/issues/N)."""
+    return url_for("issue", issue_id=issue_id)
 
-    Якорь (часть адреса после «#») — браузер прокручивает страницу к элементу с таким id.
-    """
-    args = {"status": "resolved" if resolved else "open"}
-    if category:
-        args["category"] = category
-    return url_for("issues", _anchor=f"issue-{issue_id}", **args)
+
+# Какой записи принадлежит строка таблицы — по id в row_ids, в порядке «от частного к общему»:
+# у строки образца есть и sample_id, у строки замера — и trawling_id (ссылка на траление),
+# но кнопки «Изменить»/«Удалить» относятся к самому образцу или замеру.
+# Значение — вид записи в адресах /edit/<вид>/<id> и /delete/<вид>/<id> (record_forms.py).
+ROW_KINDS = (
+    ("identification_id", "identification"),
+    ("sample_id", "sample"),
+    ("measurement_id", "water"),
+    ("catch_id", "catch"),
+    ("specimen_id", "specimen"),
+    ("trawling_id", "trawling"),
+)
+# Строки с такими id — не записи, которые здесь правят (проблема журнала, результат анализа)
+NO_ACTIONS = ("issue_id", "analysis_id")
+# Записи, которые можно только удалить (правки нет: вид меняют новым определением)
+DELETE_ONLY = ("identification",)
+
+
+def row_actions(ids: Mapping) -> list[tuple[str, str]]:
+    """Кнопки строки таблицы: «Изменить» и «Удалить» для записи этой строки."""
+    if any(key in ids for key in NO_ACTIONS):
+        return []
+    for key, kind in ROW_KINDS:
+        record_id = ids.get(key)
+        if record_id is None:
+            continue
+        buttons = []
+        if kind not in DELETE_ONLY:
+            buttons.append(
+                ("Изменить", url_for("record_edit", kind_name=kind, record_id=record_id))
+            )
+        buttons.append(("Удалить", url_for("record_delete", kind_name=kind, record_id=record_id)))
+        return buttons
+    return []
 
 
 def _url(key: str, value, row: Mapping, event_id: int | None) -> str | None:
@@ -75,13 +112,9 @@ def _url(key: str, value, row: Mapping, event_id: int | None) -> str | None:
     if key == "site_id":
         return url_for("site", site_id=value)
     if key == "trawling_id":
-        # отдельной страницы траления нет — строка в таблице «Траления» карточки выезда
-        if event_id is None:
-            return None
-        return url_for("event", event_id=event_id, _anchor=f"trawling-{value}")
+        return url_for("trawling", trawling_id=value)
     if key == "issue_id":
-        status = str(row.get("статус") or "")
-        return issue_url(value, row.get("категория"), status.startswith("решено"))
+        return issue_url(value)
     return None
 
 
@@ -91,12 +124,14 @@ def section_views(
     own_key: str | None = None,
     event_id: int | None = None,
     id_column: str | None = None,
+    actions: bool = False,
 ) -> list[SectionView]:
     """Ссылки для всех разделов страницы.
 
     own_key — id самой страницы (в карточке выезда — «event_id»): на себя не ссылаемся;
-    event_id — выезд, к которому относятся траления на странице (ссылка на его карточку);
-    id_column — что лежит в колонке «id» отчёта без row_ids («issue_id», «site_id»).
+    event_id — выезд страницы (оставлен для совместимости, ссылки от него не зависят);
+    id_column — что лежит в колонке «id» отчёта без row_ids («issue_id», «site_id»);
+    actions — у строк-записей кнопки «Изменить»/«Удалить» (карточки; в отчётах — нет).
     Строки таблицы «Траления» (только trawling_id) получают якорь trawling-N.
     """
     views = []
@@ -127,6 +162,7 @@ def section_views(
                 if id_column == "site_id" and "id" in sec.columns:
                     links[sec.columns.index("id")] = _url("site_id", named["id"], named, None)
             view.links.append(links)
+            view.actions.append(row_actions(ids) if actions and not sec.is_fields else [])
             only_trawl = set(ids) == {"trawling_id"} and ids["trawling_id"] is not None
             view.anchors.append(f"trawling-{ids['trawling_id']}" if only_trawl else None)
         views.append(view)
@@ -271,4 +307,6 @@ def issue_object_url(issue: Mapping) -> str | None:
         return url_for("event", event_id=record_id)
     if table == "sampling_site":
         return url_for("site", site_id=record_id)
+    if table == "trawling":
+        return url_for("trawling", trawling_id=record_id)
     return None

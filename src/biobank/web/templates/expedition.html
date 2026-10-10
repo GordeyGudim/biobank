@@ -4,6 +4,10 @@
 {% block content %}
 <p class="crumbs"><a href="{{ url_for('expeditions') }}">Экспедиции</a> /</p>
 <h1>Экспедиция {{ expedition.name }}</h1>
+<p class="record-actions">
+  <a class="button-link" href="{{ url_for('record_edit', kind_name='expedition', record_id=expedition.expedition_id) }}">Изменить экспедицию</a>
+  <a class="button-link danger" href="{{ url_for('record_delete', kind_name='expedition', record_id=expedition.expedition_id) }}">Удалить экспедицию</a>
+</p>
 <table class="fields">
   <tr><th scope="row">даты</th><td>{{ value(expedition.date_start) }} — {{ value(expedition.date_end) }}</td></tr>
   <tr><th scope="row">выездов</th><td>{{ expedition.event_count }}</td></tr>

@@ -58,6 +58,41 @@ from biobank.tables import format_table, run_query
 
 WEB_HOST = "127.0.0.1"  # сайт доступен только с этого компьютера (до входа по паролю)
 
+# Подсказки командной строки к сообщениям логики. Сами сообщения (entry.py, records.py)
+# нейтральны — их показывает и сайт («отметьте «это новая лаборатория»»), а здесь к ним
+# дописывается, каким флагом или командой сделать то же в командной строке.
+# Пара: (кусок текста сообщения, подсказка).
+CLI_HINTS = (
+    ("отметьте «это новая лаборатория»", "флаг --new-lab"),
+    ("отметьте «это новая провинция»", "флаг --new-region"),
+    ("Укажите провинцию города", "флаг --region"),
+    ("Укажите название места или город", "--name или --city вместе с --region"),
+    ("подтвердите создание нового места", "флаг --new"),
+    ("Сеть не указана", "--mesh, --size"),
+    ("укажите номер явно", "--label"),
+    ("Укажите, какие промеры изменить", "--tl, --sl, --mass, --gutted"),
+    ("нет тралений — сначала добавьте", "python -m biobank add-trawling <выезд> <номер>"),
+    ("Экспедиции №", 'список: python -m biobank sql "SELECT expedition_id, name FROM expedition"'),
+    ("Места №", "список: python -m biobank report sites"),
+    ("Выезда №", "список: python -m biobank sql "
+                 '"SELECT event_id, event_date, source_sheet FROM sampling_event"'),
+    ("Номера образцов — в карточке особи", "python -m biobank show <номер пробы>"),
+    ("Базы нет:", "python -m biobank import data/source.xlsx"),
+    ("нет в журнале", "список: python -m biobank report issues"),
+)  # fmt: skip
+
+
+def with_cli_hints(text: str) -> str:
+    """Сообщение + подсказки CLI_HINTS, куски которых в нём есть (каждая — с новой строки).
+
+    >>> with_cli_hints("Укажите провинцию города «Тест».")
+    'Укажите провинцию города «Тест».\n  в командной строке: флаг --region'
+    >>> with_cli_hints("Особь добавлена.")
+    'Особь добавлена.'
+    """
+    hints = [hint for marker, hint in CLI_HINTS if marker in text]
+    return "".join([text, *(f"\n  в командной строке: {hint}" for hint in hints)])
+
 
 def ask_yes_no(question: str) -> bool:
     """Спросить пользователя «да/нет» в терминале."""
@@ -258,12 +293,12 @@ def _run_edit(args: argparse.Namespace, action) -> int:
     try:
         result = apply_edit(args.db, action)
     except EditError as error:
-        print(f"Ошибка: {error}", file=sys.stderr)
+        print(f"Ошибка: {with_cli_hints(str(error))}", file=sys.stderr)
         print("База не изменена.", file=sys.stderr)
         return 1
     print(result.message)
     for warning in result.warnings:
-        print(f"Внимание: {warning}")
+        print(f"Внимание: {with_cli_hints(warning)}")
     print(f"Резервная копия до правки: {result.backup}")
     if result.checks.added or result.checks.closed:
         print(f"Журнал проблем: новых {result.checks.added}, закрыто {result.checks.closed}.")
@@ -350,7 +385,7 @@ def cmd_next_label(args: argparse.Namespace) -> int:
     try:
         print(next_label(conn, "" if args.suffix == "-" else args.suffix))
     except EditError as error:
-        print(f"Ошибка: {error}", file=sys.stderr)
+        print(f"Ошибка: {with_cli_hints(str(error))}", file=sys.stderr)
         return 1
     finally:
         conn.close()

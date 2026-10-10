@@ -19,8 +19,15 @@ from dataclasses import dataclass
 
 from biobank.card import WATER_SQL
 from biobank.checks import summary_by_category
-from biobank.edit import CONFIDENCES, METHODS, NotFoundError, event_title
-from biobank.entry import COORD_SOURCES, POINT_TYPES, SAMPLE_TYPES, SEXES, SITE_TYPES
+from biobank.edit import CONFIDENCES, METHODS, NotFoundError, event_title, find_specimen
+from biobank.entry import (
+    COORD_SOURCES,
+    POINT_TYPES,
+    PRESERVATIVES,
+    SAMPLE_TYPES,
+    SEXES,
+    SITE_TYPES,
+)
 from biobank.importer import CAPTURE_METHODS
 from biobank.parsing import _LOOKALIKES, parse_label
 from biobank.tables import CardSection, query_section
@@ -874,12 +881,32 @@ def list_shipments(conn: sqlite3.Connection, sample_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def list_preservatives(conn: sqlite3.Connection) -> list[dict]:
+    """Фиксации образцов — подсказки для поля «фиксация» (поле свободное, это не запрет).
+
+    Сначала известные по импорту (entry.PRESERVATIVES, в их порядке), затем другие,
+    уже записанные в базе, по алфавиту. Запись (dict): preservative, sample_count
+    (сколько образцов с такой фиксацией; у известной, но ещё не использованной — 0).
+    """
+    counts = {
+        r[0]: r[1]
+        for r in conn.execute(
+            "SELECT preservative, count(*) FROM sample WHERE preservative IS NOT NULL "
+            "GROUP BY preservative"
+        )
+    }
+    names = [*PRESERVATIVES, *sorted(set(counts) - set(PRESERVATIVES))]
+    return [{"preservative": name, "sample_count": counts.get(name, 0)} for name in names]
+
+
 def field_choices() -> dict[str, list[str]]:
     """Допустимые значения полей выбора — из тех же констант, по которым проверяет ввод.
 
     site_type, point_type, sample_type, sex, coord_source (entry.py);
     method, confidence — определения вида (edit.py); capture_method — четыре способа
-    получения (importer.py; список из базы — list_capture_methods).
+    получения (importer.py; список из базы — list_capture_methods);
+    preservative — фиксации, известные по импорту (entry.PRESERVATIVES): подсказки,
+    поле свободное (вместе с уже записанными в базе — list_preservatives).
     """
     return {
         "site_type": list(SITE_TYPES),
@@ -890,6 +917,7 @@ def field_choices() -> dict[str, list[str]]:
         "method": list(METHODS),
         "confidence": list(CONFIDENCES),
         "capture_method": list(CAPTURE_METHODS),
+        "preservative": list(PRESERVATIVES),
     }
 
 
@@ -948,10 +976,34 @@ def get_record(conn: sqlite3.Connection, kind: str, record_id: int) -> dict:
     water_measurement, specimen, sample, catch_record, identification.
     Дополнительно к колонкам таблицы: у места — city, region (названия); у выезда —
     capture_method, gear_mesh, gear_size; у замера, особи, прилова — trawl_no; у особи —
-    capture_method (свой способ; None — как у выезда).
+    capture_method (свой способ; None — как у выезда). Числа — числами: промеры особи
+    (tl_cm, sl_cm, mass_g, mass_gutted_g), координаты, параметры воды — float или None.
     Неизвестный kind — ValueError; нет записи — NotFoundError.
     """
     if kind not in RECORD_SQL:
         raise ValueError(f"Вид записи «{kind}» не известен. Возможные: {', '.join(RECORD_SQL)}.")
     sql, what = RECORD_SQL[kind]
     return dict(_require(conn, sql, record_id, f"{what} №{record_id} нет."))
+
+
+def specimen_measurements(conn: sqlite3.Connection, label_or_id: str | int) -> dict:
+    """Промеры особи числами — чтобы заполнить форму «исправить промеры».
+
+    label_or_id — номер пробы (строка, нормализуется как при импорте: '26ph' → '26 ph')
+    или specimen_id (целое число). Запись (dict): specimen_id, label и промеры
+    tl_cm, sl_cm, mass_g, mass_gutted_g — float или None (не измерено).
+    Нет особи — NotFoundError. (То же самое по id — get_record(conn, "specimen", id).)
+    """
+    if isinstance(label_or_id, int) and not isinstance(label_or_id, bool):
+        specimen_id = label_or_id
+    else:
+        specimen_id = find_specimen(conn, label_or_id)["specimen_id"]
+    row = _require(
+        conn,
+        "SELECT specimen_id, label, tl_cm, sl_cm, mass_g, mass_gutted_g "
+        "FROM specimen WHERE specimen_id = ?",
+        specimen_id,
+        f"Особи №{specimen_id} нет.",
+    )
+    # колонки REAL: SQLite отдаёт их как float (целое 30 — как 30.0), пустые — None
+    return dict(row)

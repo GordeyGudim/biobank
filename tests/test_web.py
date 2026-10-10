@@ -466,7 +466,7 @@ def test_event_card(client):
     assert 'id="trawling-1"' in html  # строки тралений — цели ссылок «траление»
     assert 'href="/specimen/1"' in html  # особи выезда — ссылки на карточки
     assert 'href="/expeditions/1"' in html and 'href="/sites/1"' in html
-    assert 'href="/issues?status=open' in html  # проблемы — ссылки в журнал
+    assert 'href="/issues/' in html  # проблемы — ссылки на страницу проблемы
 
 
 def test_site_card(client, path):
@@ -495,7 +495,7 @@ def test_specimen_card_links(client, path):
     assert f'href="/sites/{site_id}"' in html  # своё место поимки (рыбак)
     assert 'href="/expeditions/' in html
     assert 'href="/specimens?species=6"' in html  # вид → список особей вида
-    assert 'href="/issues?status=open' in html
+    assert 'href="/issues/' in html
     # траление неизвестно — так и написано, без ссылки
     assert "<td>неизвестно</td>" in html
 
@@ -550,9 +550,9 @@ def test_card_has_edit_forms(client):
     for label in ('for="trawl_no"', 'for="id-species"', 'for="id-method"',
                   'for="id-confidence"', 'for="id-date"', 'for="id-notes"'):  # fmt: skip
         assert label in html
-    # у выезда без тралений — объяснение вместо формы
+    # особь не из траления (аквахозяйство) — формы «Привязать к тралению» нет
     html = client.get("/specimen/26 ph").get_data(as_text=True)
-    assert "нет тралений" in html
+    assert "/link-trawl" not in html and "Привязать к тралению" not in html
 
 
 def test_link_trawl_form_changes_db(client, path):
@@ -563,7 +563,8 @@ def test_link_trawl_form_changes_db(client, path):
     assert len(backups(path)) == 1
     html = client.get("/specimen/1").get_data(as_text=True)
     assert "привязана к тралению 2" in html  # сообщение один раз, на карточке
-    assert "#trawling-" in html  # траление в карточке — теперь ссылка
+    trawling_id = specimen_row(path, "1")["trawling_id"]
+    assert f'href="/trawlings/{trawling_id}"' in html  # траление — ссылка на его страницу
 
 
 def test_link_trawl_form_htmx(client, path):
@@ -1119,3 +1120,492 @@ def test_entry_values_escaped(client, path):
     html = client.get(location(r)).get_data(as_text=True)
     assert "<script>x</script>" not in html and "&lt;script&gt;" in html
     assert "<b>жирно</b>" not in html
+
+
+# ---------------------------------------------------------------------------
+# Этап C, часть 2: правка, удаление, пакетный ввод, страницы траления и проблемы
+# ---------------------------------------------------------------------------
+
+# вид записи на сайте → (таблица, ключ) — чтобы сравнить строку до и после правки
+EDIT_TABLES = {
+    "expedition": ("expedition", "expedition_id"),
+    "site": ("sampling_site", "site_id"),
+    "event": ("sampling_event", "event_id"),
+    "trawling": ("trawling", "trawling_id"),
+    "water": ("water_measurement", "measurement_id"),
+    "specimen": ("specimen", "specimen_id"),
+    "sample": ("sample", "sample_id"),
+    "catch": ("catch_record", "catch_id"),
+}
+
+
+def db_row(path, kind, record_id):
+    table, key = EDIT_TABLES[kind]
+    conn = connect(path)
+    try:
+        row = conn.execute(f"SELECT * FROM {table} WHERE {key} = ?", (record_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def first_id(path, kind):
+    table, key = EDIT_TABLES[kind]
+    return db_value(path, f"SELECT min({key}) FROM {table}")
+
+
+def edit_form_data(path, kind, record_id, **changes):
+    """Что отправит форма правки: показанные значения (и old_…) + исправленные поля."""
+    from biobank import browse
+    from biobank.web.record_forms import KINDS, record_values
+
+    conn = connect(path)
+    try:
+        rec = browse.get_record(conn, KINDS[kind].record, record_id)
+    finally:
+        conn.close()
+    values = record_values(KINDS[kind], rec)
+    return {**values, **{f"old_{k}": v for k, v in values.items()}, **changes}
+
+
+def test_edit_fields_are_known_to_records():
+    """Каждое поле формы правки — поле функции records.update_… (имена совпадают)."""
+    from biobank import records
+    from biobank.web.record_forms import KINDS
+
+    allowed = {
+        "expedition": records.EXPEDITION_FIELDS, "site": records.SITE_FIELDS,
+        "event": records.EVENT_FIELDS, "trawling": records.TRAWLING_FIELDS,
+        "water": records.WATER_FIELDS, "specimen": records.SPECIMEN_FIELDS,
+        "sample": records.SAMPLE_FIELDS, "catch": records.CATCH_FIELDS,
+    }  # fmt: skip
+    for kind, spec in KINDS.items():
+        names = {f.name for f in spec.fields}
+        assert names <= set(allowed.get(kind, {})), kind
+
+
+@pytest.mark.parametrize("kind", list(EDIT_TABLES))
+def test_edit_form_prefilled(client, path, kind):
+    record_id = first_id(path, kind)
+    r = client.get(f"/edit/{kind}/{record_id}")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert 'method="post"' in html and 'hx-sync="this:drop"' in html
+    assert 'name="old_' in html and "Сохранить изменения" in html
+    import re
+
+    for field_id in re.findall(r'<(?:input|select|textarea)[^>]*\bid="(f-[\w-]+)"', html):
+        assert f'for="{field_id}"' in html, (kind, field_id)
+
+
+EDIT_CASES = [
+    ("expedition", {"notes": "правка с сайта"}, "notes", "правка с сайта"),
+    ("site", {"description": "новое описание"}, "description", "новое описание"),
+    ("event", {"notes": "заметка"}, "notes", "заметка"),
+    ("trawling", {"catch_note": "трал пустой"}, "catch_note", "трал пустой"),
+    ("water", {"ph": "7,1"}, "ph", 7.1),
+    ("specimen", {"sex": "самец"}, "sex", "самец"),
+    ("sample", {"preservative": "формалин 10%"}, "preservative", "формалин 10%"),
+    ("catch", {"mass_g": "12,5"}, "mass_g", 12.5),
+]
+
+
+@pytest.mark.parametrize(("kind", "change", "column", "expected"), EDIT_CASES)
+def test_edit_changes_only_given_field(client, path, kind, change, column, expected):
+    record_id = first_id(path, kind)
+    before = db_row(path, kind, record_id)
+    r = client.post(
+        f"/edit/{kind}/{record_id}", data=edit_form_data(path, kind, record_id, **change)
+    )
+    assert r.status_code == 303, r.get_data(as_text=True)[-1500:]
+    after = db_row(path, kind, record_id)
+    assert after[column] == expected
+    assert {k: v for k, v in after.items() if k != column} == {
+        k: v for k, v in before.items() if k != column
+    }
+    assert len(backups(path)) == 1
+    assert "→" in client.get(location(r)).get_data(as_text=True)  # сообщение «было → стало»
+
+
+def test_edit_nothing_changed_is_error(client, path):
+    before = digest(path)
+    r = client.post("/edit/expedition/1", data=edit_form_data(path, "expedition", 1))
+    assert r.status_code == 400 and "Ничего не изменено" in r.get_data(as_text=True)
+    assert digest(path) == before and backups(path) == []
+
+
+def test_edit_error_keeps_entered_values(client, path):
+    before = digest(path)
+    specimen_id = specimen_row(path, "2 pc")["specimen_id"]
+    data = edit_form_data(path, "specimen", specimen_id, label="1 pc", notes="моя заметка")
+    r = client.post(f"/edit/specimen/{specimen_id}", data=data, headers=HTMX)
+    assert r.status_code == 400
+    html = r.get_data(as_text=True)
+    assert "уже занят" in html and 'value="1 pc"' in html and "моя заметка" in html
+    assert 'class="field-error' in html
+    assert digest(path) == before and backups(path) == []
+
+
+def test_edit_htmx_success_redirects(client, path):
+    r = client.post("/edit/expedition/1", headers=HTMX,
+                    data=edit_form_data(path, "expedition", 1, notes="через HTMX"))  # fmt: skip
+    assert r.status_code == 204 and r.headers["HX-Redirect"] == "/expeditions/1"
+
+
+def test_edit_specimen_label_warns_about_sample_labels(client, path):
+    specimen_id = specimen_row(path, "155 pc")["specimen_id"]
+    new = f"{next_pc(path)} pc"
+    labels = db_value(path, "SELECT group_concat(label) FROM sample WHERE specimen_id = ?",
+                      specimen_id)  # fmt: skip
+    r = client.post(f"/edit/specimen/{specimen_id}",
+                    data=edit_form_data(path, "specimen", specimen_id, label=new))  # fmt: skip
+    assert r.status_code == 303 and location(r).endswith("/specimen/" + quote(new))
+    page = client.get(location(r)).get_data(as_text=True)
+    assert "Внимание:" in page and "метки образцов" in page
+    assert labels == db_value(
+        path, "SELECT group_concat(label) FROM sample WHERE specimen_id = ?", specimen_id
+    )  # метки образцов не изменились
+
+
+def test_edit_site_duplicate_needs_checkbox(client, path):
+    other = db_value(path, "SELECT name FROM sampling_site WHERE site_id = 2")
+    data = edit_form_data(path, "site", 1, name=other)
+    r = client.post("/edit/site/1", data=data)
+    assert r.status_code == 400 and "похоже, уже есть" in r.get_data(as_text=True)
+    assert backups(path) == []
+    r = client.post("/edit/site/1", data={**data, "allow_nearby": "1"})
+    assert r.status_code == 303
+    assert db_value(path, "SELECT name FROM sampling_site WHERE site_id = 1") == other
+
+
+def test_edit_unknown_kind_or_record_404(client):
+    assert client.get("/edit/zzz/1").status_code == 404
+    assert client.get("/edit/specimen/99999").status_code == 404
+    assert client.get("/edit/identification/1").status_code == 404  # только удаление
+    assert client.get("/delete/sample/99999").status_code == 404
+
+
+# ---- удаление ----
+
+
+DELETE_KINDS = [*EDIT_TABLES, "identification"]
+
+
+def test_delete_confirm_step_writes_nothing(client, path):
+    before = digest(path)
+    for kind in DELETE_KINDS:
+        record_id = 1 if kind == "identification" else first_id(path, kind)
+        url = f"/delete/{kind}/{record_id}"
+        r = client.get(url)
+        assert r.status_code == 200, url
+        html = r.get_data(as_text=True)
+        assert "Вы уверены? Будет удалено" in html and "Да, удалить" in html
+        assert 'name="confirm" value="1"' in html and 'hx-sync="this:drop"' in html
+        # POST без кнопки подтверждения — снова вопрос, ничего не удалено
+        assert client.post(url).status_code == 200
+    assert digest(path) == before and backups(path) == []
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("/delete/event/1", "особ"),
+        ("/delete/expedition/1", "выезд"),
+        ("/delete/site/1", "выезд"),
+        ("/delete/specimen/1", "образ"),
+        ("/delete/identification/1", "единственное определение"),
+    ],
+)
+def test_delete_refused_with_dependents(client, path, url, message):
+    before = digest(path)
+    r = client.post(url, data={"confirm": "1"}, headers=HTMX)
+    assert r.status_code == 400
+    html = r.get_data(as_text=True)
+    assert "удалить нельзя" in html and message in html and 'class="flash flash-error' in html
+    assert digest(path) == before and backups(path) == []
+
+
+def test_delete_specimen_closes_its_issues(client, path):
+    event_id = trawling_event(path)
+    label = f"{next_pc(path)} pc"
+    data = {**GOOD_FISH, "tl_cm": "20", "sl_cm": "22", "confirmed": "SL больше TL"}
+    assert client.post(f"/events/{event_id}/specimens/new", data=data).status_code == 303
+    specimen_id = specimen_row(path, label)["specimen_id"]
+    issue_id = db_value(path, "SELECT issue_id FROM data_issue WHERE table_name = 'specimen' "
+                              "AND record_id = ? AND resolved = 0", specimen_id)  # fmt: skip
+    assert issue_id is not None
+
+    r = client.post(f"/delete/specimen/{specimen_id}", data={"confirm": "1"})
+    assert r.status_code == 303 and location(r).endswith(f"/events/{event_id}")
+    assert specimen_row(path, label) is None
+    assert db_value(path, "SELECT count(*) FROM species_identification WHERE specimen_id = ?",
+                    specimen_id) == 0  # fmt: skip
+    row = issue_row(path, issue_id)
+    assert row["resolved"] == 1 and row["resolution"].startswith("Запись удалена")
+    assert len(backups(path)) == 2  # ввод + удаление
+    assert f"Удалена особь {label}" in client.get(location(r)).get_data(as_text=True)
+
+
+def test_delete_trawling_with_its_water(client, path):
+    trawling_id, event_id = 1, db_value(path, "SELECT event_id FROM trawling WHERE trawling_id = 1")
+    assert db_value(path, "SELECT count(*) FROM water_measurement WHERE trawling_id = 1") == 2
+    html = client.get("/delete/trawling/1").get_data(as_text=True)
+    assert "замеры воды" in html  # что удалится вместе с ним
+    r = client.post(f"/delete/trawling/{trawling_id}", data={"confirm": "1"}, headers=HTMX)
+    assert r.status_code == 204 and r.headers["HX-Redirect"] == f"/events/{event_id}"
+    assert db_row(path, "trawling", 1) is None
+    assert db_value(path, "SELECT count(*) FROM water_measurement WHERE trawling_id = 1") == 0
+
+
+def test_delete_new_expedition_goes_to_list(client, path):
+    r = client.post("/expeditions/new", data={"name": "Удалить меня"})
+    expedition_id = last_id(location(r))
+    r = client.post(f"/delete/expedition/{expedition_id}", data={"confirm": "1"})
+    assert r.status_code == 303 and location(r).endswith("/expeditions")
+    assert db_row(path, "expedition", expedition_id) is None
+
+
+def test_delete_identification_restores_species(client, path):
+    species_before = specimen_row(path, "1")["species_id"]
+    r = client.post(
+        "/specimen/1/identify",
+        data={"species": "Plotosus canius", "method": "ДНК", "confidence": "точно"},
+    )
+    assert r.status_code == 302
+    ident = db_value(path, "SELECT max(identification_id) FROM species_identification")
+    assert f"/delete/identification/{ident}" in client.get("/specimen/1").get_data(as_text=True)
+    r = client.post(f"/delete/identification/{ident}", data={"confirm": "1"})
+    assert r.status_code == 303 and location(r).endswith("/specimen/1")
+    assert specimen_row(path, "1")["species_id"] == species_before
+
+
+def test_delete_shipment(client, path):
+    sample_id, lab_id = (
+        700,
+        db_value(path, "SELECT lab_id FROM sample_shipment WHERE sample_id = 700"),
+    )
+    label = db_value(path, "SELECT sp.label FROM sample sa JOIN specimen sp USING (specimen_id) "
+                           "WHERE sa.sample_id = 700")  # fmt: skip
+    card = client.get("/specimen/" + quote(label)).get_data(as_text=True)
+    url = f"/delete/shipment/{sample_id}/{lab_id}"
+    assert url in card
+    assert "Вы уверены" in client.get(url).get_data(as_text=True)
+    r = client.post(url, data={"confirm": "1"})
+    assert r.status_code == 303 and location(r).endswith("/specimen/" + quote(label))
+    assert db_value(path, "SELECT count(*) FROM sample_shipment WHERE sample_id = ? AND lab_id = ?",
+                    sample_id, lab_id) == 0  # fmt: skip
+    assert db_row(path, "sample", sample_id) is not None  # сам образец остался
+    assert client.get(url).status_code == 404
+
+
+def test_cards_have_edit_and_delete_buttons(client, path):
+    html = client.get("/events/1").get_data(as_text=True)
+    for part in ("/edit/event/1", "/delete/event/1", "/edit/specimen/", "/delete/trawling/",
+                 "/edit/water/", "/specimens/batch"):  # fmt: skip
+        assert part in html, part
+    html = client.get("/specimen/155pc").get_data(as_text=True)
+    for part in (
+        "/edit/specimen/",
+        "/delete/specimen/",
+        "/edit/sample/",
+        "/delete/identification/",
+    ):
+        assert part in html, part
+    assert "/edit/identification/" not in html
+    assert "/edit/expedition/1" in client.get("/expeditions/1").get_data(as_text=True)
+    assert "/delete/site/1" in client.get("/sites/1").get_data(as_text=True)
+    assert "/edit/" not in client.get("/reports/samples").get_data(as_text=True)
+
+
+# ---- пакетный ввод особей ----
+
+
+def batch_data(rows, action="check", **extra):
+    data = {"action": action, **extra}
+    for i, row in enumerate(rows, start=1):
+        for name, value in row.items():
+            data[f"r{i}-{name}"] = value
+    return data
+
+
+def test_batch_page_and_row_fragment(client, path):
+    event_id = trawling_event(path)
+    html = client.get(f"/events/{event_id}/specimens/batch").get_data(as_text=True)
+    assert 'name="r10-label"' in html and 'name="r11-label"' not in html
+    assert 'name="r1-trawl_no"' in html and 'name="r1-dna"' in html
+    assert 'hx-get="/events/' in html and 'hx-swap="beforeend"' in html
+    import re
+
+    for field_id in re.findall(r'<(?:input|select|textarea)[^>]*\bid="(r\d+-\w+)"', html):
+        assert f'for="{field_id}"' in html, field_id
+    r = client.get(f"/events/{event_id}/specimens/batch/row?next=11")
+    frag = r.get_data(as_text=True)
+    assert r.status_code == 200 and "<html" not in frag
+    assert 'name="r11-label"' in frag and 'value="12" hx-swap-oob="true"' in frag
+    assert client.get(f"/events/{event_id}/specimens/batch/row?next=abc").status_code == 400
+    assert client.get("/events/99999/specimens/batch").status_code == 404
+
+
+def test_batch_check_writes_nothing(client, path):
+    event_id = trawling_event(path)
+    before = digest(path)
+    rows = [{"species": "Plotosus canius", "tl_cm": "25,4"},
+            {"species": "Plotosus canius", "tl_cm": "20", "sl_cm": "22"}]  # fmt: skip
+    r = client.post(f"/events/{event_id}/specimens/batch", data=batch_data(rows))
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    n = next_pc(path)
+    assert f"будет: <strong>{n} pc</strong>" in html and f"<strong>{n + 1} pc</strong>" in html
+    assert "SL больше TL" in html and 'class="row-warn"' in html
+    assert digest(path) == before and backups(path) == []
+
+
+def test_batch_all_or_nothing(client, path):
+    event_id = trawling_event(path)
+    n = db_value(path, "SELECT count(*) FROM specimen")
+    rows = [{"species": "Plotosus canius", "tl_cm": "25"},
+            {"species": "Plotosus canius", "tl_cm": "0"}]  # fmt: skip
+    r = client.post(f"/events/{event_id}/specimens/batch", data=batch_data(rows, "save"))
+    assert r.status_code == 400
+    html = r.get_data(as_text=True)
+    assert "TL должна быть больше 0" in html and 'class="row-error"' in html
+    assert "ничего не сохранено" in html
+    assert 'name="r2-tl_cm" value="0"' in html  # введённое на месте
+    assert db_value(path, "SELECT count(*) FROM specimen") == n and backups(path) == []
+
+
+def test_batch_soft_warnings_need_confirmation(client, path):
+    event_id = trawling_event(path)
+    n = db_value(path, "SELECT count(*) FROM specimen")
+    first = next_pc(path)
+    rows = [
+        {"species": "Plotosus canius", "tl_cm": "25,4", "dna": "1", "trawl_no": "1"},
+        {},
+        {"species": "Plotosus canius", "tl_cm": "20", "sl_cm": "22", "is_dead": "1"},
+    ]
+    url = f"/events/{event_id}/specimens/batch"
+    r = client.post(url, data=batch_data(rows, "save"), headers=HTMX)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert "Всё равно сохранить" in html
+    warnings = shown_warnings(html)
+    assert warnings and all(w.startswith("строка 3") for w in warnings)  # пустая строка 2 — пропуск
+    assert db_value(path, "SELECT count(*) FROM specimen") == n and backups(path) == []
+
+    r = client.post(url, data=batch_data(rows, "save", confirmed=warnings))
+    assert r.status_code == 303 and location(r).endswith(f"/events/{event_id}")
+    assert db_value(path, "SELECT count(*) FROM specimen") == n + 2
+    assert len(backups(path)) == 1
+    assert specimen_row(path, f"{first} pc")["trawl_no"] == 1
+    assert db_value(path, "SELECT is_dead FROM specimen WHERE label = ?", f"{first + 1} pc") == 1
+    assert (
+        db_value(
+            path,
+            "SELECT count(*) FROM sample sa JOIN specimen s USING (specimen_id) "
+            "WHERE s.label = ? AND sa.sample_type = 'ДНК'",
+            f"{first} pc",
+        )
+        == 1
+    )
+    page = client.get(location(r)).get_data(as_text=True)
+    assert f"{first} pc, {first + 1} pc" in page  # список добавленных номеров
+
+
+def test_batch_errors_without_database(client, path):
+    event_id = trawling_event(path)
+    url = f"/events/{event_id}/specimens/batch"
+    r = client.post(url, data=batch_data([{"notes": "без вида"}], "save"))
+    assert r.status_code == 400 and "Выберите вид" in r.get_data(as_text=True)
+    r = client.post(url, data=batch_data([{}, {}], "save"))
+    assert r.status_code == 400 and "Нет ни одной заполненной строки" in r.get_data(as_text=True)
+    r = client.post(url, data=batch_data([{"label": "5 pc", "species": "Plotosus canius"}], "more"))
+    html = r.get_data(as_text=True)
+    assert r.status_code == 200 and 'name="r11-label"' in html and 'value="5 pc"' in html
+    assert backups(path) == []
+
+
+# ---- страница траления, страница проблемы, форма траления ----
+
+
+def test_trawling_page(client, path):
+    r = client.get("/trawlings/1")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    for title in ("Замеры воды", "Особи из этого траления", "Прилов", "Проблемы в журнале"):
+        assert title in html
+    event_id = db_value(path, "SELECT event_id FROM trawling WHERE trawling_id = 1")
+    assert f'href="/events/{event_id}"' in html and "/edit/trawling/1" in html
+    assert 'href="/trawlings/1"' in client.get(f"/events/{event_id}").get_data(as_text=True)
+    assert client.get("/trawlings/99999").status_code == 404
+
+
+def test_issue_page(client, path):
+    issue_id = first_open_issue(path)
+    r = client.get(f"/issues/{issue_id}")
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert f"Проблема №{issue_id}" in html and f'action="/issues/{issue_id}/resolve"' in html
+    assert f'href="/issues/{issue_id}"' in client.get("/issues").get_data(as_text=True)
+    assert client.get("/issues/999999").status_code == 404
+
+
+def test_link_trawl_form_only_for_trawled_specimens(client):
+    assert "/specimen/1/link-trawl" in client.get("/specimen/1").get_data(as_text=True)
+    html = client.get("/specimen/118pc").get_data(as_text=True)  # от рыбака на выезде-тралении
+    assert "/link-trawl" not in html
+
+
+# ---- безопасность новых адресов ----
+
+
+def record_post_urls(path):
+    event_id = trawling_event(path)
+    return [
+        "/edit/expedition/1", "/edit/specimen/1", "/edit/water/1",
+        "/delete/event/1", "/delete/specimen/1", "/delete/identification/1",
+        "/delete/shipment/700/1", f"/events/{event_id}/specimens/batch",
+    ]  # fmt: skip
+
+
+def test_record_forms_cross_site_post_rejected(client, path):
+    before = digest(path)
+    for url in record_post_urls(path):
+        data = {"confirm": "1", "action": "save", "r1-species": "Plotosus canius", "notes": "x"}
+        assert (
+            client.post(url, data=data, headers={"Origin": "http://evil.example"}).status_code
+            == 403
+        )
+        r = client.post(url, data=data, headers={"Sec-Fetch-Site": "cross-site"})
+        assert r.status_code == 403, url
+    assert digest(path) == before and backups(path) == []
+
+
+def test_record_pages_get_writes_nothing(client, path):
+    before = digest(path)
+    for url in [
+        *record_post_urls(path),
+        "/trawlings/1",
+        f"/issues/{first_open_issue(path)}",
+        "/events/1/specimens/batch/row?next=3",
+        "/delete/specimen/1?confirm=1",
+    ]:
+        assert client.get(url).status_code == 200, url
+    assert digest(path) == before and backups(path) == []
+
+
+def test_entry_messages_without_cli_flags(client, path):
+    """Тексты ошибок логики на сайте — без флагов командной строки (--label, allow_nearby)."""
+    import re
+
+    event_id = trawling_event(path)
+    r = client.post(f"/events/{event_id}/specimens/new", data={"species": "?"})
+    assert r.status_code == 400 and "укажите номер явно" in r.get_data(as_text=True)
+    r2 = client.post(
+        "/edit/site/1",
+        data=edit_form_data(
+            path, "site", 1, name=db_value(path, "SELECT name FROM sampling_site WHERE site_id = 2")
+        ),
+    )
+    for html in (r.get_data(as_text=True), r2.get_data(as_text=True)):
+        errors = " ".join(re.findall(r'class="[^"]*field-error[^"]*"[^>]*>([^<]*)<', html))
+        assert errors and "--" not in errors and "allow_nearby" not in errors

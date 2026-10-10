@@ -5,6 +5,10 @@
 {% block content %}
 <p class="crumbs"><a href="{{ url_for('sites') }}">Места</a> /</p>
 <h1>{{ title }}</h1>
+<p class="record-actions">
+  <a class="button-link" href="{{ url_for('record_edit', kind_name='site', record_id=site_id) }}">Изменить место</a>
+  <a class="button-link danger" href="{{ url_for('record_delete', kind_name='site', record_id=site_id) }}">Удалить место</a>
+</p>
 <p><a href="{{ url_for('specimens', site=site_id) }}">Особи этого места — списком с фильтрами</a></p>
 {#- Выезд на это место: ссылки на экспедиции → её карточка с раскрытой формой «Новый выезд»
     и уже выбранным местом (?site=N). Обычные ссылки (GET) — база не меняется. -#}

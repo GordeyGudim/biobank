@@ -56,17 +56,16 @@ from biobank.entry import (
     SITE_TYPES,
     WATER_NUMBERS,
 )
-from biobank.importer import LABS
 from biobank.parsing import ORGANS
 from biobank.reports import REPORTS, report_tables
 from biobank.web.entry_forms import (
-    PRESERVATIVE_HINTS,
     Submitted,
     grouped_sites,
     label_suffixes,
     register_entry_routes,
     site_hints,
 )
+from biobank.web.record_forms import as_text, register_record_routes
 from biobank.web.views import (
     ISSUE_STATUSES,
     SPECIMEN_ORDERS,
@@ -74,6 +73,7 @@ from biobank.web.views import (
     field_ids,
     issue_object_url,
     issue_query,
+    row_actions,
     section_views,
     specimen_query,
 )
@@ -130,6 +130,8 @@ def create_app(db_path: Path | str) -> Flask:
     # формы ввода — в своём модуле entry_forms.py; он получает этот модуль (функции
     # страниц и read_db) параметром, чтобы два модуля не импортировали друг друга по кругу
     register_entry_routes(app, sys.modules[__name__])
+    # правка, удаление и пакетный ввод — record_forms.py, устроены так же
+    register_record_routes(app, sys.modules[__name__])
     return app
 
 
@@ -372,13 +374,28 @@ def _register_routes(app: Flask) -> None:
     def site(site_id: int):
         conn = read_db()
         sections = browse.site_card(conn, site_id)  # нет места — 404
-        views = section_views(sections, own_key="site_id")
+        views = section_views(sections, own_key="site_id", actions=True)
         return render_template(
             "site.html",
             views=views,
             title=sections[0].rows[0][1],
             site_id=site_id,
             expeditions=browse.list_expeditions(conn),
+        )
+
+    @app.get("/trawlings/<int:trawling_id>")
+    def trawling(trawling_id: int):
+        """Карточка траления: замеры воды, особи, прилов, проблемы (browse.trawling_card)."""
+        sections = browse.trawling_card(read_db(), trawling_id)  # нет траления — 404
+        ids = field_ids(sections[0])
+        fields = dict(sections[0].rows)
+        return render_template(
+            "trawling.html",
+            views=section_views(sections, own_key="trawling_id", actions=True),
+            trawling_id=trawling_id,
+            trawl_no=fields["траление"],
+            event_title=fields["выезд"],
+            ids=ids,
         )
 
     # ---- отчёты ----
@@ -418,6 +435,17 @@ def _register_routes(app: Flask) -> None:
             categories=browse.issue_categories(conn),
             statuses=ISSUE_STATUSES,
             **context,
+        )
+
+    @app.get("/issues/<int:issue_id>")
+    def issue(issue_id: int):
+        """Одна проблема журнала (на неё ведут ссылки из карточек) + форма «Решено»."""
+        item = browse.get_issue(read_db(), issue_id)  # нет такой — 404
+        return render_template(
+            "issue.html",
+            issue=item,
+            object_url=issue_object_url(item),
+            table_title=TABLE_TITLES.get(item["table_name"], item["table_name"]),
         )
 
     @app.post("/issues/<int:issue_id>/resolve")
@@ -491,7 +519,7 @@ def event_page(event_id: int, submitted: Submitted | None = None, status: int = 
     trawls = browse.event_trawls(conn, event_id)
     return render_template(
         "event.html",
-        views=section_views(sections, own_key="event_id", event_id=event_id),
+        views=section_views(sections, own_key="event_id", event_id=event_id, actions=True),
         title=fields["выезд"],
         event_id=event_id,
         ids=ids,
@@ -551,11 +579,24 @@ def _specimen_page(
     ids = field_ids(sections[0])
     fields = dict(sections[0].rows)
     samples = next(sec for sec in sections if sec.title == "Образцы")  # sample_id — в row_ids
+    sample_ids = [row_ids.get("sample_id") for row_ids in samples.row_ids]
+    views = section_views(sections, own_key="specimen_id", event_id=ids["event_id"], actions=True)
     return render_template(
         "specimen.html",
-        views=section_views(sections, own_key="specimen_id", event_id=ids["event_id"]),
+        views=views,
         label=fields["номер пробы"],  # номер как в базе: «155pc» → «155 pc»
         ids=ids,
+        # форма «Привязать к тралению» — только у особей, полученных тралением
+        # (способ особи, а если своего нет — выезда; из row_ids раздела «Особь»)
+        is_trawled=ids.get("capture_method") == "траление",
+        own_actions=row_actions({"specimen_id": ids["specimen_id"]}),
+        # куда отправлены образцы — для кнопок «удалить отправку»
+        shipments=[
+            (dict(zip(samples.columns, row, strict=True)), shipment)
+            for row, sample_id in zip(samples.rows, sample_ids, strict=True)
+            if sample_id is not None
+            for shipment in browse.list_shipments(conn, sample_id)
+        ],
         trawls=browse.event_trawls(conn, ids["event_id"]),
         species=browse.list_species(conn),
         methods=METHODS,
@@ -567,10 +608,10 @@ def _specimen_page(
             (row_ids.get("sample_id"), dict(zip(samples.columns, row, strict=True)))
             for row, row_ids in zip(samples.rows, samples.row_ids, strict=True)
         ],
-        labs=LABS,
+        labs=[lab["name"] for lab in browse.list_labs(conn)],
         organs=list(dict.fromkeys(name for _, name in ORGANS)),
-        preservatives=PRESERVATIVE_HINTS,
-        current=current_measurements(fields),
+        preservatives=[p["preservative"] for p in browse.list_preservatives(conn)],
+        current=current_measurements(conn, ids["specimen_id"]),
         measurements=MEASUREMENTS,
         **errors,
     ), status
@@ -581,14 +622,15 @@ def specimen_entry_page(label: str, submitted: Submitted, status: int = 400):
     return _specimen_page(label, status, submitted=submitted)
 
 
-def current_measurements(fields: dict) -> dict[str, str]:
-    """Промеры особи для формы «Исправить промеры»: '29.9 см' → '29.9', нет значения → ''.
+def current_measurements(conn: sqlite3.Connection, specimen_id: int) -> dict[str, str]:
+    """Промеры особи для формы «Исправить промеры»: 29.9 → '29.9', не измерено → ''.
 
-    Карточка уже показывает промеры текстом с единицей; форма отправляет назад и
-    показанное значение (скрытые поля old_…) — меняются только исправленные поля.
+    Числа берутся из базы (browse.specimen_measurements), а не из текста карточки; форма
+    отправляет назад и показанное значение (скрытые поля old_…) — меняются только
+    исправленные поля.
     """
-    shown = {"tl_cm": "TL", "sl_cm": "SL", "mass_g": "m", "mass_gutted_g": "m без внутр."}
-    return {column: (fields.get(name) or "").split(" ")[0] for column, name in shown.items()}
+    numbers = browse.specimen_measurements(conn, specimen_id)
+    return {column: as_text(numbers[column]) for column in MEASUREMENTS}
 
 
 def _specimen_edit(label: str, form: dict, error_name: str, action):

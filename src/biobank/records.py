@@ -362,7 +362,7 @@ def update_site(
                 listed = "; ".join(site.describe() for site in nearby)
                 raise EditError(
                     f"Такое место, похоже, уже есть: {listed}. Если это действительно другое "
-                    "место — подтвердите (allow_nearby)."
+                    "место — подтвердите правку."
                 )
             warnings = [f"Рядом есть место {site.describe()}" for site in nearby]
         changed = _apply(conn, "sampling_site", "site_id", site_id, old, new)
@@ -1179,7 +1179,7 @@ def delete_identification(conn: sqlite3.Connection, identification_id: int) -> E
         if not left:
             raise EditError(
                 f"Это единственное определение вида особи {old['label']} — удалить нельзя. "
-                "Чтобы исправить вид, добавьте новое определение (identify)."
+                "Чтобы исправить вид, добавьте новое определение вида."
             )
         what = (
             f"определение вида особи {old['label']}: {old['species']} "

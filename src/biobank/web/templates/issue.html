@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% from "_macros.html" import value %}
+{#- Одна проблема журнала (browse.get_issue): на неё ведут ссылки из карточек и отчётов.
+    Значения — как в базе; если проблема открыта — форма «Решено» (та же, что в журнале). -#}
+{% block title %}Проблема №{{ issue.issue_id }}{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('issues') }}">Журнал проблем</a> /
+  <a href="{{ url_for('issues', category=issue.category) }}">{{ issue.category }}</a> /</p>
+<h1>Проблема №{{ issue.issue_id }}: {{ issue.category }}</h1>
+<table class="fields">
+  <tr><th scope="row">описание</th><td>{{ issue.description }}</td></tr>
+  <tr><th scope="row">к чему</th><td>{{ value(table_title) }}</td></tr>
+  <tr><th scope="row">объект</th><td>{% if object_url %}<a href="{{ object_url }}">{{ value(issue.object_label) }}</a>{% else %}{{ value(issue.object_label) }}{% endif %}</td></tr>
+  <tr><th scope="row">лист Excel</th><td>{{ value(issue.sheet_name) }}</td></tr>
+  <tr><th scope="row">ячейка</th><td>{{ value(issue.cell) }}</td></tr>
+  <tr><th scope="row">значение</th><td>{{ value(issue.raw_value) }}</td></tr>
+  <tr><th scope="row">статус</th><td>{% if issue.resolved %}<span class="resolved"><strong>Решено.</strong> {{ issue.resolution }}</span>{% else %}открыто{% endif %}</td></tr>
+</table>
+{% if not issue.resolved %}
+<section class="section">
+  <h2>Отметить решённой</h2>
+  {% with issue_id=issue.issue_id, resolution=none, error=none %}{% include "_resolve_form.html" %}{% endwith %}
+</section>
+{% endif %}
+{% endblock %}

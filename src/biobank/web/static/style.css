@@ -188,6 +188,26 @@ button.secondary, a.button-link {
   display: none;
 }
 
+/* --- правка и удаление (этап C, часть 2) --- */
+.record-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.8rem; }
+a.button-link.small-button { padding: 0.05rem 0.45rem; font-size: 0.8rem; font-weight: normal; margin-right: 0.3rem; }
+a.button-link.danger, button.danger { color: var(--error); border-color: var(--error); }
+button.danger { background: var(--error); color: #fff; }
+td.row-actions { white-space: nowrap; }
+
+/* --- пакетный ввод особей: компактная таблица, поля без лишних отступов --- */
+.batch-wrap { max-height: none; }
+table.batch td, table.batch th { padding: 0.2rem 0.3rem; }
+table.batch input[type="text"], table.batch select { padding: 0.2rem 0.3rem; width: auto; }
+table.batch select { max-width: 13rem; }
+table.batch td.center { text-align: center; }
+table.batch td.status { min-width: 12rem; font-size: 0.85rem; }
+table.batch tr.row-error { background: var(--error-bg); }
+table.batch tr.row-warn { background: var(--warn-bg); }
+.row-msg.error { color: var(--error); }
+.row-msg.warn { color: #7a5a00; }
+.auto-label { color: var(--ok); }
+
 @media (max-width: 600px) {
   main { padding: 0.5rem; }
   .search input { width: 100%; }

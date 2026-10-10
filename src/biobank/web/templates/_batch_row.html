@@ -1,0 +1,59 @@
+{#- Одна строка таблицы пакетного ввода (batch.html). Поля называются r<номер>-<поле>:
+    номер строки в имени, чтобы невыбранные галочки (браузер их не присылает) не сдвигали
+    значения других строк. status — итог проверки строки (record_forms.RowStatus) или None.
+    oob=true — ответ на «Добавить строку» (HTMX): вместе со строкой сервер присылает новый
+    счётчик строк, HTMX ставит его на место старого (hx-swap-oob — «вставить вне цели»). -#}
+{% set p = "r" ~ i ~ "-" %}
+{% set cls = "row-error" if status and status.errors else ("row-warn" if status and status.warnings else "") %}
+<tr id="row-{{ i }}"{% if cls %} class="{{ cls }}"{% endif %}>
+  <th scope="row" class="num">{{ i }}</th>
+  <td>
+    <label class="visually-hidden" for="{{ p }}label">Строка {{ i }}: № пробы</label>
+    <input type="text" id="{{ p }}label" name="{{ p }}label" value="{{ row.label }}" size="7" placeholder="авто" autocomplete="off">
+  </td>
+  <td>
+    <label class="visually-hidden" for="{{ p }}species">Строка {{ i }}: вид</label>
+    <select id="{{ p }}species" name="{{ p }}species">
+      <option value=""></option>
+      <option value="?"{% if row.species == "?" %} selected{% endif %}>? — не определён</option>
+      {% for sp in species %}
+      <option value="{{ sp.scientific_name }}"{% if row.species == sp.scientific_name %} selected{% endif %}>{{ sp.scientific_name }}{% if sp.code %} ({{ sp.code }}){% endif %}</option>
+      {% endfor %}
+    </select>
+  </td>
+  {% for name, (title, size) in text_fields.items() if name != "label" %}
+  <td>
+    <label class="visually-hidden" for="{{ p }}{{ name }}">Строка {{ i }}: {{ title }}</label>
+    <input type="text" id="{{ p }}{{ name }}" name="{{ p }}{{ name }}" value="{{ row[name] }}" size="{{ size }}" inputmode="decimal" autocomplete="off">
+  </td>
+  {% endfor %}
+  {% if trawls %}
+  <td>
+    <label class="visually-hidden" for="{{ p }}trawl_no">Строка {{ i }}: траление</label>
+    <select id="{{ p }}trawl_no" name="{{ p }}trawl_no">
+      <option value="">неизв.</option>
+      {% for t in trawls %}<option value="{{ t.trawl_no }}"{% if row.trawl_no == t.trawl_no | string %} selected{% endif %}>№{{ t.trawl_no }}</option>{% endfor %}
+    </select>
+  </td>
+  {% endif %}
+  {% for name, title in checks.items() %}
+  <td class="center">
+    <label class="visually-hidden" for="{{ p }}{{ name }}">Строка {{ i }}: {{ title }}</label>
+    <input type="checkbox" id="{{ p }}{{ name }}" name="{{ p }}{{ name }}" value="1"{% if row[name] %} checked{% endif %}>
+  </td>
+  {% endfor %}
+  <td>
+    <label class="visually-hidden" for="{{ p }}notes">Строка {{ i }}: примечание</label>
+    <input type="text" id="{{ p }}notes" name="{{ p }}notes" value="{{ row.notes }}" size="14">
+  </td>
+  <td class="status">
+    {% if status %}
+      {% if status.label and not status.errors %}<span class="{{ 'auto-label' if status.auto else '' }}">{% if status.auto %}будет: {% endif %}<strong>{{ status.label }}</strong></span>{% endif %}
+      {% for e in status.errors %}<div class="row-msg error" role="alert">{{ e }}</div>{% endfor %}
+      {% for w in status.warnings %}<div class="row-msg warn">{{ w }}</div>{% endfor %}
+    {% endif %}
+  </td>
+</tr>
+{#- <template> — чтобы поле счётчика рядом со строкой таблицы разобралось браузером правильно
+    (вне <td> поле в таблице стоять не может); HTMX достанет его оттуда и уберёт обёртку -#}
+{% if oob %}<template><input type="hidden" id="batch-next" name="next" value="{{ i + 1 }}" hx-swap-oob="true"></template>{% endif %}

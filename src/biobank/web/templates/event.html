@@ -9,11 +9,17 @@
 <p class="crumbs"><a href="{{ url_for('expeditions') }}">Экспедиции</a> /
   <a href="{{ url_for('expedition', expedition_id=ids.expedition_id) }}">экспедиция</a> /</p>
 <h1>Выезд {{ title }}</h1>
+<p class="record-actions">
+  <a class="button-link" href="{{ url_for('record_edit', kind_name='event', record_id=event_id) }}">Изменить выезд</a>
+  <a class="button-link danger" href="{{ url_for('record_delete', kind_name='event', record_id=event_id) }}">Удалить выезд</a>
+</p>
 <p><a href="{{ url_for('specimens', expedition=ids.expedition_id, event=event_id) }}">Особи этого выезда — списком с фильтрами</a></p>
 {{ section_table(views[0]) }}
 
 <section class="section edits" id="entry">
   <h2>Добавить</h2>
+  <p><a class="button-link" href="{{ url_for('specimen_batch', event_id=event_id) }}">Ввести несколько особей</a>
+    <span class="small">— таблицей, строка на особь, одним сохранением</span></p>
   {% include "_form_specimen.html" %}
   {#- у выезда не-траления формы нет; но если её всё же отправили — показать ошибку -#}
   {% if is_trawling or (submitted and submitted.form == "f-trawling") %}{% include "_form_trawling.html" %}{% endif %}

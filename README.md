@@ -438,7 +438,7 @@ ORDER BY i.identification_id;
 ## 8. Для разработки
 
 ```bash
-pytest              # все тесты (≈1200; используют data/source.xlsx, но не трогают output/)
+pytest              # все тесты (≈1210; используют data/source.xlsx, но не трогают output/)
 pytest -k histology # только тесты со словом histology в имени
 ruff check .        # стиль кода
 ruff format .       # автоформатирование

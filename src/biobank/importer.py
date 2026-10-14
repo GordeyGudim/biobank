@@ -869,8 +869,21 @@ def _build_database(expeditions: list[ExpeditionData], path: Path) -> dict[str, 
 # (это всё равно нужно для импорта) и сравнить со старой ПО СОДЕРЖИМОМУ: каждая
 # запись — набор значений колонок без собственного номера (id). Номер не
 # сравниваем: он ничего не говорит о данных (у записей журнала проблем номера
-# могут отличаться, хотя содержание то же). Ссылки на другие таблицы (event_id,
-# specimen_id…) сравниваем — импорт нумерует записи всегда в одном порядке.
+# могут отличаться, хотя содержание то же).
+#
+# Ссылки на другие таблицы (sample_id, event_id…) тоже нельзя сравнивать как числа:
+# если импорт создаст новую запись в начале (новый образец на первом листе), номера
+# всех следующих сдвинутся, и каждая ссылка на них покажется изменённой. Поэтому
+# таблицы обходятся по порядку «сначала та, на которую ссылаются» (по PRAGMA
+# foreign_key_list), и для каждой строится соответствие «запись старой базы → запись
+# новой базы». Ссылка в старой базе переводится в номер соответствующей записи новой
+# базы и только потом сравнивается. Соответствие:
+# 1) записи с одинаковым содержимым (с уже переведёнными ссылками);
+# 2) оставшиеся (изменённые) — по одинаковому номеру, а если номера сдвинуты — по
+#    порядку. Это нужно, чтобы правка одного поля выезда не сделала «другими» все его
+#    особи: изменённым считается только сам выезд.
+# Ссылка data_issue (table_name + record_id) внешним ключом не оформлена, но
+# переводится так же.
 #
 # Записи сравниваются как мультимножества (collections.Counter — «словарь
 # запись → сколько раз встречается»): две одинаковые строки считаются двумя.
@@ -933,10 +946,167 @@ def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [r["name"] for r in rows if r["name"] != own_id]
 
 
-def _records(conn: sqlite3.Connection, table: str, columns: list[str]) -> Counter:
-    # имена таблицы и колонок — из схемы базы (sqlite_master), а не от пользователя
-    sql = f"SELECT {', '.join(columns)} FROM {table}"
-    return Counter(tuple(row) for row in conn.execute(sql))
+# ссылки без внешнего ключа: таблица → (колонка с именем таблицы, колонка с номером)
+POLYMORPHIC_LINKS = {"data_issue": ("table_name", "record_id")}
+
+
+@dataclass
+class _ForeignKey:
+    parent: str
+    columns: tuple[str, ...]  # колонки в этой таблице
+    parent_columns: tuple[str, ...]  # на какие колонки родителя ссылаются
+
+
+def _foreign_keys(conn: sqlite3.Connection, table: str) -> list[_ForeignKey]:
+    """Внешние ключи таблицы; составной (trawling_id, event_id) — одним ключом."""
+    groups: dict[int, list] = defaultdict(list)
+    for r in conn.execute("SELECT * FROM pragma_foreign_key_list(?)", (table,)):
+        groups[r["id"]].append(r)
+    keys = []
+    for rows in groups.values():
+        rows.sort(key=lambda r: r["seq"])
+        parent = rows[0]["table"]
+        parent_columns = tuple(r["to"] for r in rows)
+        if None in parent_columns:  # REFERENCES parent без колонок — на первичный ключ
+            parent_columns = tuple(_primary_key(conn, parent))
+        keys.append(_ForeignKey(parent, tuple(r["from"] for r in rows), parent_columns))
+    return sorted(keys, key=lambda k: (k.parent, k.columns))
+
+
+def _primary_key(conn: sqlite3.Connection, table: str) -> list[str]:
+    rows = conn.execute("SELECT name, pk FROM pragma_table_info(?)", (table,)).fetchall()
+    return [r["name"] for r in sorted(rows, key=lambda r: r["pk"]) if r["pk"]]
+
+
+def _table_order(conn: sqlite3.Connection, tables: list[str]) -> list[str]:
+    """Таблицы по порядку: сначала те, на которые ссылаются (топологическая сортировка)."""
+    parents = {t: {k.parent for k in _foreign_keys(conn, t)} - {t} for t in tables}
+    for table in POLYMORPHIC_LINKS:  # ссылается на любую таблицу — в самый конец
+        if table in parents:
+            parents[table] = set(tables) - {table}
+    order: list[str] = []
+    while len(order) < len(tables):
+        ready = sorted(t for t in tables if t not in order and parents[t] <= set(order))
+        if not ready:
+            raise sqlite3.DatabaseError("в схеме циклические внешние ключи — сравнить нельзя")
+        order += ready
+    return order
+
+
+class _Side:
+    """Записи одной базы для сравнения: строки таблиц и как их найти по значениям ссылок."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.rows: dict[str, list[sqlite3.Row]] = {}
+        self._lookups: dict[tuple, dict[tuple, int]] = {}
+
+    def load(self, table: str) -> list[sqlite3.Row]:
+        # имя таблицы — из схемы базы (sqlite_master), а не от пользователя
+        self.rows[table] = self.conn.execute(f"SELECT rowid AS _rowid_, * FROM {table}").fetchall()
+        return self.rows[table]
+
+    def lookup(self, table: str, columns: tuple[str, ...]) -> dict[tuple, int]:
+        """Значения колонок → rowid записи (для перевода ссылок; таблица уже загружена).
+
+        Словарь строится один раз на таблицу и набор колонок — не запрос на каждую строку.
+        """
+        if (table, columns) not in self._lookups:
+            self._lookups[table, columns] = {
+                tuple(r[c] for c in columns): r["_rowid_"] for r in self.rows[table]
+            }
+        return self._lookups[table, columns]
+
+    def lookup_by_id(self, table) -> dict[tuple, int] | None:
+        """Собственный номер записи → rowid; None — таблицы нет или у неё нет номера."""
+        if table not in self.rows:
+            return None
+        own_id = _own_id_column(self.conn, table)
+        return self.lookup(table, (own_id,)) if own_id else None
+
+
+def _record_keys(
+    side: _Side,
+    table: str,
+    columns: list[str],
+    keys: list[_ForeignKey],
+    mapping: dict[str, dict[int, object]] | None,
+) -> list[tuple[int, tuple]]:
+    """[(rowid, содержимое записи)] — ссылки заменены на номер записи в НОВОЙ базе.
+
+    mapping — соответствие «rowid старой базы → rowid новой» по уже сравненным
+    таблицам (для старой базы); None — это сама новая база, ссылки остаются как есть.
+    Ссылка на запись, которой в новой базе нет, — ('нет в новой', rowid): она не
+    совпадёт ни с одной ссылкой новой базы.
+    """
+    fk_columns = {c for k in keys for c in k.columns}
+    link = POLYMORPHIC_LINKS.get(table)
+    if link:
+        fk_columns.add(link[1])
+    plain = [c for c in columns if c not in fk_columns]
+    lookups = [side.lookup(k.parent, k.parent_columns) for k in keys]
+
+    def translate(parent: str, rowid: int | None):
+        if rowid is None or mapping is None:
+            return rowid
+        return mapping[parent].get(rowid, ("нет в новой", rowid))
+
+    if link:  # таблицы, на которые ссылается data_issue: по одному словарю на таблицу
+        targets = {name: side.lookup_by_id(name) for name in {r[link[0]] for r in side.rows[table]}}
+
+    result = []
+    for row in side.rows[table]:
+        refs = []
+        for key, lookup in zip(keys, lookups, strict=True):
+            values = tuple(row[c] for c in key.columns)
+            if None in values:  # ссылки нет (траление неизвестно) — NULL
+                refs.append(None)
+            elif values in lookup:
+                refs.append(translate(key.parent, lookup[values]))
+            else:  # битая ссылка (при foreign_keys = ON не бывает) — сравниваем как есть
+                refs.append(("битая", values))
+        if link:
+            parent, record_id = row[link[0]], row[link[1]]
+            found = targets[parent]
+            if record_id is None or found is None:  # нет ссылки или неизвестная таблица
+                refs.append(record_id)
+            elif (record_id,) in found:
+                refs.append(translate(parent, found[(record_id,)]))
+            else:  # запись, о которой проблема, уже удалена
+                refs.append(("битая", record_id))
+        result.append((row["_rowid_"], tuple(row[c] for c in plain) + tuple(refs)))
+    return result
+
+
+def _own_id_column(conn: sqlite3.Connection, table: str) -> str | None:
+    """Собственный номер записи — одиночный первичный ключ (или None)."""
+    key = _primary_key(conn, table)
+    return key[0] if len(key) == 1 else None
+
+
+def _match(old_keys: list[tuple[int, tuple]], new_keys: list[tuple[int, tuple]]) -> dict:
+    """Соответствие rowid старой → новой: сначала по содержимому, остальные — по номеру."""
+    by_content: dict[tuple, list[int]] = defaultdict(list)
+    for rowid, key in sorted(new_keys):
+        by_content[key].append(rowid)
+    mapping, left_old = {}, []
+    for rowid, key in sorted(old_keys):
+        if by_content.get(key):
+            mapping[rowid] = by_content[key].pop(0)
+        else:
+            left_old.append(rowid)
+    left_new = {rowid for rowids in by_content.values() for rowid in rowids}
+    still_old = []
+    for rowid in left_old:  # изменённая запись: та же, что под тем же номером
+        if rowid in left_new:
+            mapping[rowid] = rowid
+            left_new.discard(rowid)
+        else:
+            still_old.append(rowid)
+    # номера сдвинуты — оставшиеся изменённые по порядку (влияет только на перевод
+    # ссылок дочерних таблиц; сама изменённая запись всё равно считается расхождением)
+    mapping.update(zip(still_old, sorted(left_new), strict=False))
+    return mapping
 
 
 def compare_databases(old: sqlite3.Connection, new: sqlite3.Connection) -> list[TableDifference]:
@@ -951,17 +1121,27 @@ def compare_databases(old: sqlite3.Connection, new: sqlite3.Connection) -> list[
         raise sqlite3.DatabaseError(
             f"структура базы отличается от db/schema.sql (таблицы: {names})"
         )
-    differences = []
-    for table in sorted(new_tables):
-        columns = _columns(new, table)
-        if _columns(old, table) != columns:
+    old_side, new_side = _Side(old), _Side(new)
+    mapping: dict[str, dict[int, object]] = {}  # таблица → rowid старой → rowid новой
+    counts = {}
+    for table in _table_order(new, sorted(new_tables)):
+        columns, keys = _columns(new, table), _foreign_keys(new, table)
+        if _columns(old, table) != columns or _foreign_keys(old, table) != keys:
             raise sqlite3.DatabaseError(f"структура таблицы {table} отличается от db/schema.sql")
-        old_records, new_records = _records(old, table, columns), _records(new, table, columns)
-        only_old = sum((old_records - new_records).values())
-        only_new = sum((new_records - old_records).values())
-        if only_old or only_new:
-            differences.append(TableDifference(table, only_old, only_new))
-    return differences
+        old_side.load(table)
+        new_side.load(table)
+        old_keys = _record_keys(old_side, table, columns, keys, mapping)
+        new_keys = _record_keys(new_side, table, columns, keys, None)
+        mapping[table] = _match(old_keys, new_keys)
+        old_records = Counter(key for _, key in old_keys)
+        new_records = Counter(key for _, key in new_keys)
+        counts[table] = (
+            sum((old_records - new_records).values()),
+            sum((new_records - old_records).values()),
+        )
+    return [
+        TableDifference(table, *counts[table]) for table in sorted(counts) if any(counts[table])
+    ]
 
 
 @dataclass

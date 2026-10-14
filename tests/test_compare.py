@@ -6,11 +6,13 @@
 """
 
 import shutil
+import sqlite3
 
 import pytest
 from conftest import count
 
 from biobank.db import connect, connect_read_only
+from biobank.entry import create_specimen
 from biobank.importer import _table_order, compare_databases
 
 # на сколько сдвинуть номера: заведомо больше числа записей в таблице
@@ -60,6 +62,17 @@ def shift_ids(conn, table, id_column, references):
     )
     conn.commit()
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def shift_all(conn):
+    """Сдвинуть номера образцов, особей и тралений — как будто импорт добавил записи в начало."""
+    shift_ids(conn, "sample", "sample_id", SAMPLE_REFS)
+    shift_ids(conn, "specimen", "specimen_id", SPECIMEN_REFS)
+    shift_ids(conn, "trawling", "trawling_id", TRAWLING_REFS)
+
+
+def specimen_id(conn, label):
+    return count(conn, "SELECT specimen_id FROM specimen WHERE label = ?", label)
 
 
 def test_identical(old, db_path):
@@ -155,3 +168,120 @@ def test_table_order_parents_first(db):
                           ("trawling", "specimen"), ("sampling_event", "trawling")]:  # fmt: skip
         assert order.index(parent) < order.index(child)
     assert order[-1] == "data_issue"
+
+
+# ---- изменения при сдвинутых номерах: находятся и не «расползаются» ----
+
+
+def test_specimen_moved_to_other_event(old, db_path):
+    """Перенос особи на другой выезд — изменена только особь (её образцы — те же)."""
+    shift_all(old)
+    with old:
+        old.execute(
+            "UPDATE specimen SET event_id = 2 WHERE specimen_id = ?", (specimen_id(old, "3"),)
+        )
+    assert differences(old, db_path) == {"specimen": (1, 1)}
+
+
+def test_link_trawl(old, db_path):
+    """link-trawl: NULL → номер траления (составная ссылка) — изменена только особь."""
+    shift_all(old)
+    event_id = count(old, "SELECT event_id FROM specimen WHERE label = '5 pc'")
+    trawling_id = count(old, "SELECT min(trawling_id) FROM trawling WHERE event_id = ?", event_id)
+    with old:
+        old.execute("UPDATE specimen SET trawling_id = ? WHERE label = '5 pc'", (trawling_id,))
+    assert differences(old, db_path) == {"specimen": (1, 1)}
+
+
+def test_one_of_two_equal_catches_deleted(old, db_path):
+    """Две одинаковые записи прилова (выезд 7) — удалена одна: (0, 1), а не «совпадает»."""
+    rows = old.execute(
+        "SELECT catch_id FROM catch_record WHERE event_id = 7 "
+        "AND raw_text = 'речная камбала - 1 шт'"
+    ).fetchall()
+    assert len(rows) == 2
+    shift_all(old)
+    with old:
+        old.execute("DELETE FROM catch_record WHERE catch_id = ?", (rows[0][0],))
+    assert differences(old, db_path) == {"catch_record": (0, 1)}
+
+
+def test_specimen_added_through_entry(old, db_path):
+    """Особь, введённая на сайте (entry.create_specimen), — видна, остальное на месте."""
+    shift_all(old)
+    create_specimen(old, 1, "Plotosus canius", "999 pc", tl_cm=10)
+    diff = differences(old, db_path)
+    assert diff["specimen"] == (1, 0)
+    assert diff["species_identification"] == (1, 0)
+    assert set(diff) <= {"specimen", "species_identification", "data_issue"}
+
+
+def test_tl_edit_and_sample_moved(old, db_path):
+    """Правка TL особи + перенос её образца на другую особь — расхождение и в sample."""
+    shift_all(old)
+    source, target = specimen_id(old, "3"), specimen_id(old, "5 pc")
+    with old:
+        old.execute("UPDATE specimen SET tl_cm = 1.5 WHERE specimen_id = ?", (source,))
+        old.execute(
+            "UPDATE sample SET specimen_id = ? WHERE sample_id = "
+            "(SELECT min(sample_id) FROM sample WHERE specimen_id = ?)",
+            (target, source),
+        )
+    assert differences(old, db_path) == {"specimen": (1, 1), "sample": (1, 1)}
+
+
+def test_specimen_replaced_by_other_with_same_samples(old, db_path):
+    """Удалили особь «3» с образцами и добавили особь X1 с образцами того же содержания:
+    X1 — другая особь (другой label), её образцы тоже видны в сводке."""
+    shift_all(old)
+    source = specimen_id(old, "3")
+    with old:
+        old.execute(
+            "INSERT INTO specimen (label, label_raw, series, series_no, event_id, species_id, "
+            "tl_cm, sl_cm, mass_g, mass_gutted_g, sex, is_dead, notes, source_row) "
+            "SELECT 'X1', label_raw, series, series_no, event_id, species_id, tl_cm, sl_cm, "
+            "mass_g, mass_gutted_g, sex, is_dead, notes, source_row FROM specimen "
+            "WHERE specimen_id = ?",
+            (source,),
+        )
+        new_id = specimen_id(old, "X1")
+        for table in ("sample", "species_identification"):  # имена — константы теста
+            old.execute(
+                f"UPDATE {table} SET specimen_id = ? WHERE specimen_id = ?", (new_id, source)
+            )
+        old.execute("DELETE FROM specimen WHERE specimen_id = ?", (source,))
+    diff = differences(old, db_path)
+    assert diff["specimen"] == (1, 1)
+    assert diff["sample"] == (3, 3)
+    assert diff["species_identification"] == (1, 1)
+
+
+def test_all_smears_changed_shipments_unchanged(old, db_path):
+    """Изменён фиксатор у всех мазков и сдвинуты номера: отправки мазков — те же."""
+    smears = count(old, "SELECT count(*) FROM sample WHERE sample_type = 'мазок крови'")
+    assert count(
+        old,
+        "SELECT count(*) FROM sample_shipment JOIN sample USING (sample_id) "
+        "WHERE sample_type = 'мазок крови'",
+    )  # у мазков есть отправки — есть что «потерять»
+    with old:
+        old.execute("UPDATE sample SET preservative = 'другой' WHERE sample_type = 'мазок крови'")
+        # удалить первый образец без отправок: номера расходятся не «ровно», как при новом
+        # образце «ХХ» в начале импорта (на этом прежнее сопоставление «по порядку» ошибалось)
+        old.execute(
+            "DELETE FROM sample WHERE sample_id = (SELECT min(sample_id) FROM sample "
+            "WHERE sample_id NOT IN (SELECT sample_id FROM sample_shipment))"
+        )
+    shift_all(old)
+    assert differences(old, db_path) == {"sample": (smears, smears + 1)}
+
+
+def test_self_reference_is_error(old, db_path):
+    """Запись журнала о записи журнала — сравнить нельзя: ошибка, а не KeyError."""
+    with old:
+        old.execute(
+            "UPDATE data_issue SET table_name = 'data_issue', record_id = issue_id "
+            "WHERE issue_id = (SELECT min(issue_id) FROM data_issue)"
+        )
+    with pytest.raises(sqlite3.DatabaseError, match="той же таблицы"):
+        differences(old, db_path)

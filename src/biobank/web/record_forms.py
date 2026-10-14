@@ -10,6 +10,12 @@
 (есть зависимые записи) — текст ошибки на той же странице, база не меняется.
 После удаления — переход на «родителя»: выезд → экспедиция, особь → выезд и т.д.
 
+Куда вернуться: кнопки «Изменить»/«Удалить» в карточках передают адрес своей страницы
+параметром next (/edit/specimen/5?next=/events/3). Форма хранит его в скрытом поле, и после
+сохранения (и по «Отмене») пользователь возвращается туда, откуда пришёл. Принимается только
+путь на этом сайте (views.local_path). После удаления на страницу самой удалённой записи
+вернуться нельзя — её больше нет: тогда переход на «родителя».
+
 Пакетный ввод: таблица-форма на странице /events/<id>/specimens/batch, строка = особь.
 «Проверить» — entry.check_specimens (только чтение), «Сохранить» — entry.create_specimens
 (всё или ничего). Мягкие предупреждения — как у одиночной формы: «Всё равно сохранить».
@@ -24,6 +30,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from urllib.parse import unquote, urlsplit
 
 from flask import Flask, abort, current_app, flash, render_template, request, url_for
 
@@ -31,6 +38,7 @@ from biobank import browse, entry, records
 from biobank.edit import EditError, NotFoundError, apply_edit, event_title
 from biobank.parsing import ORGANS
 from biobank.web.entry_forms import confirmed, go
+from biobank.web.views import local_path
 
 # ---------------------------------------------------------------------------
 # Поля форм правки
@@ -395,6 +403,72 @@ def parent_url(conn, kind_name: str, rec: dict) -> str:
     return view_url(conn, kind_name, rec)  # замер, образец, определение вида
 
 
+def requested_next() -> str | None:
+    """Куда вернуться: next из адреса (GET) или из скрытого поля формы (POST).
+
+    Только путь на этом сайте (views.local_path); чужой адрес — None (родная страница записи).
+    """
+    raw = request.form.get("next") if request.method == "POST" else request.args.get("next")
+    return local_path(raw)
+
+
+def _path(url: str) -> str:
+    """Путь адреса без параметров и в раскодированном виде: «/specimen/26%20ph?x=1» →
+    «/specimen/26 ph» — чтобы сравнивать адреса, записанные по-разному."""
+    return unquote(urlsplit(url).path)
+
+
+def _is_form_page(url: str) -> bool:
+    """Страница правки или удаления — после записи на неё не возвращаемся."""
+    return _path(url).startswith(("/edit/", "/delete/"))
+
+
+def own_pages(kind_name: str, rec: dict) -> set[str]:
+    """Пути страниц самой записи (у образца, замера, прилова своей страницы нет)."""
+    if kind_name == "expedition":
+        url = url_for("expedition", expedition_id=rec["expedition_id"])
+    elif kind_name == "site":
+        url = url_for("site", site_id=rec["site_id"])
+    elif kind_name == "event":
+        url = url_for("event", event_id=rec["event_id"])
+    elif kind_name == "trawling":
+        url = url_for("trawling", trawling_id=rec["trawling_id"])
+    elif kind_name == "specimen":
+        url = url_for("specimen", label=rec["label"])
+    else:
+        return set()
+    return {_path(url)}
+
+
+def after_edit_url(conn, kind_name: str, before: dict, after: dict, back: str | None) -> str:
+    """Куда перейти после правки: туда, откуда пришли (back), иначе — страница записи.
+
+    Номер особи изменился, а пришли с карточки по старому номеру — на карточку с новым
+    номером (по старому её уже не найти: была бы 404).
+    """
+    if back is None or _is_form_page(back):
+        return view_url(conn, kind_name, after)
+    # карточка особи по старому номеру (в любом написании: «26ph», «26 ph») — уже 404
+    if kind_name == "specimen" and before["label"] != after["label"]:
+        if _path(back).startswith("/specimen/"):
+            return view_url(conn, kind_name, after)
+    return back
+
+
+def after_delete_url(conn, kind_name: str, rec: dict, back: str | None) -> str:
+    """Куда перейти после удаления: туда, откуда пришли, — если та страница ещё есть.
+
+    Страница самой удалённой записи (и её формы /edit/…, /delete/…) — уже 404: тогда
+    на «родителя». Для особи — любая карточка /specimen/…: номер в адресе можно написать
+    по-разному («26ph», «26 ph»), при сомнении — «родитель».
+    """
+    if back is None or _is_form_page(back) or _path(back) in own_pages(kind_name, rec):
+        return parent_url(conn, kind_name, rec)
+    if kind_name == "specimen" and _path(back).startswith("/specimen/"):
+        return parent_url(conn, kind_name, rec)
+    return back
+
+
 # ---------------------------------------------------------------------------
 # Пакетный ввод особей
 # ---------------------------------------------------------------------------
@@ -518,6 +592,7 @@ def register_record_routes(app: Flask, pages) -> None:
 
     def edit_page(kind_name, kind, rec, values, old, error=None, status=200):
         conn = pages.read_db()
+        back = requested_next()
         f = {"id": "f-edit", "data": values, "old": old, "error": error, "warnings": [],
              "nearby": [], "open": True}  # fmt: skip
         return render_template(
@@ -526,7 +601,8 @@ def register_record_routes(app: Flask, pages) -> None:
             kind=kind,
             f=f,
             title=record_title(conn, kind_name, rec),
-            back=view_url(conn, kind_name, rec),
+            back=back or view_url(conn, kind_name, rec),
+            next_url=back,
             choices=build_choices(conn, kind, rec),
             extra={"new_region": request.form.get("new_region") == "1",
                    "allow_nearby": request.form.get("allow_nearby") == "1"},
@@ -567,15 +643,18 @@ def register_record_routes(app: Flask, pages) -> None:
         flash(result.message, "ok")
         for warning in result.warnings:
             flash(f"Внимание: {warning}", "warn")
-        # запись после правки (номер особи мог измениться) — адрес её страницы
-        return go(view_url(conn, kind_name, browse.get_record(conn, kind.record, record_id)))
+        # туда, откуда пришли; номер особи мог измениться — запись берём заново
+        after = browse.get_record(conn, kind.record, record_id)
+        return go(after_edit_url(conn, kind_name, rec, after, requested_next()))
 
     # ---- удаление ----
 
-    def delete_page(title, rows, back, action, together=None, error=None, status=200):
+    def delete_page(
+        title, rows, back, action, together=None, error=None, status=200, came_from=None
+    ):
         return render_template(
             "record_delete.html", title=title, rows=rows, back=back, action=action,
-            together=together, error=error,
+            together=together, error=error, next_url=came_from,
         ), status  # fmt: skip
 
     def delete(action, success_url, page):
@@ -603,15 +682,17 @@ def register_record_routes(app: Flask, pages) -> None:
         # всё, что нужно показать и куда вернуться, — до удаления: потом записи уже нет
         title = record_title(conn, kind_name, rec)
         rows = display_rows(conn, kind_name, kind, rec)
-        back = view_url(conn, kind_name, rec)
+        came_from = requested_next()
+        back = came_from or view_url(conn, kind_name, rec)  # «Отмена»: запись на месте
+        success = after_delete_url(conn, kind_name, rec, came_from)
 
         def page(error, status):
             action = url_for("record_delete", kind_name=kind_name, record_id=record_id)
-            return delete_page(title, rows, back, action, kind.together, error, status)
+            return delete_page(title, rows, back, action, kind.together, error, status, came_from)
 
         if request.method == "GET":
             return page(None, 200)
-        return delete(lambda c: kind.delete(c, record_id), parent_url(conn, kind_name, rec), page)
+        return delete(lambda c: kind.delete(c, record_id), success, page)
 
     @app.route("/delete/shipment/<int:sample_id>/<int:lab_id>", methods=["GET", "POST"])
     def shipment_delete(sample_id: int, lab_id: int):

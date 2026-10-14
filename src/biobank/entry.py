@@ -45,7 +45,7 @@ from biobank.edit import (
     find_specimen,
     write_transaction,
 )
-from biobank.importer import CAPTURE_METHODS, SAME_SITE_KM, SITE_TYPE, SMEAR_PRESERVATIVE
+from biobank.importer import CAPTURE_METHODS, SAME_SITE_KM, SITE_TYPE
 from biobank.parsing import (
     SUFFIXES,
     distance_km,
@@ -62,9 +62,10 @@ SITE_TYPES = tuple(SITE_TYPE.values())  # 'участок реки', 'рынок
 SAMPLE_TYPES = ("ДНК", "гистология", "мазок крови", "кишечник", "целая особь", "другое")
 POINT_TYPES = ("старт", "финиш", "точка")
 SEXES = ("самка", "самец")
-# Фиксация образцов — в том написании, что при импорте (мазки, гистология и внутренности
-# креветок, целые особи в спирте). Поле свободное: это подсказки для формы, а не запрет.
-PRESERVATIVES = (SMEAR_PRESERVATIVE, "формалин 10%", "заморозка", "этанол")
+# Фиксация образцов — только те, что подтверждены текстом Excel и записаны импортом
+# (гистология и внутренности креветок, целые особи в спирте). У мазков фиксация в Excel
+# не указана — импорт оставляет NULL. Поле свободное: это подсказки для формы, а не запрет.
+PRESERVATIVES = ("формалин 10%", "заморозка", "этанол")
 # первое слово (в нижнем регистре) → как записано при импорте
 COORD_SOURCES = {"garmin": "Garmin", "google": "Google Maps"}
 GEAR_TYPE = "трал"

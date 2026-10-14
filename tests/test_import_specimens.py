@@ -211,12 +211,35 @@ def test_shrimp_samples(db):
     ]
 
 
-def test_smear_preservative(db):
+def test_smear_preservative_is_null(db):
+    """О фиксации мазков в Excel ничего не сказано — поле пустое, не догадка."""
+    assert count(db, "SELECT count(*) FROM sample WHERE sample_type = 'мазок крови'") > 0
     assert (
         count(
             db,
             "SELECT count(*) FROM sample WHERE sample_type = 'мазок крови' "
-            "AND preservative IS NOT 'этанол 96% (фиксация)'",
+            "AND preservative IS NOT NULL",
+        )
+        == 0
+    )
+
+
+def test_shrimp_preservatives_kept(db):
+    """Фиксации креветок подтверждены текстом ячеек: «10% form.», «заморозили в пакете»."""
+    rows = db.execute(
+        "SELECT sa.sample_type, sa.organ, sa.preservative FROM sample sa "
+        "JOIN specimen sp USING (specimen_id) WHERE sp.label = '1 mr' ORDER BY sa.sample_id"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("гистология", "мышцы", "формалин 10%"),
+        ("гистология", "жабры", "формалин 10%"),
+        ("другое", "кишечник, гепатопанкреас, карапакс", "заморозка"),
+    ]
+    assert (
+        count(
+            db,
+            "SELECT count(*) FROM sample sa JOIN specimen sp USING (specimen_id) "
+            "WHERE sp.label LIKE '% mr' AND sa.preservative IS NULL",
         )
         == 0
     )

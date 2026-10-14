@@ -21,6 +21,8 @@
   <form method="post" action="{{ action }}" hx-post="{{ action }}"
         hx-target="#f-delete" hx-select="#f-delete" hx-swap="outerHTML"
         hx-sync="this:drop" hx-disabled-elt="find button">
+    {#- откуда пришли (параметр next): туда вернёт сервер после удаления, если страница осталась -#}
+    {% if next_url %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
     <div class="buttons">
       <button type="submit" name="confirm" value="1" class="danger">Да, удалить</button>
       <a class="button-link" href="{{ back }}">Отмена</a>

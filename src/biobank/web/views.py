@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from flask import url_for
 
@@ -77,10 +78,39 @@ NO_ACTIONS = ("issue_id", "analysis_id")
 DELETE_ONLY = ("identification",)
 
 
-def row_actions(ids: Mapping) -> list[tuple[str, str]]:
-    """Кнопки строки таблицы: «Изменить» и «Удалить» для записи этой строки."""
+def local_path(value: str | None) -> str | None:
+    r"""Адрес «куда вернуться» (параметр next), если это путь на этом же сайте; иначе None.
+
+    Защита от «открытого перенаправления» (open redirect): чужая ссылка вида
+    /edit/…?next=https://evil.example не должна уводить пользователя после сохранения
+    на посторонний сайт. Принимаем только путь: один «/» в начале, без схемы (https:)
+    и хоста. «//evil» и «/\evil» браузер понимает как адрес другого сайта, а табуляции
+    и переводы строк он выбрасывает («/<Tab>/evil» → «//evil») — такие адреса отклоняем.
+
+    >>> local_path("/events/3"), local_path("/specimens?event=3&page=2")
+    ('/events/3', '/specimens?event=3&page=2')
+    >>> local_path("https://evil"), local_path("//evil"), local_path("/\\evil"), local_path("")
+    (None, None, None, None)
+    """
+    if not value or not value.startswith("/") or value.startswith("//"):
+        return None
+    if "\\" in value or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None
+    parts = urlsplit(value)
+    if parts.scheme or parts.netloc:
+        return None
+    return value
+
+
+def row_actions(ids: Mapping, here: str | None = None) -> list[tuple[str, str]]:
+    """Кнопки строки таблицы: «Изменить» и «Удалить» для записи этой строки.
+
+    here — адрес текущей страницы: передаётся в ссылки параметром next, чтобы после
+    сохранения или удаления вернуться сюда же (None — на страницу самой записи).
+    """
     if any(key in ids for key in NO_ACTIONS):
         return []
+    back = {"next": here} if here else {}
     for key, kind in ROW_KINDS:
         record_id = ids.get(key)
         if record_id is None:
@@ -88,9 +118,11 @@ def row_actions(ids: Mapping) -> list[tuple[str, str]]:
         buttons = []
         if kind not in DELETE_ONLY:
             buttons.append(
-                ("Изменить", url_for("record_edit", kind_name=kind, record_id=record_id))
+                ("Изменить", url_for("record_edit", kind_name=kind, record_id=record_id, **back))
             )
-        buttons.append(("Удалить", url_for("record_delete", kind_name=kind, record_id=record_id)))
+        buttons.append(
+            ("Удалить", url_for("record_delete", kind_name=kind, record_id=record_id, **back))
+        )
         return buttons
     return []
 
@@ -125,13 +157,15 @@ def section_views(
     event_id: int | None = None,
     id_column: str | None = None,
     actions: bool = False,
+    here: str | None = None,
 ) -> list[SectionView]:
     """Ссылки для всех разделов страницы.
 
     own_key — id самой страницы (в карточке выезда — «event_id»): на себя не ссылаемся;
     event_id — выезд страницы (оставлен для совместимости, ссылки от него не зависят);
     id_column — что лежит в колонке «id» отчёта без row_ids («issue_id», «site_id»);
-    actions — у строк-записей кнопки «Изменить»/«Удалить» (карточки; в отчётах — нет).
+    actions — у строк-записей кнопки «Изменить»/«Удалить» (карточки; в отчётах — нет);
+    here — адрес страницы: туда кнопки вернут после сохранения/удаления (параметр next).
     Строки таблицы «Траления» (только trawling_id) получают якорь trawling-N.
     """
     views = []
@@ -162,7 +196,7 @@ def section_views(
                 if id_column == "site_id" and "id" in sec.columns:
                     links[sec.columns.index("id")] = _url("site_id", named["id"], named, None)
             view.links.append(links)
-            view.actions.append(row_actions(ids) if actions and not sec.is_fields else [])
+            view.actions.append(row_actions(ids, here) if actions and not sec.is_fields else [])
             only_trawl = set(ids) == {"trawling_id"} and ids["trawling_id"] is not None
             view.anchors.append(f"trawling-{ids['trawling_id']}" if only_trawl else None)
         views.append(view)

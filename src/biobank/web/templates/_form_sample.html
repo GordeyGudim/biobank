@@ -10,7 +10,7 @@
     {{ select(f, "sample_type", "Тип образца", types, required=true, empty="— выберите —") }}
     {{ text(f, "organ", "Орган", list="organs") }}
     {{ text(f, "sample_label", "Метка образца", placeholder=label, hint="пусто — " ~ label) }}
-    {{ text(f, "preservative", "Фиксация", list="preservatives", placeholder="этанол 96%") }}
+    {{ text(f, "preservative", "Фиксация", list="preservatives", placeholder="формалин 10%", hint="пусто — фиксация не указана") }}
     {{ area(f, "labs", "Отправлен в лаборатории", hint="по одной в строке: " ~ (labs | join("; "))) }}
     {{ area(f, "notes", "Примечания") }}
   </div>

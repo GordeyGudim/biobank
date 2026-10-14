@@ -553,7 +553,7 @@ def _add_entry_parsers(sub) -> None:
     p.add_argument("sample_type", choices=SAMPLE_TYPES, help="тип образца")
     p.add_argument("--organ", help="орган: печень, почки, икра, жабры, мышцы…")
     p.add_argument("--tag", help='метка образца, напр. "179 pc a" (по умолчанию — номер особи)')
-    p.add_argument("--preservative", help='фиксация, напр. "этанол 96%%", "формалин 10%%"')
+    p.add_argument("--preservative", help='фиксация, напр. "формалин 10%%", "заморозка"')
     p.add_argument("--lab", action="append", default=[], help="куда отправлен (можно несколько)")
     p.add_argument("--notes", help="примечание")
     p.set_defaults(func=cmd_add_sample)

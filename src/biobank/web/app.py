@@ -374,7 +374,9 @@ def _register_routes(app: Flask) -> None:
     def site(site_id: int):
         conn = read_db()
         sections = browse.site_card(conn, site_id)  # нет места — 404
-        views = section_views(sections, own_key="site_id", actions=True)
+        views = section_views(
+            sections, own_key="site_id", actions=True, here=url_for("site", site_id=site_id)
+        )
         return render_template(
             "site.html",
             views=views,
@@ -391,7 +393,12 @@ def _register_routes(app: Flask) -> None:
         fields = dict(sections[0].rows)
         return render_template(
             "trawling.html",
-            views=section_views(sections, own_key="trawling_id", actions=True),
+            views=section_views(
+                sections,
+                own_key="trawling_id",
+                actions=True,
+                here=url_for("trawling", trawling_id=trawling_id),
+            ),
             trawling_id=trawling_id,
             trawl_no=fields["траление"],
             event_title=fields["выезд"],
@@ -519,7 +526,13 @@ def event_page(event_id: int, submitted: Submitted | None = None, status: int = 
     trawls = browse.event_trawls(conn, event_id)
     return render_template(
         "event.html",
-        views=section_views(sections, own_key="event_id", event_id=event_id, actions=True),
+        views=section_views(
+            sections,
+            own_key="event_id",
+            event_id=event_id,
+            actions=True,
+            here=url_for("event", event_id=event_id),
+        ),
         title=fields["выезд"],
         event_id=event_id,
         ids=ids,
@@ -580,7 +593,12 @@ def _specimen_page(
     fields = dict(sections[0].rows)
     samples = next(sec for sec in sections if sec.title == "Образцы")  # sample_id — в row_ids
     sample_ids = [row_ids.get("sample_id") for row_ids in samples.row_ids]
-    views = section_views(sections, own_key="specimen_id", event_id=ids["event_id"], actions=True)
+    # адрес карточки — с номером как в базе: сюда вернут кнопки «Изменить»/«Удалить»
+    # (страница могла прийти и от POST-формы — тогда request.path не адрес карточки)
+    here = url_for("specimen", label=fields["номер пробы"])
+    views = section_views(
+        sections, own_key="specimen_id", event_id=ids["event_id"], actions=True, here=here
+    )
     return render_template(
         "specimen.html",
         views=views,
@@ -589,7 +607,7 @@ def _specimen_page(
         # форма «Привязать к тралению» — только у особей, полученных тралением
         # (способ особи, а если своего нет — выезда; из row_ids раздела «Особь»)
         is_trawled=ids.get("capture_method") == "траление",
-        own_actions=row_actions({"specimen_id": ids["specimen_id"]}),
+        own_actions=row_actions({"specimen_id": ids["specimen_id"]}, here),
         # куда отправлены образцы — для кнопок «удалить отправку»
         shipments=[
             (dict(zip(samples.columns, row, strict=True)), shipment)

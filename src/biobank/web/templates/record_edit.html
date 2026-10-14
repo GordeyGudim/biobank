@@ -36,6 +36,9 @@
   <datalist id="dl-{{ fld.datalist }}">{% for value, _ in choices.get(fld.datalist, []) %}<option value="{{ value }}">{% endfor %}</datalist>
   {% endif %}{% endfor %}
   {% for name, v in f.old.items() %}<input type="hidden" name="old_{{ name }}" value="{{ v }}">{% endfor %}
+  {#- откуда пришли (параметр next): туда вернёт сервер после сохранения -#}
+  {% if next_url %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
   {{ submit(f, "Сохранить изменения") }}
+  <p><a class="button-link" href="{{ back }}">Отмена</a></p>
 {% endcall %}
 {% endblock %}

@@ -1609,3 +1609,171 @@ def test_entry_messages_without_cli_flags(client, path):
     for html in (r.get_data(as_text=True), r2.get_data(as_text=True)):
         errors = " ".join(re.findall(r'class="[^"]*field-error[^"]*"[^>]*>([^<]*)<', html))
         assert errors and "--" not in errors and "allow_nearby" not in errors
+
+
+# ---------------------------------------------------------------------------
+# Возврат туда, откуда пришли (параметр next у «Изменить»/«Удалить»)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("/events/3", "/events/3"),
+        ("/specimens?event=3&page=2", "/specimens?event=3&page=2"),
+        ("/specimen/26%20ph", "/specimen/26%20ph"),
+        ("https://evil", None),
+        ("http://127.0.0.1:5000/events/1", None),  # полный адрес — тоже нет: только путь
+        ("//evil", None),
+        ("/\\evil", None),
+        ("/\t/evil", None),  # браузер выбросит табуляцию и получит //evil
+        ("/events/1\r\nSet-Cookie: x", None),
+        ("javascript:alert(1)", None),
+        ("events/1", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_local_path(value, expected):
+    from biobank.web.views import local_path
+
+    assert local_path(value) == expected
+
+
+def test_card_buttons_pass_page_as_next(client, path):
+    html = client.get("/events/1").get_data(as_text=True)
+    assert "/edit/specimen/" in html and '?next=/events/1"' in html
+    html = client.get("/specimen/155pc").get_data(as_text=True)  # номер — как в базе
+    assert '?next=/specimen/155%2520pc"' in html
+    html = client.get("/trawlings/1").get_data(as_text=True)
+    assert "/edit/water/" in html and '?next=/trawlings/1"' in html
+
+
+def test_edit_returns_to_next(client, path):
+    """Особь правят с карточки выезда — после сохранения снова карточка выезда."""
+    specimen_id = specimen_row(path, "2 pc")["specimen_id"]
+    event_id = db_value(path, "SELECT event_id FROM specimen WHERE specimen_id = ?", specimen_id)
+    back = f"/specimens?event={event_id}&page=1"
+    html = client.get(f"/edit/specimen/{specimen_id}?next={quote(back)}").get_data(as_text=True)
+    escaped = back.replace("&", "&amp;")  # так & пишется внутри HTML
+    assert f'<input type="hidden" name="next" value="{escaped}">' in html
+    assert f'href="{escaped}">Отмена' in html
+    data = {**edit_form_data(path, "specimen", specimen_id, sex="самец"), "next": back}
+    r = client.post(f"/edit/specimen/{specimen_id}", data=data)
+    assert r.status_code == 303 and location(r).endswith(back)
+    r = client.post(f"/edit/specimen/{specimen_id}", headers=HTMX,
+                    data={**data, "old_sex": "самец", "sex": "самка"})  # fmt: skip
+    assert r.status_code == 204 and r.headers["HX-Redirect"] == back
+
+
+def test_edit_error_keeps_next(client, path):
+    specimen_id = specimen_row(path, "2 pc")["specimen_id"]
+    data = {**edit_form_data(path, "specimen", specimen_id, label="1 pc"), "next": "/events/1"}
+    r = client.post(f"/edit/specimen/{specimen_id}", data=data, headers=HTMX)
+    assert r.status_code == 400
+    assert '<input type="hidden" name="next" value="/events/1">' in r.get_data(as_text=True)
+
+
+@pytest.mark.parametrize("bad", ["https://evil", "//evil", "/\\evil", "/\t/evil"])
+def test_edit_ignores_foreign_next(client, path, bad):
+    html = client.get("/edit/expedition/1", query_string={"next": bad}).get_data(as_text=True)
+    assert 'name="next"' not in html and "evil" not in html
+    assert 'href="/expeditions/1">Отмена' in html  # «Отмена» — на страницу записи
+    data = {**edit_form_data(path, "expedition", 1, notes="x"), "next": bad}
+    r = client.post("/edit/expedition/1", data=data)
+    assert r.status_code == 303 and location(r).endswith("/expeditions/1")
+    assert "evil" not in location(r)
+
+
+@pytest.mark.parametrize("spelling", ["155 pc", "155pc"])
+def test_edit_label_change_goes_to_new_card(client, path, spelling):
+    """Номер особи изменили, пришли с карточки по старому номеру — карточка с новым."""
+    specimen_id = specimen_row(path, "155 pc")["specimen_id"]
+    new = f"{next_pc(path)} pc"
+    data = {
+        **edit_form_data(path, "specimen", specimen_id, label=new),
+        "next": "/specimen/" + quote(spelling),
+    }
+    r = client.post(f"/edit/specimen/{specimen_id}", data=data)
+    assert r.status_code == 303 and location(r).endswith("/specimen/" + quote(new))
+    assert client.get(location(r)).status_code == 200
+
+
+def test_edit_next_to_form_page_goes_to_record(client, path):
+    data = {**edit_form_data(path, "expedition", 1, notes="x"), "next": "/delete/expedition/1"}
+    r = client.post("/edit/expedition/1", data=data)
+    assert r.status_code == 303 and location(r).endswith("/expeditions/1")
+
+
+def new_specimen(client, path):
+    """Новая особь без образцов (её можно удалить): (id, номер, выезд)."""
+    event_id = trawling_event(path)
+    label = f"{next_pc(path)} pc"
+    r = client.post(f"/events/{event_id}/specimens/new", data=GOOD_FISH)
+    assert r.status_code == 303, r.get_data(as_text=True)[-1500:]
+    return specimen_row(path, label)["specimen_id"], label, event_id
+
+
+def test_delete_returns_to_next(client, path):
+    specimen_id, label, event_id = new_specimen(client, path)
+    back = f"/specimens?event={event_id}"
+    html = client.get(f"/delete/specimen/{specimen_id}?next={quote(back)}").get_data(as_text=True)
+    escaped = back.replace("&", "&amp;")
+    assert f'<input type="hidden" name="next" value="{escaped}">' in html
+    assert f'href="{escaped}">Отмена' in html
+    r = client.post(f"/delete/specimen/{specimen_id}", data={"confirm": "1", "next": back})
+    assert r.status_code == 303 and location(r).endswith(back)
+    assert specimen_row(path, label) is None
+
+
+def test_delete_sample_returns_to_specimen_card(client, path):
+    """Образец удаляют с карточки особи — карточка осталась, туда и возвращаемся."""
+    sample_id = first_id(path, "sample")
+    label = db_value(path, "SELECT sp.label FROM sample sa JOIN specimen sp USING (specimen_id) "
+                           "WHERE sa.sample_id = ?", sample_id)  # fmt: skip
+    back = "/specimen/" + quote(label)
+    r = client.post(f"/delete/sample/{sample_id}", data={"confirm": "1", "next": back})
+    assert r.status_code == 303 and location(r).endswith(back)
+
+
+@pytest.mark.parametrize("spelling", ["own", "other"])
+def test_delete_specimen_from_its_card_goes_to_event(client, path, spelling):
+    """next — карточка самой удалённой особи (её больше нет) → карточка выезда."""
+    specimen_id, label, event_id = new_specimen(client, path)
+    card = label if spelling == "own" else label.replace(" ", "")  # «179pc» — тот же номер
+    data = {"confirm": "1", "next": "/specimen/" + quote(card)}
+    r = client.post(f"/delete/specimen/{specimen_id}", data=data, headers=HTMX)
+    assert r.status_code == 204 and r.headers["HX-Redirect"] == f"/events/{event_id}"
+
+
+@pytest.mark.parametrize("back", ["/trawlings/1", "/trawlings/1?x=1", "/edit/trawling/1",
+                                  "/delete/trawling/1"])  # fmt: skip
+def test_delete_trawling_next_own_page_goes_to_event(client, path, back):
+    event_id = db_value(path, "SELECT event_id FROM trawling WHERE trawling_id = 1")
+    r = client.post("/delete/trawling/1", data={"confirm": "1", "next": back})
+    assert r.status_code == 303 and location(r).endswith(f"/events/{event_id}")
+    assert db_row(path, "trawling", 1) is None
+
+
+@pytest.mark.parametrize("bad", ["https://evil", "//evil", "/\\evil"])
+def test_delete_ignores_foreign_next(client, path, bad):
+    specimen_id, _, event_id = new_specimen(client, path)
+    html = client.get(f"/delete/specimen/{specimen_id}", query_string={"next": bad}).get_data(
+        as_text=True
+    )
+    assert "evil" not in html
+    r = client.post(f"/delete/specimen/{specimen_id}", data={"confirm": "1", "next": bad})
+    assert r.status_code == 303 and location(r).endswith(f"/events/{event_id}")
+
+
+def test_delete_refused_keeps_next(client, path):
+    r = client.post("/delete/event/1", data={"confirm": "1", "next": "/expeditions/1"},
+                    headers=HTMX)  # fmt: skip
+    assert r.status_code == 400
+    assert '<input type="hidden" name="next" value="/expeditions/1">' in r.get_data(as_text=True)
+
+
+def test_sample_form_does_not_suggest_ethanol(client):
+    """Фиксацию не подсказываем «этанолом 96%»: пусто — значит не указана."""
+    html = client.get("/specimen/155pc").get_data(as_text=True)
+    assert 'placeholder="этанол' not in html

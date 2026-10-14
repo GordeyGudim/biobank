@@ -529,8 +529,6 @@ def _check_missing_shipments(expedition: ExpeditionData) -> None:
 # Особи, определения вида, образцы, прилов
 # ---------------------------------------------------------------------------
 
-SMEAR_PRESERVATIVE = "этанол 96% (фиксация)"
-
 
 def _import_note_rows(ctx: ImportContext, sheet: SheetData, event_id: int) -> None:
     """Строки под таблицей особей: улов → catch_record, остальное уже в notes выезда."""
@@ -656,7 +654,8 @@ def _specimen_samples(sheet: SheetData, spec: SpecimenRow, label: str) -> list[t
         parsed = parse_label(smear)
         smear_label = parsed.label if parsed else str(smear)
         samples.append(
-            (SampleSpec("мазок крови", None, smear_label, SMEAR_PRESERVATIVE), smear,
+            # фиксация мазков в Excel не указана → preservative NULL (решение 2026-10-14)
+            (SampleSpec("мазок крови", None, smear_label, None), smear,
              sheet.smear_labs)
         )  # fmt: skip
     return samples

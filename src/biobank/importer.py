@@ -20,7 +20,7 @@ import os
 import sqlite3
 import statistics
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from biobank.checks import collapse_issues, run_checks
@@ -53,12 +53,14 @@ from biobank.parsing import (
     is_catch_note,
     is_dead_text,
     is_whole_specimen,
+    is_whole_specimen_comment,
     market_city,
     parse_catch_counts,
     parse_catch_note,
     parse_histology,
     parse_label,
     parse_labs,
+    parse_preservative,
     parse_sex,
     parse_shrimp_samples,
     parse_species,
@@ -579,27 +581,67 @@ def _specimen_capture(
     return None, None
 
 
-def _whole_text(spec: SpecimenRow) -> str | None:
+def _whole_key(spec: SpecimenRow) -> str | None:
+    """Колонка, где написано «целая рыба» / «заспиртовали целиком» (None — особь не целая)."""
     for key in ("dna", "histo", "smear", "gut", "tl", "sl", "mass"):
-        value = spec.values.get(key)
-        if is_whole_specimen(value):
-            return str(value)
+        if is_whole_specimen(spec.values.get(key)):
+            return key
     return None
+
+
+def _whole_comment_key(spec: SpecimenRow) -> str | None:
+    """Ячейка, в комментарии к которой сказано, что особь сохранили целиком (или None)."""
+    for key in ("label", "species", "dna", "gut", "histo", "smear", "tl", "sl", "mass"):
+        if is_whole_specimen_comment(spec.comments.get(key)):
+            return key
+    return None
+
+
+def _preservative(
+    sheet: SheetData, spec: SpecimenRow, text, cell_key: str, header_key: str | None
+) -> str | None:
+    """Фиксатор образца — только если он назван в Excel (иначе None, не угадываем).
+
+    Порядок: текст ячейки → комментарий к ней → комментарий к шапке колонки header_key
+    (методика для всех проб листа). header_key отличается от cell_key, когда колонки
+    гистологии и мазка перепутаны; None — шапку не смотреть.
+    """
+    return (
+        parse_preservative(text)
+        or parse_preservative(spec.comments.get(cell_key))
+        or (sheet.column_preservatives.get(header_key) if header_key else None)
+    )
 
 
 def _specimen_samples(sheet: SheetData, spec: SpecimenRow, label: str) -> list[tuple]:
     """Образцы особи: [(SampleSpec, исходное значение, [лаборатории])]."""
     values = spec.values
     samples: list[tuple] = []
-    whole = _whole_text(spec)
-    if whole:
-        preservative = "этанол" if "спирт" in whole.lower() else None
+    whole_key = _whole_key(spec)
+    if whole_key:
+        whole = str(values[whole_key])
+        # фиксатор целой особи: её ячейка и комментарии к ней, к номеру и к виду
+        # (они о рыбе целиком); шапка колонки — о других образцах, её не берём
+        preservative = _preservative(sheet, spec, whole, whole_key, None)
+        for key in ("label", "species"):
+            preservative = preservative or parse_preservative(spec.comments.get(key))
         samples.append((SampleSpec("целая особь", None, label, preservative), whole, []))
+    elif comment_key := _whole_comment_key(spec):
+        # в ячейках о целой особи ни слова, но сказано в комментарии (ХХ, 178 pc)
+        comment = spec.comments[comment_key]
+        note = f"целая особь — по комментарию к ячейке {spec.cells[comment_key]}"
+        samples.append(
+            (SampleSpec("целая особь", None, label, parse_preservative(comment), note),
+             comment, [])
+        )  # fmt: skip
 
     if spec.label and spec.label.series == "mr":
         for sample in parse_shrimp_samples(values.get("histo"), values.get("smear"), label):
-            raw = values.get("histo") if sample.sample_type == "гистология" else values.get("smear")
-            samples.append((sample, raw, []))
+            key = "histo" if sample.sample_type == "гистология" else "smear"
+            if sample.preservative is None:
+                # колонки у креветок означают другое — методика из шапки к ним не относится
+                sample = replace(sample, preservative=_preservative(sheet, spec, None, key, None))
+            samples.append((sample, values.get(key), []))
         return samples
 
     extra_labs = []
@@ -610,8 +652,9 @@ def _specimen_samples(sheet: SheetData, spec: SpecimenRow, label: str) -> list[t
     if not is_blank(dna) and not is_whole_specimen(dna):
         parsed = parse_label(dna)
         samples.append(
-            (SampleSpec("ДНК", None, parsed.label if parsed else str(dna)), dna,
-             sheet.dna_labs + extra_labs)
+            (SampleSpec("ДНК", None, parsed.label if parsed else str(dna),
+                        _preservative(sheet, spec, dna, "dna", "dna")),
+             dna, sheet.dna_labs + extra_labs)
         )  # fmt: skip
     elif extra_labs:
         sheet.issues.append(
@@ -623,10 +666,12 @@ def _specimen_samples(sheet: SheetData, spec: SpecimenRow, label: str) -> list[t
     if not is_blank(gut) and not is_whole_specimen(gut):
         parsed = parse_label(gut)
         samples.append(
-            (SampleSpec("кишечник", "кишечник", parsed.label if parsed else str(gut)), gut, [])
-        )
+            (SampleSpec("кишечник", "кишечник", parsed.label if parsed else str(gut),
+                        _preservative(sheet, spec, gut, "gut", "gut")), gut, [])
+        )  # fmt: skip
 
     histo, smear = values.get("histo"), values.get("smear")
+    histo_cell, smear_cell = "histo", "smear"  # где физически записан текст
     if smear_looks_like_histology(smear):
         sheet.issues.append(
             Issue("формат",
@@ -635,6 +680,7 @@ def _specimen_samples(sheet: SheetData, spec: SpecimenRow, label: str) -> list[t
                   sheet.name, spec.cells.get("smear"), label, str(smear), "sample")
         )  # fmt: skip
         histo, smear = smear, histo
+        histo_cell, smear_cell = smear_cell, histo_cell
 
     result = parse_histology(histo, label)
     for warning in result.warnings:
@@ -643,7 +689,11 @@ def _specimen_samples(sheet: SheetData, spec: SpecimenRow, label: str) -> list[t
             Issue(category, warning, sheet.name, spec.cells.get("histo"), label,
                   None if histo is None else str(histo), "sample")
         )  # fmt: skip
-    samples += [(sample, histo, []) for sample in result.samples]
+    histo_preservative = _preservative(sheet, spec, histo, histo_cell, "histo")
+    samples += [
+        (replace(sample, preservative=sample.preservative or histo_preservative), histo, [])
+        for sample in result.samples
+    ]
 
     if (
         not is_blank(smear)
@@ -654,9 +704,11 @@ def _specimen_samples(sheet: SheetData, spec: SpecimenRow, label: str) -> list[t
         parsed = parse_label(smear)
         smear_label = parsed.label if parsed else str(smear)
         samples.append(
-            # фиксация мазков в Excel не указана → preservative NULL (решение 2026-10-14)
-            (SampleSpec("мазок крови", None, smear_label, None), smear,
-             sheet.smear_labs)
+            # фиксация — из ячейки или методики в комментарии к шапке (листы 2025:
+            # «…фиксировали в 96% этаноле»); не названа (2026) — NULL
+            (SampleSpec("мазок крови", None, smear_label,
+                        _preservative(sheet, spec, smear, smear_cell, "smear")),
+             smear, sheet.smear_labs)
         )  # fmt: skip
     return samples
 

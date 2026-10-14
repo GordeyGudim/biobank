@@ -30,6 +30,7 @@ from biobank.parsing import (
     parse_label_range,
     parse_labs,
     parse_number,
+    parse_preservative,
     parse_time,
     parse_trawl_point,
     sheet_capture_method,
@@ -149,6 +150,9 @@ class SheetData:
     header_notes: list[str] = field(default_factory=list)
     dna_labs: list[str] = field(default_factory=list)
     smear_labs: list[str] = field(default_factory=list)
+    # колонка образцов ('dna', 'gut', 'histo', 'smear') → фиксатор из комментария к её шапке
+    # (методика для всех проб листа, напр. «…фиксировали в 96% этаноле»)
+    column_preservatives: dict[str, str] = field(default_factory=dict)
     specimens: list[SpecimenRow] = field(default_factory=list)
     note_rows: list[NoteRow] = field(default_factory=list)
     issues: list[Issue] = field(default_factory=list)
@@ -287,6 +291,10 @@ def _read_header_comments(r: _SheetReader, sheet: SheetData, rows: set[int]) -> 
             if not text:
                 continue
             head = _header_key(r.value(row, col)) or ""
+            column = _specimen_column_key(head)
+            preservative = parse_preservative(text)
+            if column in SAMPLE_COLUMNS and preservative:
+                sheet.column_preservatives[column] = preservative
             if "ячеи" in text:
                 sheet.gear = parse_gear(text)
             elif head == "dna" and parse_labs(text):
@@ -424,35 +432,40 @@ def _read_point_comments(r, row, cols, point, trawl, header_row, time_cols) -> N
             point.notes.append(f"{head}: {text}")
 
 
+# колонки, из которых импорт делает образцы (у них может быть фиксатор)
+SAMPLE_COLUMNS = ("dna", "gut", "histo", "smear")
+
+
+def _specimen_column_key(key: str | None) -> str | None:
+    """Поле левой таблицы по тексту шапки (уже в нижнем регистре): 'dna', 'smear', …"""
+    if not key:
+        return None
+    if key.startswith("№ пробы"):
+        return "label"
+    if key.startswith("мазок"):
+        return "smear"
+    if key.startswith("tl"):
+        return "tl"
+    if key.startswith("sl"):
+        return "sl"
+    if key.startswith("m (г"):
+        return "mass"
+    if key.startswith(("m (без порки", "m (порка")):
+        return "gutted"
+    exact = {"вид": "species", "dna": "dna", "кишечник": "gut", "гистология": "histo"}
+    return exact.get(key)
+
+
 def find_specimen_columns(ws: Worksheet, header_row: int) -> dict[str, int]:
     """Колонки левой таблицы (особи) по тексту шапки."""
     cols: dict[str, int] = {}
     for col in range(1, ws.max_column + 1):
         key = _header_key(ws.cell(header_row, col).value)
-        if not key:
-            continue
-        if key.startswith("№ пробы"):
-            cols["label"] = col
-        elif key == "вид":
-            cols["species"] = col
-        elif key == "dna":
-            cols["dna"] = col
-        elif key == "кишечник":
-            cols["gut"] = col
-        elif key == "гистология":
-            cols["histo"] = col
-        elif key.startswith("мазок"):
-            cols["smear"] = col
-        elif key.startswith("tl"):
-            cols["tl"] = col
-        elif key.startswith("sl"):
-            cols["sl"] = col
-        elif key.startswith("m (г"):
-            cols["mass"] = col
-        elif key.startswith(("m (без порки", "m (порка")):
-            cols["gutted"] = col
-        elif key == "№ траления":
+        if key == "№ траления":
             break  # дальше — таблица тралений
+        column = _specimen_column_key(key)
+        if column:
+            cols[column] = col
     return cols
 
 

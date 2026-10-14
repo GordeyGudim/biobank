@@ -979,8 +979,9 @@ def test_field_choices():
         "site_type", "point_type", "sample_type", "sex", "coord_source", "method",
         "confidence", "capture_method", "preservative",
     }  # fmt: skip
-    assert choices["preservative"] == ["формалин 10%", "заморозка", "этанол"]
-    assert not any("96" in p for p in choices["preservative"])
+    assert choices["preservative"] == [
+        "этанол 96%", "этанол 99%", "формалин 10%", "заморозка", "этанол",
+    ]  # fmt: skip
 
 
 @pytest.mark.parametrize("kind", list(browse.RECORD_SQL))

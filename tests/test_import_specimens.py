@@ -211,14 +211,63 @@ def test_shrimp_samples(db):
     ]
 
 
-def test_smear_preservative_is_null(db):
-    """О фиксации мазков в Excel ничего не сказано — поле пустое, не догадка."""
-    assert count(db, "SELECT count(*) FROM sample WHERE sample_type = 'мазок крови'") > 0
+# листы, где в комментарии к шапке «мазок крови» — методика «…фиксировали в 96% этаноле»
+SMEAR_ETHANOL_SHEETS = {
+    "Точка 1", "Точка 3", "Точка 4", "Точка 5", "Точка 1.", "Рынок.Бенче", "Точка 2.",
+    "Точка 3.", "Рынок. Чавинь", "Точка 4.", "Точка 5.", "Точка 6.",
+}  # fmt: skip
+
+
+def smear_preservatives(db) -> dict[str, set]:
+    rows = db.execute(
+        "SELECT e.source_sheet, sa.preservative FROM sample sa "
+        "JOIN specimen sp USING (specimen_id) JOIN sampling_event e USING (event_id) "
+        "WHERE sa.sample_type = 'мазок крови'"
+    )
+    result: dict[str, set] = {}
+    for sheet, preservative in rows:
+        result.setdefault(sheet, set()).add(preservative)
+    return result
+
+
+def test_smear_preservative_from_header_comment(db):
+    """Фиксатор мазков — из методики в комментарии к шапке; где не назван — NULL."""
+    by_sheet = smear_preservatives(db)
+    assert SMEAR_ETHANOL_SHEETS <= set(by_sheet)
+    for sheet, preservatives in by_sheet.items():
+        expected = {"этанол 96%"} if sheet in SMEAR_ETHANOL_SHEETS else {None}
+        assert preservatives == expected, sheet
+
+
+def test_smear_preservative_null_when_not_named(db):
+    """2026, «Точка 2» и «Аквахозяйство 1» (Донг-хап): о фиксации ни слова — поле пустое."""
+    by_sheet = smear_preservatives(db)
+    assert by_sheet["Точка 2"] == {None}
+    assert by_sheet["Аквахозяйство 1"] == {None}
+    assert by_sheet["Точка 4 2026"] == {None}
+
+
+def test_whole_specimen_preservative(db):
+    """«Заспиртовали целиком» → этанол; «зафиксирована целиком» — фиксатор не назван."""
+    rows = dict(
+        db.execute(
+            "SELECT sa.raw_value, group_concat(DISTINCT coalesce(sa.preservative, '-')) "
+            "FROM sample sa WHERE sa.sample_type = 'целая особь' GROUP BY sa.raw_value"
+        ).fetchall()
+    )
+    assert rows["зафиксирована целиком"] == "-"
+    assert rows["Заспиртовали целиком"] == "этанол"
+    assert rows["Заспиртовали полностью"] == "этанол"
+
+
+def test_no_preservative_without_text(db):
+    """ДНК, кишечник, гистология рыб — в Excel фиксатор не назван, поле пустое."""
     assert (
         count(
             db,
-            "SELECT count(*) FROM sample WHERE sample_type = 'мазок крови' "
-            "AND preservative IS NOT NULL",
+            "SELECT count(*) FROM sample sa JOIN specimen sp USING (specimen_id) "
+            "WHERE sa.sample_type IN ('ДНК', 'кишечник', 'гистология') "
+            "AND sp.label NOT LIKE '% mr' AND sa.preservative IS NOT NULL",
         )
         == 0
     )
@@ -308,3 +357,59 @@ def test_catch_notes_under_table(db):
     assert (
         count(db, "SELECT mass_g FROM catch_record WHERE raw_text = 'm креветок: 1754 г.'") == 1754
     )
+
+
+def test_preservative_sources_order():
+    """Фиксатор: текст ячейки → комментарий к ней → комментарий к шапке колонки."""
+    from biobank.excel_reader import SheetData, SpecimenRow
+    from biobank.importer import _preservative
+
+    sheet = SheetData("Лист", "траление", None, None, None)
+    sheet.column_preservatives["smear"] = "этанол 96%"
+    spec = SpecimenRow(1, None, "1", {}, {}, {"smear": "заморозили"})
+    assert _preservative(sheet, spec, "в 10% формалине", "smear", "smear") == "формалин 10%"
+    assert _preservative(sheet, spec, "1 pc", "smear", "smear") == "заморозка"
+    assert _preservative(sheet, spec, "1 pc", "dna", "smear") == "этанол 96%"
+    assert _preservative(sheet, spec, "1 pc", "dna", None) is None
+    assert _preservative(sheet, spec, "1 pc", "dna", "dna") is None
+
+
+@pytest.mark.parametrize(
+    "where, preservative, cell",
+    [
+        ("sp.label_raw = 'ХХ'", "этанол 99%", "B18"),
+        ("sp.label = '178 pc'", "этанол", "F27"),
+    ],
+)
+def test_whole_specimen_from_comment(db, where, preservative, cell):
+    """В ячейках о целой особи ни слова, в комментарии — «заспиртовали…» → образец."""
+    rows = db.execute(
+        "SELECT sa.preservative, sa.raw_value, sa.notes FROM sample sa "
+        f"JOIN specimen sp USING (specimen_id) WHERE {where} "  # where — фиксированный фрагмент
+        "AND sa.sample_type = 'целая особь'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == preservative
+    assert "заспиртовали" in rows[0][1]
+    assert cell in rows[0][2]
+
+
+def test_no_duplicate_whole_specimen(db):
+    assert (
+        count(
+            db,
+            "SELECT count(*) FROM (SELECT specimen_id FROM sample "
+            "WHERE sample_type = 'целая особь' GROUP BY specimen_id HAVING count(*) > 1)",
+        )
+        == 0
+    )
+
+
+def test_whole_specimen_from_comment_only_two(db):
+    """По комментариям созданы ровно два образца (ХХ и 178 pc), всего целых особей — 136.
+
+    Всего образцов 1232: до чтения комментариев было 1230, новых лишних нет.
+    """
+    assert count(db, "SELECT count(*) FROM sample") == 1232
+    assert count(db, "SELECT count(*) FROM sample WHERE notes LIKE 'целая особь — по комм%'") == 2
+    assert count(db, "SELECT count(*) FROM sample WHERE sample_type = 'целая особь'") == 136

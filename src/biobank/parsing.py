@@ -359,6 +359,40 @@ def is_whole_specimen(value) -> bool:
     return isinstance(value, str) and any(word in value.lower() for word in WHOLE_WORDS)
 
 
+# в комментарии: рыбу «заспиртовали» / «зафиксировали» (без слова «целиком»)
+_PRESERVED_RE = re.compile(r"заспирт|зафиксир", re.IGNORECASE)
+# …но если назван образец или орган, это о нём, а не о целой рыбе
+_PART_WORDS = ("днк", "dna", "кров", "мазк", "мазок", "гистолог", "образ")
+
+
+def is_whole_specimen_comment(text) -> bool:
+    """Комментарий к ячейке особи говорит, что рыбу сохранили целиком.
+
+    Да — если в нём «целиком/полностью/целая рыба» (как в ячейках) или «заспиртовали/
+    зафиксировали» без указания образца или органа («заспиртовали на ДНК» — это о ДНК).
+    Комментарии «Далее …» — о группе следующих строк, а не об этой особи: нет.
+
+    >>> is_whole_specimen_comment("не определен вид рыбы, заспиртовали в 99% этаноле")
+    True
+    >>> is_whole_specimen_comment("заспиртовали полностью")
+    True
+    >>> is_whole_specimen_comment("вид неизвестен, заспиртовали на ДНК")
+    False
+    >>> is_whole_specimen_comment("Далее маленькие особи, заспиртовали полностью")
+    False
+    """
+    if not isinstance(text, str) or text.strip().lower().startswith("далее"):
+        return False
+    if is_whole_specimen(text):
+        return True
+    low = text.lower()
+    return (
+        bool(_PRESERVED_RE.search(text))
+        and not any(w in low for w in _PART_WORDS)
+        and (organ_of(text) is None)
+    )
+
+
 def is_dead_text(text) -> bool:
     """В тексте сказано, что особь мёртвая.
 
@@ -526,26 +560,96 @@ def parse_histology(text, specimen_label: str) -> HistologyResult:
     return result
 
 
+# Органы креветок: к общему списку добавлен панцирь (в таблице с опечаткой «каропакса»)
+SHRIMP_ORGANS = (*ORGANS, ("карапакс", "карапакс"), ("каропакс", "карапакс"))
+
+
+def organs_in(text, organs=ORGANS) -> list[str]:
+    """Все органы, упомянутые в тексте, — в порядке появления, без повторов.
+
+    >>> organs_in("Кишечник hepatopancreas и кусок каропакса", SHRIMP_ORGANS)
+    ['кишечник', 'гепатопанкреас', 'карапакс']
+    >>> organs_in("заморозили в пакете")
+    []
+    """
+    if not isinstance(text, str):
+        return []
+    low = text.lower()
+    found = sorted((low.find(root), organ) for root, organ in organs if root in low)
+    return list(dict.fromkeys(organ for _, organ in found))
+
+
+# Фиксатор, названный в тексте: (название, слова-признаки). Регулярные выражения:
+# \b — граница слова, \w* — любое окончание («формалине», «заспиртовали»).
+_PRESERVATIVE_WORDS = (
+    ("формалин", r"\bform(?:alin)?\b|формалин\w*"),
+    ("заморозка", r"заморо[жз]\w*"),
+    ("этанол", r"\w*спирт\w*|этанол\w*"),
+)
+_PERCENT = r"(\d+(?:[.,]\d+)?)\s*%"  # «10%», «96 %», «4,5%»
+
+
+def parse_preservative(text) -> str | None:
+    """Фиксатор образца, если он прямо назван в тексте; иначе None (не угадываем).
+
+    Концентрация сохраняется, только если «N%» записано вплотную к слову
+    («10% form.», «в 96% этаноле», «этанол 70%»); иначе — название без числа.
+    Если в тексте названо несколько фиксаторов — берём первый по порядку.
+
+    >>> parse_preservative("Кусок мышц, кусок жабр в 10% form.")
+    'формалин 10%'
+    >>> parse_preservative("затем оставляли высохнуть и фиксировали в 96% этаноле.")
+    'этанол 96%'
+    >>> parse_preservative("кусок жабр в формалине"), parse_preservative("заспиртовали целиком")
+    ('формалин', 'этанол')
+    >>> parse_preservative("Кишечник ... - заморозили в пакете"), parse_preservative("мышцы")
+    ('заморозка', None)
+    """
+    if not isinstance(text, str):
+        return None
+    found = []
+    for name, words in _PRESERVATIVE_WORDS:
+        word = re.search(words, text, re.IGNORECASE)
+        if not word:
+            continue
+        # «N% слово» или «слово N%» (между ними — только пробелы и точка сокращения)
+        percent = re.search(
+            rf"{_PERCENT}\s*(?:{words})|(?:{words})\.?\s*{_PERCENT}", text, re.IGNORECASE
+        )
+        if name != "заморозка" and percent:
+            name = f"{name} {percent.group(1) or percent.group(2)}%"
+        found.append((word.start(), name))
+    return min(found)[1] if found else None
+
+
 def parse_shrimp_samples(histology, smear, specimen_label: str) -> list[SampleSpec]:
     """Образцы креветок (серия mr): колонки таблицы использованы по-другому.
 
-    В «гистологии» — кусочки мышц и жабр в формалине, в «мазке» — внутренности в заморозке.
+    В «гистологии» — кусочки органов (по образцу на орган), в «мазке» — внутренности
+    одним образцом (тип «другое»). Органы и фиксатор читаются из текста ячейки
+    (organs_in, parse_preservative); не названо — None.
 
     >>> samples = parse_shrimp_samples(
     ...     "Кусок мышц, кусок жабр в 10% form.", "Кишечник hepatopancreas ... заморозили", "1 mr")
-    >>> [s.organ for s in samples]
-    ['мышцы', 'жабры', 'кишечник, гепатопанкреас, карапакс']
+    >>> for s in samples:
+    ...     print(s.sample_type, "|", s.organ, "|", s.preservative)
+    гистология | мышцы | формалин 10%
+    гистология | жабры | формалин 10%
+    другое | кишечник, гепатопанкреас | заморозка
     """
     samples = []
     if isinstance(histology, str) and not is_blank(histology):
+        preservative = parse_preservative(histology)
         for part in histology.split(","):
             organ = organ_of(part)
             if organ:
-                samples.append(SampleSpec("гистология", organ, specimen_label, "формалин 10%"))
+                samples.append(SampleSpec("гистология", organ, specimen_label, preservative))
     if isinstance(smear, str) and not is_blank(smear):
+        organs = organs_in(smear, SHRIMP_ORGANS)
         samples.append(
-            SampleSpec("другое", "кишечник, гепатопанкреас, карапакс", specimen_label, "заморозка")
-        )
+            SampleSpec("другое", ", ".join(organs) or None, specimen_label,
+                       parse_preservative(smear))
+        )  # fmt: skip
     return samples
 
 

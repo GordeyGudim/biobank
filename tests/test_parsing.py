@@ -9,6 +9,7 @@ import datetime as dt
 import pytest
 
 from biobank.parsing import (
+    SHRIMP_ORGANS,
     clean_comment,
     is_blank,
     is_catch_comment,
@@ -16,7 +17,9 @@ from biobank.parsing import (
     is_dead_text,
     is_text_number,
     is_whole_specimen,
+    is_whole_specimen_comment,
     market_city,
+    organs_in,
     parse_catch_counts,
     parse_catch_note,
     parse_city,
@@ -27,6 +30,7 @@ from biobank.parsing import (
     parse_label_range,
     parse_labs,
     parse_number,
+    parse_preservative,
     parse_sex,
     parse_shrimp_samples,
     parse_species,
@@ -423,6 +427,56 @@ def test_parse_shrimp_samples():
     ]
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("Кусок мышц, кусок жабр в 10% form.", "формалин 10%"),
+        ("кусок жабр, формалин 4%", "формалин 4%"),
+        ("кусок жабр в Formalin", "формалин"),  # концентрации нет — не угадываем 10%
+        ("кусок жабр в формалине, 10 штук", "формалин"),  # число без % — не концентрация
+        ("Кишечник hepatopancreas - заморозили в пакете", "заморозка"),
+        ("замороженный кусок мышц", "заморозка"),
+        ("целая рыба в спирте", "этанол"),
+        ("этанол 70%", "этанол 70%"),
+        ("заспиртовали в 99% этаноле", "этанол 99%"),
+        ("фиксировали в 96% этаноле.", "этанол 96%"),
+        ("96 % спирт", "этанол 96%"),
+        ("в спирте, 3 особи по 10%", "этанол"),  # число не рядом со словом
+        ("10 % formalin", "формалин 10%"),
+        ("Кусок мышц, кусок жабр", None),
+        ("", None),
+        (None, None),
+        (12.0, None),
+    ],
+)
+def test_parse_preservative(raw, expected):
+    assert parse_preservative(raw) == expected
+
+
+def test_parse_preservative_first_named():
+    """Названы два фиксатора — берётся первый по тексту."""
+    assert parse_preservative("заморозили, потом в формалин") == "заморозка"
+
+
+def test_organs_in():
+    assert organs_in("Кишечник hepatopancreas и кусок каропакса", SHRIMP_ORGANS) == [
+        "кишечник", "гепатопанкреас", "карапакс",
+    ]  # fmt: skip
+    assert organs_in("почки, печень, почки") == ["почки", "печень"]
+    assert organs_in("карапакс") == []  # панцирь — только в списке органов креветок
+    assert organs_in(None) == []
+
+
+def test_parse_shrimp_samples_without_preservative():
+    """Фиксатор и органы не названы — None, без догадок; образец всё равно создаётся."""
+    samples = parse_shrimp_samples("Кусок мышц, кусок жабр", "что-то в пакете", "6 mr")
+    assert [(s.sample_type, s.organ, s.preservative) for s in samples] == [
+        ("гистология", "мышцы", None),
+        ("гистология", "жабры", None),
+        ("другое", None, None),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Лаборатории
 # ---------------------------------------------------------------------------
@@ -618,3 +672,22 @@ def test_market_city():
 )
 def test_sheet_capture_method(sheet, method):
     assert sheet_capture_method(sheet) == method
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("не определен вид рыбы, заспиртовали в 99% этаноле", True),  # ХХ, Точка 1
+        ("заспиртовали полностью", True),  # 178 pc
+        ("зафиксирована целиком", True),
+        ("вид неизвестен, заспиртовали на ДНК", False),  # о ДНК, не о рыбе
+        ("Далее маленькие особи, измеряли по 3 параметрам, заспиртовали полностью", False),
+        ("далее рыб фиксировали целиком в одной пробирке", False),
+        ("кровь брали шприцом… фиксировали в 96% этаноле.", False),  # методика мазка
+        ("печень заспиртовали", False),
+        ("самка, икра", False),
+        (None, False),
+    ],
+)
+def test_is_whole_specimen_comment(text, expected):
+    assert is_whole_specimen_comment(text) is expected

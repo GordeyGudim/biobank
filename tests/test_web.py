@@ -325,6 +325,18 @@ def test_web_command_without_db(tmp_path, capsys):
 FRAGMENT = {"HX-Request": "true", "HX-Target": "results"}  # HTMX просит только таблицу
 
 
+def first_shipment(path) -> tuple[int, int]:
+    """(sample_id, lab_id) первой отправки — не завязываться на номера образцов из импорта."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT sample_id, lab_id FROM sample_shipment ORDER BY sample_id, lab_id LIMIT 1"
+        ).fetchone()
+        return row[0], row[1]
+    finally:
+        conn.close()
+
+
 def db_value(path, sql, *params):
     conn = connect(path)
     try:
@@ -1380,12 +1392,9 @@ def test_delete_identification_restores_species(client, path):
 
 
 def test_delete_shipment(client, path):
-    sample_id, lab_id = (
-        700,
-        db_value(path, "SELECT lab_id FROM sample_shipment WHERE sample_id = 700"),
-    )
+    sample_id, lab_id = first_shipment(path)
     label = db_value(path, "SELECT sp.label FROM sample sa JOIN specimen sp USING (specimen_id) "
-                           "WHERE sa.sample_id = 700")  # fmt: skip
+                           "WHERE sa.sample_id = ?", sample_id)  # fmt: skip
     card = client.get("/specimen/" + quote(label)).get_data(as_text=True)
     url = f"/delete/shipment/{sample_id}/{lab_id}"
     assert url in card
@@ -1560,10 +1569,11 @@ def test_link_trawl_form_only_for_trawled_specimens(client):
 
 def record_post_urls(path):
     event_id = trawling_event(path)
+    sample_id, lab_id = first_shipment(path)
     return [
         "/edit/expedition/1", "/edit/specimen/1", "/edit/water/1",
         "/delete/event/1", "/delete/specimen/1", "/delete/identification/1",
-        "/delete/shipment/700/1", f"/events/{event_id}/specimens/batch",
+        f"/delete/shipment/{sample_id}/{lab_id}", f"/events/{event_id}/specimens/batch",
     ]  # fmt: skip
 
 

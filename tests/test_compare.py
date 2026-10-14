@@ -230,13 +230,14 @@ def test_tl_edit_and_sample_moved(old, db_path):
     assert differences(old, db_path) == {"specimen": (1, 1), "sample": (1, 1)}
 
 
-def test_specimen_replaced_by_other_with_same_samples(old, db_path):
-    """Удалили особь «3» с образцами и добавили особь X1 с образцами того же содержания:
-    X1 — другая особь (другой label), её образцы тоже видны в сводке."""
-    shift_all(old)
-    source = specimen_id(old, "3")
-    with old:
-        old.execute(
+def replace_specimen(conn, label, changes: str):
+    """Удалить особь label и добавить X1 с теми же образцами и определением.
+
+    changes — фиксированный фрагмент SQL теста: чем X1 отличается кроме номера.
+    """
+    source = specimen_id(conn, label)
+    with conn:
+        conn.execute(
             "INSERT INTO specimen (label, label_raw, series, series_no, event_id, species_id, "
             "tl_cm, sl_cm, mass_g, mass_gutted_g, sex, is_dead, notes, source_row) "
             "SELECT 'X1', label_raw, series, series_no, event_id, species_id, tl_cm, sl_cm, "
@@ -244,16 +245,102 @@ def test_specimen_replaced_by_other_with_same_samples(old, db_path):
             "WHERE specimen_id = ?",
             (source,),
         )
-        new_id = specimen_id(old, "X1")
+        new_id = specimen_id(conn, "X1")
+        if changes:
+            conn.execute(f"UPDATE specimen SET {changes} WHERE specimen_id = ?", (new_id,))
         for table in ("sample", "species_identification"):  # имена — константы теста
-            old.execute(
+            conn.execute(
                 f"UPDATE {table} SET specimen_id = ? WHERE specimen_id = ?", (new_id, source)
             )
-        old.execute("DELETE FROM specimen WHERE specimen_id = ?", (source,))
+        conn.execute("DELETE FROM specimen WHERE specimen_id = ?", (source,))
+
+
+def test_specimen_replaced_by_same_with_other_label(old, db_path):
+    """X1 — та же особь «3», отличается только номером: неотличимо от исправленного номера
+    (сценарий Б), поэтому изменена одна особь. Ничего не скрыто: образцы и определение
+    X1 по содержимому те же, что вернёт импорт у «3»."""
+    shift_all(old)
+    replace_specimen(old, "3", "")
+    assert differences(old, db_path) == {"specimen": (1, 1)}
+
+
+def test_specimen_replaced_by_other_with_same_samples(old, db_path):
+    """X1 отличается от «3» не только номером (другие промеры, пол, выезд) — это другая
+    особь: и она, и её образцы, и определение видны в сводке."""
+    shift_all(old)
+    replace_specimen(old, "3", "tl_cm = 50, sl_cm = 40, mass_g = 900, sex = 'самка', event_id = 2")
     diff = differences(old, db_path)
     assert diff["specimen"] == (1, 1)
     assert diff["sample"] == (3, 3)
     assert diff["species_identification"] == (1, 1)
+
+
+def test_event_site_changed(old, db_path):
+    """Сценарий А: у выезда 1 сменили место — изменён только выезд (особи, траления,
+    замеры воды и записи журнала о нём — те же)."""
+    shift_all(old)
+    with old:
+        old.execute("UPDATE sampling_event SET site_id = 2 WHERE event_id = 1")
+    assert differences(old, db_path) == {"sampling_event": (1, 1)}
+
+
+def test_event_site_changed_and_specimen_edited(old, db_path):
+    shift_all(old)
+    with old:
+        old.execute("UPDATE sampling_event SET site_id = 2 WHERE event_id = 1")
+        old.execute("UPDATE specimen SET tl_cm = 1.5 WHERE label = '3'")  # особь выезда 1
+    assert differences(old, db_path) == {"sampling_event": (1, 1), "specimen": (1, 1)}
+
+
+def test_specimen_label_changed(old, db_path):
+    """Сценарий Б: исправили номер особи — изменена только особь, не её образцы."""
+    shift_all(old)
+    with old:
+        old.execute("UPDATE specimen SET label = '1 испр' WHERE label = '1'")
+    assert differences(old, db_path) == {"specimen": (1, 1)}
+
+
+def test_two_events_of_one_site_not_mixed(old, db_path):
+    """Два выезда одного места; у одного сменили место — их особи не перепутаны."""
+    site_id, first, second = old.execute(
+        "SELECT site_id, min(event_id), max(event_id) FROM sampling_event "
+        "GROUP BY site_id HAVING count(*) > 1 ORDER BY site_id LIMIT 1"
+    ).fetchone()
+    other_site = count(old, "SELECT min(site_id) FROM sampling_site WHERE site_id != ?", site_id)
+    shift_all(old)
+    with old:
+        old.execute("UPDATE sampling_event SET site_id = ? WHERE event_id = ?", (other_site, first))
+    assert differences(old, db_path) == {"sampling_event": (1, 1)}
+    assert first != second
+
+
+def test_lab_renamed(old, db_path):
+    """Справочник: переименовали лабораторию — узнаётся по тем же отправкам, без каскада."""
+    shift_all(old)
+    with old:
+        old.execute("UPDATE lab SET name = 'Россия (ЗИН)' WHERE name = 'Россия'")
+    assert differences(old, db_path) == {"lab": (1, 1)}
+
+
+def swap_lab_names(conn, first, second):
+    with conn:
+        conn.execute("UPDATE lab SET name = 'временно' WHERE name = ?", (first,))
+        conn.execute("UPDATE lab SET name = ? WHERE name = ?", (first, second))
+        conn.execute("UPDATE lab SET name = ? WHERE name = 'временно'", (second,))
+
+
+def test_two_labs_swapped_names(old, db_path):
+    """«Россия» и «Кантхо» обменялись названиями: отправки по смыслу ушли в другие
+    лаборатории — это видно (ничего не «склеено» по названию)."""
+    swap_lab_names(old, "Россия", "Кантхо (секвенирование)")
+    assert differences(old, db_path)["sample_shipment"] != (0, 0)
+
+
+def test_labs_with_equal_shipments_swapped(old, db_path):
+    """«Россия» и «Тропцентр» получили одни и те же образцы (по 236): обмен названиями
+    даёт базу, совпадающую с исходной с точностью до номеров, — расхождений нет."""
+    swap_lab_names(old, "Россия", "Тропцентр")
+    assert differences(old, db_path) == {}
 
 
 def test_all_smears_changed_shipments_unchanged(old, db_path):

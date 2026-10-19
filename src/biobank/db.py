@@ -338,23 +338,28 @@ def backup_time(name: str, db_name: str, kind: str) -> dt.datetime | None:
         return None
 
 
+# Копия «из будущего» — время в имени позже «сейчас» больше чем на сутки (часы спешили
+# или их перевели назад). Сутки — запас на переход на летнее время и небольшой сбой часов.
+FUTURE_MARGIN = dt.timedelta(days=1)
+
+
 def future_backups(stamps: dict[str, dt.datetime], now: dt.datetime) -> list[str]:
-    """Копии «из будущего»: время в имени позже now (часы спешили или их перевели назад).
+    """Копии «из будущего»: время в имени позже now + FUTURE_MARGIN.
 
     >>> now = dt.datetime(2026, 10, 19, 3, 0)
-    >>> future_backups({"a": now, "b": now + dt.timedelta(seconds=1)}, now)
+    >>> future_backups({"a": now + dt.timedelta(hours=23), "b": now + dt.timedelta(days=2)}, now)
     ['b']
     """
-    return sorted(name for name, stamp in stamps.items() if stamp > now)
+    return sorted(name for name, stamp in stamps.items() if stamp > now + FUTURE_MARGIN)
 
 
 def expired_backups(stamps: dict[str, dt.datetime], kind: str, now: dt.datetime) -> list[str]:
-    """Какие копии удалить по правилу RETENTION[kind]; stamps — {имя файла: время копии}.
+    """Какие НАСТОЯЩИЕ копии удалить по правилу RETENTION[kind]; stamps — {имя: время}.
 
     Чистая функция: решает, но ничего не удаляет. Остаются keep_last самых новых
     и все, что моложе keep_days дней; остальные — в ответе (по алфавиту).
-    Копии «из будущего» (future_backups) не удаляются и не считаются в keep_last:
-    иначе после сбоя часов они вытесняли бы каждую новую копию.
+    Копии «из будущего» (future_backups) здесь не удаляются и не считаются в keep_last:
+    иначе после сбоя часов они вытесняли бы каждую новую копию (их — excess_future).
 
     >>> now = dt.datetime(2026, 10, 19, 3, 0)
     >>> daily = {f"d{i}": now - dt.timedelta(days=i) for i in range(9)}
@@ -371,7 +376,8 @@ def expired_backups(stamps: dict[str, dt.datetime], kind: str, now: dt.datetime)
     []
     """
     rule = RETENTION[kind]
-    current = {name: stamp for name, stamp in stamps.items() if stamp <= now}
+    future = set(future_backups(stamps, now))
+    current = {name: stamp for name, stamp in stamps.items() if name not in future}
     # новые — первыми; при одинаковом времени новее та, что с суффиксом _1, _2 (имя больше)
     newest = sorted(current, key=lambda name: (current[name], name), reverse=True)
     keep = set(newest[: rule.keep_last])
@@ -379,6 +385,27 @@ def expired_backups(stamps: dict[str, dt.datetime], kind: str, now: dt.datetime)
         border = now - dt.timedelta(days=rule.keep_days)
         keep |= {name for name, stamp in current.items() if stamp >= border}
     return sorted(name for name in current if name not in keep)
+
+
+def excess_future(future_mtimes: dict[str, float], current_count: int, kind: str) -> list[str]:
+    """Какие копии «из будущего» удалить, чтобы при долгом сбое часов их не копилось без конца.
+
+    future_mtimes — {имя: время изменения файла (st_mtime)} копий из будущего:
+    время в имени у них неверное, поэтому новизна — по времени файла. Остаются
+    keep_last самых новых; лишние удаляются, только если настоящих копий уже не меньше
+    keep_last — иначе будущие могут оказаться единственными.
+
+    >>> mtimes = {f"f{i}": float(i) for i in range(10)}
+    >>> excess_future(mtimes, 7, "daily")  # 7 самых новых остаются
+    ['f0', 'f1', 'f2']
+    >>> excess_future(mtimes, 6, "daily")  # настоящих меньше 7 — ничего не удалять
+    []
+    """
+    keep_last = RETENTION[kind].keep_last
+    if current_count < keep_last:
+        return []
+    newest = sorted(future_mtimes, key=lambda name: (future_mtimes[name], name), reverse=True)
+    return sorted(newest[keep_last:])
 
 
 def _backup_files(
@@ -411,20 +438,49 @@ def prune_backups(
 
     Смотрит только в папку своего вида и только на файлы с именем копии этой базы
     (<файл базы>_<вид>_ГГГГММДД_ЧЧММСС.db): сама база, копии других видов и других баз,
-    старого формата, «из будущего» и посторонние файлы не удаляются. keep — копии,
-    которые не удалять ни в коем случае (только что созданные). now — «сейчас» (для тестов).
+    старого формата и посторонние файлы не удаляются. Копии «из будущего» — только
+    сверх keep_last (excess_future). keep — копии, которые не удалять ни в коем случае
+    (только что созданные). now — «сейчас» (для тестов).
     """
     db_path = Path(db_path)
+    now = now or dt.datetime.now()
     folder = _kind_dir(db_path, kind, backup_dir)
     protected = {Path(p).name for p in keep if Path(p).parent == folder}
     stamps = _backup_files(db_path, kind, backup_dir)
+    future = future_backups(stamps, now)
+    mtimes = {name: (folder / name).stat().st_mtime for name in future}
+    doomed = expired_backups(stamps, kind, now)
+    doomed += excess_future(mtimes, len(stamps) - len(future), kind)
     deleted = []
-    for name in expired_backups(stamps, kind, now or dt.datetime.now()):
+    for name in sorted(doomed):
         if name in protected:
             continue
         (folder / name).unlink()
         deleted.append(folder / name)
     return deleted
+
+
+def find_future_backups(
+    db_path: Path | str,
+    kinds: Iterable[str] = BACKUP_KINDS,
+    backup_dir: Path | str | None = None,
+    now: dt.datetime | None = None,
+) -> list[Path]:
+    """Копии «из будущего» этой базы (по видам kinds) — повод проверить часы компьютера."""
+    db_path = Path(db_path)
+    now = now or dt.datetime.now()
+    found = []
+    for kind in kinds:
+        folder = _kind_dir(db_path, kind, backup_dir)
+        found += [folder / n for n in future_backups(_backup_files(db_path, kind, backup_dir), now)]
+    return found
+
+
+FUTURE_WARNING = (
+    "копии из будущего (время в имени позже текущего больше чем на сутки) — проверьте "
+    "часы компьютера. Хранятся не больше обычного числа таких копий, в правиле хранения "
+    "они не учитываются"
+)
 
 
 def weekly_due(last: dt.datetime | None, now: dt.datetime) -> bool:
@@ -443,14 +499,16 @@ def weekly_due(last: dt.datetime | None, now: dt.datetime) -> bool:
     False
     >>> weekly_due(dt.datetime(2027, 10, 13, 3, 0), dt.datetime(2026, 10, 19, 3, 0))
     True
+    >>> weekly_due(dt.datetime(2026, 10, 19, 10, 0), dt.datetime(2026, 10, 19, 3, 0))  # часы
+    False
     """
-    return last is None or last > now or (now.date() - last.date()).days >= 7
+    return last is None or last > now + FUTURE_MARGIN or (now.date() - last.date()).days >= 7
 
 
 @dataclass
 class BackupReport:
     """Что сделала run_backup: созданные копии, удалённые по правилу хранения
-    и копии «из будущего» (время в имени позже текущего — проверить часы)."""
+    и копии «из будущего» (время в имени позже текущего больше чем на сутки — проверить часы)."""
 
     created: list[Path] = field(default_factory=list)
     deleted: list[Path] = field(default_factory=list)
@@ -469,8 +527,8 @@ def run_backup(
     нужен один таймер, а не два, и пропущенная неделя (сервер был выключен) догоняется
     при следующем запуске. Еженедельную можно сделать и явно: kind="weekly".
     Сбой часов: копии этого запуска не удаляются никогда; копии «из будущего» не
-    удаляются и не засчитываются (ни в правило хранения, ни как последняя еженедельная) —
-    они перечислены в report.future, чтобы человек проверил часы.
+    засчитываются (ни в правило хранения, ни как последняя еженедельная) и хранятся не
+    больше keep_last на вид; они перечислены в report.future, чтобы человек проверил часы.
     """
     db_path = Path(db_path)
     now = now or dt.datetime.now()
@@ -478,17 +536,15 @@ def run_backup(
     kinds = [kind]
     if kind == DAILY:
         weekly = _backup_files(db_path, WEEKLY, backup_dir)
-        last_weekly = max((t for t in weekly.values() if t <= now), default=None)
+        future = set(future_backups(weekly, now))
+        last_weekly = max((t for n, t in weekly.items() if n not in future), default=None)
         if weekly_due(last_weekly, now):
             kinds.append(WEEKLY)
     for each in kinds:
         report.created.append(backup_database(db_path, backup_dir, each, now))
     for each in kinds:
         report.deleted += prune_backups(db_path, each, backup_dir, now, keep=report.created)
-    for each in BACKUP_KINDS:  # предупреждать о часах — по всем видам копий
-        stamps = _backup_files(db_path, each, backup_dir)
-        folder = _kind_dir(db_path, each, backup_dir)
-        report.future += [folder / name for name in future_backups(stamps, now)]
+    report.future = find_future_backups(db_path, BACKUP_KINDS, backup_dir, now)  # все виды
     return report
 
 
@@ -580,121 +636,182 @@ def set_live(db_path: Path | str, live: bool) -> bool:
 # Почему не «cp копия база»: в режиме WAL рядом с базой может лежать -wal с изменениями,
 # сделанными ПОСЛЕ копии (последним закрылся читатель — сайт, — и журнал остался).
 # SQLite применит этот чужой журнал к скопированному файлу: «отменённая» правка вернётся,
-# а на большой базе возможна порча. restore_database делает замену безопасно.
-
-
-@dataclass
-class BackupInfo:
-    """Проверенный файл копии: путь и помечен ли он как рабочая база."""
-
-    path: Path
-    live: bool
+# а на большой базе возможна порча. Восстановление идёт в два шага, как import:
+# prepare_restore — копия переносится во временный файл рядом с базой и проверяется
+# ИМЕННО она (то, что ляжет на место базы); replace_database — замена файла.
 
 
 def _snapshot_uri(path: Path) -> str:
-    """Адрес файла копии «только чтение, файл не меняется» (immutable=1).
+    """Адрес СВОЕГО временного файла «только чтение, файл не меняется» (immutable=1).
 
-    В таком режиме SQLite не создаёт рядом -wal и -shm — в папке копий не остаётся
-    мусора. Годится только для закрытых копий, которые никто не пишет.
+    В таком режиме SQLite не создаёт рядом -wal и -shm и не берёт блокировок — годится
+    только для файла, который никто другой не открывает (временный файл restore).
     """
     return path.resolve().as_uri() + "?mode=ro&immutable=1"
 
 
-def inspect_backup(source: Path | str) -> BackupInfo:
-    """Проверить файл копии перед восстановлением: целая база биобанка?
+def _copy_source(source: Path, target: Path) -> None:
+    """Перенести базу source в новый файл target через backup API (согласованный снимок).
 
-    Нет файла — FileNotFoundError. Не база SQLite, повреждена (PRAGMA integrity_check
-    не «ok»), нет таблицы specimen или рядом непустой -wal (значит, это не закрытая
-    копия, а чья-то работающая база) — ValueError с объяснением.
+    source открывается обычным mode=ro — с блокировками и с учётом его -wal: даже если
+    этот файл сейчас кто-то пишет (например, ~/biobank_test.db под сайтом), снимок цельный.
+    Если -wal/-shm рядом с source появились из-за этого чтения (до него их не было),
+    их убирает _tidy_wal: SQLite удаляет их, только если базу больше никто не открыл, —
+    чужие служебные файлы так не пострадают.
     """
-    source = Path(source)
-    if not source.is_file():
-        raise FileNotFoundError(f"Файла копии нет: {source}")
-    wal = source.with_name(source.name + "-wal")
-    if wal.exists() and wal.stat().st_size > 0:
-        raise ValueError(
-            f"Рядом с {source} лежит непустой {wal.name}: это не закрытая копия, а "
-            "работающая база. Сделайте из неё копию командой backup и восстанавливайте из копии."
-        )
-    conn = sqlite3.connect(_snapshot_uri(source), uri=True)
-    conn.row_factory = sqlite3.Row
+    had_wal = bool(wal_files(source))
+    snapshot = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)
+    dest = sqlite3.connect(target)
     try:
-        check = [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()]
-        tables = list_tables(conn)
-        app_id = conn.execute("PRAGMA application_id").fetchone()[0]
-    except sqlite3.DatabaseError as error:
-        raise ValueError(f"{source} — не база SQLite или повреждена: {error}") from error
+        snapshot.backup(dest)
     finally:
-        conn.close()
-    if check != ["ok"]:
-        raise ValueError(f"Копия {source} повреждена (integrity_check: {check[0]} …).")
-    if "specimen" not in tables:
-        raise ValueError(f"{source} — не база биобанка (нет таблицы specimen).")
-    return BackupInfo(source, app_id == LIVE_APPLICATION_ID)
+        dest.close()
+        snapshot.close()
+    if not had_wal and wal_files(source):
+        _tidy_wal(source)
+
+
+def _tidy_wal(path: Path) -> None:
+    """Убрать -wal/-shm, оставленные нашим чтением: открыть и закрыть пишущее подключение.
+
+    Журнал был пуст (до чтения его не было), поэтому основной файл не меняется. Если папка
+    только для чтения или базу кто-то открыл — служебные файлы просто остаются.
+    """
+    try:
+        conn = connect(path)
+        try:
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
 
 
 @dataclass
-class RestoreResult:
-    """Что сделала restore_database."""
+class PreparedRestore:
+    """Копия уже перенесена во временный файл рядом с базой и проверена; база не тронута.
 
-    db_path: Path  # восстановленная база
-    source: Path  # из какой копии
-    backup: Path | None  # pre-op копия базы, которая была до восстановления (None — базы не было)
-    live: bool  # восстановленная база помечена как рабочая (пометка переехала с копией)
+    Дальше вызывающий код решает (CLI спрашивает): replace_database() — заменить базу,
+    discard() — отказаться. Удобнее через with: при выходе временный файл удаляется.
+    """
+
+    db_path: Path  # база, которую заменяем
+    source: Path  # файл копии
+    new_path: Path  # временный файл <база>.restore — ровно то, что ляжет на место базы
+    source_live: bool  # копия помечена как рабочая
+    current_live: bool  # текущая база помечена как рабочая (False — если её нет)
+    backup: Path | None = None  # pre-op копия текущей базы (заполняет replace_database)
+
+    @property
+    def exists(self) -> bool:
+        return self.db_path.exists()
+
+    @property
+    def live(self) -> bool:
+        """Будет ли восстановленная база рабочей: пометка копии или текущей базы."""
+        return self.source_live or self.current_live
+
+    def replace_database(self) -> None:
+        """Заменить базу проверенной копией.
+
+        1. Если база есть: pre-op копия текущей базы (не получилась — BackupError,
+           ничего не заменено) и close_wal: журнал текущей базы перенесён, -wal/-shm
+           убраны; базу держит открытой другая программа — DatabaseBusyError.
+        2. Текущая база была рабочей, а копия сделана до go-live — пометка ставится и на
+           восстановленную: снять её можно только командой undo-go-live, не restore.
+        3. os.replace — одна атомарная операция в той же папке; рядом с восстановленной
+           базой не остаётся -wal/-shm от старой.
+        Как и у import: между close_wal и os.replace есть окно в доли миллисекунды, когда
+        другая программа могла бы открыть базу, — поэтому сайт и все программы, работающие
+        с базой, перед restore нужно остановить (файл-замок — на этапе D4).
+        """
+        try:
+            if self.exists:
+                try:
+                    self.backup = backup_database(self.db_path, kind=PRE_OP)
+                except BackupError as error:
+                    raise BackupError(
+                        f"{error}. Восстановление отменено: текущую базу нельзя заменить, не "
+                        "сохранив её. Если она повреждена — перенесите её файл (и -wal, -shm) "
+                        "в другое место вручную и повторите."
+                    ) from error
+                # перечитать: пока CLI ждал ответа «да/нет», могли выполнить go-live;
+                # до close_wal — чтение создаёт -wal/-shm, close_wal их уберёт
+                self.current_live = is_live(self.db_path)
+                close_wal(self.db_path)
+            if self.current_live and not self.source_live:
+                set_live(self.new_path, True)
+            os.replace(self.new_path, self.db_path)
+        except BaseException:
+            if self.backup is not None:  # замены не было — копия не нужна
+                self.backup.unlink(missing_ok=True)
+                self.backup = None
+            raise
+        try:
+            prune_backups(self.db_path, PRE_OP, keep=[self.backup] if self.backup else [])
+        except OSError:
+            pass  # база уже восстановлена; лишние копии удалит следующая операция
+
+    def discard(self) -> None:
+        """Удалить временный файл (после замены его уже нет — это не ошибка)."""
+        remove_temp_database(self.new_path)
+
+    def __enter__(self) -> PreparedRestore:
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.discard()
 
 
-def restore_database(
-    db_path: Path | str, source: Path | str, backup_dir: Path | str | None = None
-) -> RestoreResult:
-    """Заменить базу db_path копией source. Спрашивать подтверждение — задача CLI.
+def prepare_restore(db_path: Path | str, source: Path | str) -> PreparedRestore:
+    """Перенести копию source во временный файл <база>.restore и проверить его.
 
-    1. inspect_backup(source): целая база биобанка, иначе ValueError.
-    2. Копия переносится (backup API) во временный файл <база>.restore в папке базы —
-       чтобы сама замена была одной атомарной операцией os.replace в той же папке.
-    3. Если база есть: pre-op копия текущей базы (не получилась — BackupError, ничего
-       не заменено) и close_wal: журнал текущей базы перенесён, -wal/-shm убраны;
-       если базу держит открытой другая программа — DatabaseBusyError, ничего не заменено.
-    4. os.replace — рядом с восстановленной базой нет -wal/-shm от старой.
-    Как и у import: между close_wal и os.replace есть окно в доли миллисекунды, когда
-    другая программа могла бы открыть базу, — поэтому сайт и все программы, работающие
-    с базой, перед restore нужно остановить (файл-замок — на этапе D4).
-    Пометка «рабочая база» переезжает вместе с копией (см. RestoreResult.live).
+    Нет файла копии — FileNotFoundError. Копия и база — один файл, копия не база SQLite,
+    повреждена (PRAGMA integrity_check не «ok») или не база биобанка (нет таблицы
+    specimen) — ValueError с объяснением; временный файл при этом удаляется.
+    Сама база не меняется. Текущая база занята дольше BUSY_TIMEOUT_MS — ошибка SQLite.
     """
     db_path = Path(db_path)
     source = Path(source)
-    if db_path.exists() and source.exists() and os.path.samefile(db_path, source):
+    if not source.is_file():
+        raise FileNotFoundError(f"Файла копии нет: {source}")
+    if db_path.exists() and os.path.samefile(db_path, source):
         raise ValueError(f"Копия и база — один и тот же файл: {source}")
-    info = inspect_backup(source)
-    tmp = db_path.with_name(db_path.name + ".restore")
-    remove_temp_database(tmp)
+    current_live = is_live(db_path)
+    new_path = db_path.with_name(db_path.name + ".restore")
+    remove_temp_database(new_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    backup = None
     try:
-        snapshot = sqlite3.connect(_snapshot_uri(source), uri=True)
-        dest = sqlite3.connect(tmp)
         try:
-            snapshot.backup(dest)
+            _copy_source(source, new_path)
+        except sqlite3.DatabaseError as error:
+            raise ValueError(f"{source} — не база SQLite или повреждена: {error}") from error
+        conn = sqlite3.connect(_snapshot_uri(new_path), uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            check = [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()]
+            tables = list_tables(conn)
+            app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+        except sqlite3.DatabaseError as error:
+            raise ValueError(f"{source} — не база SQLite или повреждена: {error}") from error
         finally:
-            dest.close()
-            snapshot.close()
-        if db_path.exists():
-            try:
-                backup = backup_database(db_path, backup_dir, PRE_OP)
-            except BackupError as error:
-                raise BackupError(
-                    f"{error}. Восстановление отменено: текущую базу нельзя заменить, не "
-                    "сохранив её. Если она повреждена — перенесите её файл (и -wal, -shm) "
-                    "в другое место вручную и повторите."
-                ) from error
-            close_wal(db_path)
-        os.replace(tmp, db_path)
+            conn.close()
+        if check != ["ok"]:
+            raise ValueError(f"Копия {source} повреждена (integrity_check: {check[0]} …).")
+        if "specimen" not in tables:
+            raise ValueError(f"{source} — не база биобанка (нет таблицы specimen).")
     except BaseException:
-        remove_temp_database(tmp)
-        if backup is not None:  # замены не было — копия не нужна
-            backup.unlink(missing_ok=True)
+        remove_temp_database(new_path)
         raise
-    try:
-        prune_backups(db_path, PRE_OP, backup_dir, keep=[backup] if backup else [])
-    except OSError:
-        pass  # база уже восстановлена; лишние копии удалит следующая операция
-    return RestoreResult(db_path, source, backup, info.live)
+    return PreparedRestore(db_path, source, new_path, app_id == LIVE_APPLICATION_ID, current_live)
+
+
+def restore_database(db_path: Path | str, source: Path | str) -> PreparedRestore:
+    """Восстановить базу из копии без вопросов: prepare_restore + replace_database.
+
+    Вернуть PreparedRestore: backup — pre-op копия прежней базы, live — рабочая ли
+    восстановленная база.
+    """
+    with prepare_restore(db_path, source) as prepared:
+        prepared.replace_database()
+    return prepared

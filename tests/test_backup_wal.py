@@ -29,6 +29,7 @@ from biobank.db import (
     connect_read_only,
     create_database,
     is_live,
+    prepare_restore,
     prune_backups,
     restore_database,
     run_backup,
@@ -662,7 +663,7 @@ def test_restore_carries_live_mark(empty, tmp_path):
     assert is_live(empty)
 
 
-@pytest.mark.parametrize("problem", ["not_db", "not_biobank", "live_wal", "same_file"])
+@pytest.mark.parametrize("problem", ["not_db", "not_biobank", "same_file"])
 def test_restore_refuses_bad_source(empty, tmp_path, problem):
     source = tmp_path / "copy.db"
     if problem == "not_db":
@@ -671,9 +672,6 @@ def test_restore_refuses_bad_source(empty, tmp_path, problem):
         conn = sqlite3.connect(source)
         conn.execute("CREATE TABLE t (x)")
         conn.close()
-    elif problem == "live_wal":  # «копия», которую кто-то пишет: рядом непустой -wal
-        shutil.copy(empty, source)
-        source.with_name("copy.db-wal").write_bytes(b"x" * 100)
     else:
         source = empty
     before = sha(empty)
@@ -753,7 +751,7 @@ def test_clock_jumps_ahead_and_back(empty):
 
 def test_cli_backup_warns_about_future_copies(empty, capsys):
     touch_backups(empty.parent / "backups" / "daily", "biobank.db", "daily", [-400])
-    assert main(["--db", str(empty), "backup"]) == 0
+    assert main(["--db", str(empty), "backup"]) == 2  # копии сделаны, но таймер заметит
     err = capsys.readouterr().err
     assert "копии из будущего" in err and "проверьте часы" in err
 
@@ -779,3 +777,133 @@ def test_go_live_on_busy_db_has_clear_message(empty, monkeypatch, capsys, comman
     assert main(["--db", str(empty), command]) == 1
     err = capsys.readouterr().err
     assert "не удалось прочитать базу" in err and "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
+# 5. Повторное ревью D1
+# ---------------------------------------------------------------------------
+
+
+def test_restore_from_file_being_written_takes_committed_snapshot(empty, tmp_path):
+    """Источник пишут (как ~/biobank_test.db под сайтом): restore берёт цельный снимок
+    сохранённого — с изменениями из его -wal, без незавершённой транзакции; проверяется
+    именно перенесённый файл. Служебные файлы источника (они уже были) не трогаются."""
+    source = create_database(tmp_path / "test" / "biobank_test.db")
+    writer = connect(source)
+    with writer:
+        writer.execute("INSERT INTO region(name) VALUES ('сохранено')")  # лежит в -wal
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("INSERT INTO region(name) VALUES ('не сохранено')")
+    try:
+        prepared = restore_database(empty, source)
+        assert wal_files(source)  # были до restore — остались
+    finally:
+        writer.rollback()
+        writer.close()
+    assert region_names(empty) == ["сохранено"]
+    assert not prepared.new_path.exists()
+
+
+def test_restore_leaves_no_side_files_next_to_backup(empty):
+    """У копии не было -wal/-shm — после restore их тоже нет, файл копии не изменился."""
+    backup = backup_database(empty, kind="daily", now=NOW)
+    before = sha(backup)
+    restore_database(empty, backup)
+    assert names(backup.parent) == [backup.name]
+    assert sha(backup) == before
+
+
+def test_prepare_restore_checks_and_discards(empty, tmp_path):
+    backup = backup_database(empty, kind="daily", now=NOW)
+    before = sha(empty)
+    with prepare_restore(empty, backup) as prepared:
+        assert prepared.new_path.exists() and prepared.exists
+        assert not prepared.current_live and not prepared.source_live
+    assert not prepared.new_path.exists()
+    assert sha(empty) == before
+
+
+def test_restore_rereads_live_mark_before_replace(empty):
+    """go-live выполнили, пока restore ждал ответа «да/нет»: пометка не теряется."""
+    backup = backup_database(empty, kind="daily", now=NOW)
+    with prepare_restore(empty, backup) as prepared:
+        assert not prepared.current_live
+        set_live(empty, True)
+        prepared.replace_database()
+    assert is_live(empty)
+
+
+def test_restore_keeps_live_mark_of_current_db(empty, monkeypatch, capsys):
+    """Копия сделана до go-live, текущая база рабочая: restore -y пометку не снимает."""
+    backup = backup_database(empty, kind="daily", now=NOW)
+    set_live(empty, True)
+    assert main(["--db", str(empty), "restore", str(backup), "-y"]) == 0
+    out = capsys.readouterr().out
+    assert "Пометка «рабочая база» сохранена" in out
+    assert is_live(empty)
+    assert not is_live(backup)  # файл копии не менялся
+
+
+def test_restore_api_keeps_live_mark(empty):
+    backup = backup_database(empty, kind="daily", now=NOW)
+    set_live(empty, True)
+    result = restore_database(empty, backup)
+    assert result.live and is_live(empty)
+
+
+def test_slightly_future_copy_is_not_future(empty):
+    """Копия на 23 часа «впереди» (летнее время, небольшой сбой) — обычная копия."""
+    folder = empty.parent / "backups" / "daily"
+    folder.mkdir(parents=True)
+    stamp = (NOW + dt.timedelta(hours=23)).strftime("%Y%m%d_%H%M%S")
+    (folder / f"biobank.db_daily_{stamp}.db").write_text("копия")
+    assert run_backup(empty, now=NOW).future == []
+
+
+def touch_future(folder, count_):
+    """count_ копий «из будущего» (через год) с разным временем файла (st_mtime)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for i in range(count_):
+        stamp = (NOW + dt.timedelta(days=365 + i)).strftime("%Y%m%d_%H%M%S")
+        path = folder / f"biobank.db_{folder.name}_{stamp}.db"
+        path.write_text("копия")
+        os.utime(path, (1_000_000 + i, 1_000_000 + i))
+        paths.append(path)
+    return paths
+
+
+def test_future_copies_limited_when_enough_real_ones(empty):
+    folder = empty.parent / "backups" / "daily"
+    future = touch_future(folder, 10)
+    touch_backups(folder, "biobank.db", "daily", range(1, 8))  # 7 настоящих
+    deleted = prune_backups(empty, "daily", now=NOW)
+    assert sorted(deleted) == future[:3]  # самые старые по времени файла
+    assert all(p.exists() for p in future[3:])
+
+
+def test_future_copies_kept_when_few_real_ones(empty):
+    folder = empty.parent / "backups" / "daily"
+    future = touch_future(folder, 10)
+    touch_backups(folder, "biobank.db", "daily", range(1, 7))  # 6 настоящих
+    assert prune_backups(empty, "daily", now=NOW) == []
+    assert all(p.exists() for p in future)
+
+
+def test_pre_op_future_copies_do_not_grow_and_edit_warns(path, capsys):
+    """Долгий сбой часов: pre-op перед каждой правкой не копятся без конца; правка
+    предупреждает (CLI — в stderr, функция — в notices)."""
+    folder = path.parent / "backups" / "pre-op"
+    touch_future(folder, 25)
+    touch_backups(folder, "biobank.db", "pre-op", range(1, 21))  # 20 настоящих
+    assert main(["--db", str(path), "link-trawl", "5 pc", "3"]) == 0
+    assert "копии из будущего" in capsys.readouterr().err
+    future = [n for n in names(folder) if "_2027" in n]
+    assert len(future) == 20  # не больше keep_last
+    result = edit.apply_edit(path, lambda c: edit.resolve_issue(c, 1, "сверено"))
+    assert any("проверьте часы" in n for n in result.notices)
+
+
+def test_edit_without_future_copies_has_no_notices(path):
+    result = edit.apply_edit(path, lambda c: edit.link_trawl(c, "5 pc", 3))
+    assert result.notices == []

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import re
 import sqlite3
 from collections.abc import Callable, Iterator
@@ -25,8 +26,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from biobank.checks import CheckResult, run_checks
-from biobank.db import PRE_OP, backup_database, connect, prune_backups
+from biobank.db import (
+    FUTURE_WARNING,
+    PRE_OP,
+    backup_database,
+    connect,
+    find_future_backups,
+    prune_backups,
+)
 from biobank.parsing import parse_label
+
+log = logging.getLogger(__name__)
 
 METHODS = ("морфология", "ДНК", "другое")
 CONFIDENCES = ("точно", "предп.", "до рода", "не определён")
@@ -49,6 +59,8 @@ class EditResult:
     record_ids: list[int] = field(default_factory=list)  # id всех созданных (пакетный ввод)
     # мягкие предупреждения: запись сохранена, проблема — в журнале data_issue
     warnings: list[str] = field(default_factory=list)
+    # служебные предупреждения не о данных (сбой часов и т.п.; заполняет apply_edit)
+    notices: list[str] = field(default_factory=list)
 
 
 @contextmanager
@@ -108,9 +120,14 @@ def apply_edit(
         raise EditError(f"Ошибка базы данных: {error}") from error
     result.backup = backup
     try:
-        prune_backups(db_path, PRE_OP)
+        prune_backups(db_path, PRE_OP, keep=[backup])
+        future = find_future_backups(db_path, [PRE_OP])
     except OSError:
-        pass  # правка уже сохранена; лишние копии удалит следующая правка или backup
+        future = []  # правка уже сохранена; лишние копии удалит следующая правка или backup
+    if future:
+        notice = f"{FUTURE_WARNING} ({len(future)} шт. в {future[0].parent})."
+        result.notices.append(notice)
+        log.warning(notice)  # на сервере попадёт в журнал сайта
     return result
 
 

@@ -19,6 +19,7 @@ from biobank.db import (
     BACKUP_KINDS,
     DAILY,
     DEFAULT_DB_PATH,
+    FUTURE_WARNING,
     PRE_OP,
     RETENTION,
     LiveDatabaseError,
@@ -27,11 +28,10 @@ from biobank.db import (
     connect_read_only,
     create_database,
     ensure_not_live,
-    inspect_backup,
     is_live,
     list_tables,
+    prepare_restore,
     prune_backups,
-    restore_database,
     run_backup,
     set_live,
 )
@@ -233,15 +233,11 @@ def cmd_backup(args: argparse.Namespace) -> int:
     for path in report.deleted:
         print(f"  {path}")
     if report.future:
-        # в stderr: таймер на сервере пишет его в журнал отдельно, его легче заметить
-        print(
-            f"Внимание: копии из будущего (время в имени позже текущего, {len(report.future)} "
-            "шт.) — проверьте часы компьютера. Такие копии не удаляются и не учитываются "
-            "в правиле хранения:",
-            file=sys.stderr,
-        )
+        # в stderr и с кодом 2: копии сделаны, но таймер на сервере должен заметить сбой часов
+        print(f"Внимание: {FUTURE_WARNING} ({len(report.future)} шт.):", file=sys.stderr)
         for path in report.future:
             print(f"  {path}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -318,38 +314,41 @@ def _yes_no(flag: bool) -> str:
 def cmd_restore(args: argparse.Namespace) -> int:
     """Заменить базу резервной копией (безопасно для режима WAL, в отличие от cp)."""
     try:
-        info = inspect_backup(args.backup)
+        # копия переносится во временный файл и проверяется до вопроса пользователю
+        prepared = prepare_restore(args.db, args.backup)
     except (ValueError, OSError, sqlite3.Error) as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         print("База не изменена.", file=sys.stderr)
         return 1
-    if args.db.exists():
-        live = _live_status(args.db)
-        if live is None:
+    with prepared:  # при выходе временный файл удаляется, если базу не заменили
+        if prepared.exists:
+            print(
+                f"База {args.db} (рабочая: {_yes_no(prepared.current_live)}) будет ЗАМЕНЕНА "
+                f"копией\n  {prepared.source} (рабочая: {_yes_no(prepared.source_live)})."
+            )
+            print("  Всё, что внесено после этой копии, пропадёт из базы; текущая база перед")
+            print("  заменой сохранится как копия pre-op.")
+            if prepared.current_live and not prepared.source_live:
+                print("  Копия сделана до go-live: пометка «рабочая база» будет поставлена и на")
+                print("  восстановленную базу (снять — только командой undo-go-live).")
+        else:
+            print(f"Базы {args.db} нет — она будет создана из копии {prepared.source}.")
+        print("  Перед восстановлением остановите сайт и все программы, работающие с базой.")
+        if not args.yes and not ask_yes_no("Восстановить базу из копии?"):
+            print("Отменено, база не изменена.")
             return 1
-        print(f"База {args.db} (рабочая: {_yes_no(live)}) будет ЗАМЕНЕНА копией")
-        print(f"  {info.path} (рабочая: {_yes_no(info.live)}).")
-        print("  Всё, что внесено после этой копии, пропадёт из базы; текущая база перед")
-        print("  заменой сохранится как копия pre-op.")
-        if live and not info.live:
-            print("  Внимание: копия НЕ помечена как рабочая — после восстановления import")
-            print("  на базе снова будет возможен (пометить: python -m biobank go-live).")
-    else:
-        print(f"Базы {args.db} нет — она будет создана из копии {info.path}.")
-    print("  Перед восстановлением остановите сайт и все программы, работающие с базой.")
-    if not args.yes and not ask_yes_no("Восстановить базу из копии?"):
-        print("Отменено, база не изменена.")
-        return 1
-    try:
-        result = restore_database(args.db, info.path)
-    except (ValueError, OSError, sqlite3.Error) as error:
-        print(f"Ошибка: {error}", file=sys.stderr)
-        print("База не изменена.", file=sys.stderr)
-        return 1
-    print(f"База {result.db_path} восстановлена из копии {result.source}.")
-    if result.backup is not None:
-        print(f"Резервная копия базы до восстановления: {result.backup}")
-    if result.live:
+        try:
+            prepared.replace_database()
+        except (ValueError, OSError, sqlite3.Error) as error:
+            print(f"Ошибка: {error}", file=sys.stderr)
+            print("База не изменена.", file=sys.stderr)
+            return 1
+    print(f"База {prepared.db_path} восстановлена из копии {prepared.source}.")
+    if prepared.backup is not None:
+        print(f"Резервная копия базы до восстановления: {prepared.backup}")
+    if prepared.current_live and not prepared.source_live:
+        print("Пометка «рабочая база» сохранена: она поставлена на восстановленную базу.")
+    if prepared.live:
         print("Восстановленная база — рабочая (go-live): import и init на ней запрещены.")
     else:
         print("Восстановленная база не помечена как рабочая (import на ней возможен).")
@@ -466,6 +465,8 @@ def _run_edit(args: argparse.Namespace, action) -> int:
     for warning in result.warnings:
         print(f"Внимание: {with_cli_hints(warning)}")
     print(f"Резервная копия до правки: {result.backup}")
+    for notice in result.notices:
+        print(f"Внимание: {notice}", file=sys.stderr)
     if result.checks.added or result.checks.closed:
         print(f"Журнал проблем: новых {result.checks.added}, закрыто {result.checks.closed}.")
     return 0

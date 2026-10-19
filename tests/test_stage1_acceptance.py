@@ -70,6 +70,12 @@ def files_in(folder):
     return sorted(p.name for p in folder.iterdir())
 
 
+def files_without_wal(folder):
+    """Файлы папки без служебных -wal/-shm: в режиме WAL их создаёт (и, закрываясь
+    последним, оставляет) даже подключение только на чтение — это не запись в базу."""
+    return [name for name in files_in(folder) if not name.endswith(("-wal", "-shm"))]
+
+
 def execute(path, *statements):
     """Записать в копию базы напрямую (как будто данные ввели через веб)."""
     conn = connect(path)
@@ -156,7 +162,7 @@ def test_read_only_connection_refuses_writes(copy_path, tmp_path, sql):
         conn.close()
     assert sha(copy_path) == before
     assert not out.exists()
-    assert files_in(copy_path.parent) == ["biobank.db"]  # ни журнала, ни WAL
+    assert files_without_wal(copy_path.parent) == ["biobank.db"]  # ни журнала, ни копий
 
 
 ALLOWED_SQL = {
@@ -236,7 +242,7 @@ def test_cli_sql_refuses_writes(copy_path, tmp_path, capsys, key):
     assert "Traceback" not in err
     assert sha(copy_path) == before
     assert not out.exists()
-    assert files_in(copy_path.parent) == ["biobank.db"]
+    assert files_without_wal(copy_path.parent) == ["biobank.db"]
 
 
 def test_cli_sql_explains_forbidden_query(copy_path, capsys):
@@ -371,7 +377,7 @@ def test_import_force_answer_yes_recreates_and_backs_up(copy_path, monkeypatch, 
     conn = connect(copy_path)
     assert count(conn, "SELECT count(*) FROM specimen WHERE trawling_id IS NOT NULL") == 0
     conn.close()
-    [backup] = (copy_path.parent / "backups").iterdir()
+    [backup] = (copy_path.parent / "backups" / "pre-op").iterdir()
     conn = connect(backup)
     assert count(conn, "SELECT count(*) FROM specimen WHERE trawling_id IS NOT NULL") == 1
     conn.close()
@@ -384,7 +390,7 @@ def test_import_force_yes_flag_recreates_without_questions(copy_path, monkeypatc
     conn = connect(copy_path)
     assert count(conn, "SELECT count(*) FROM specimen") == 462
     conn.close()
-    [backup] = (copy_path.parent / "backups").iterdir()
+    [backup] = (copy_path.parent / "backups" / "pre-op").iterdir()
     conn = connect(backup)
     assert count(conn, "SELECT count(*) FROM specimen WHERE label = '300 pc'") == 1
     conn.close()
@@ -406,7 +412,7 @@ def test_import_over_clean_db_backs_up_without_questions(copy_path, monkeypatch,
     no_questions(monkeypatch)
     assert main(["--db", str(copy_path), "import", str(SOURCE)]) == 0
     assert "Резервная копия" in capsys.readouterr().out
-    [backup] = (copy_path.parent / "backups").iterdir()
+    [backup] = (copy_path.parent / "backups" / "pre-op").iterdir()
     assert dump(backup) == original  # в копии — база до импорта
 
 

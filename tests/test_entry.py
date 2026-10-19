@@ -713,7 +713,7 @@ def test_cli_full_entry_sequence(entry_path, capsys):
     assert run(entry_path, "add-sample", "179 pc", "ДНК", "--lab", "Россия") == 0
     assert "отправлен: Россия" in capsys.readouterr().out
     assert run(entry_path, "add-catch", "25", "--text", "arius maculatus - 39 шт") == 0
-    backups = list((entry_path.parent / "backups").iterdir())
+    backups = list((entry_path.parent / "backups" / "pre-op").iterdir())
     assert len(backups) == 8  # копия перед каждым вводом
 
 
@@ -721,7 +721,7 @@ def test_cli_entry_error_leaves_no_backup(entry_path, capsys):
     assert run(entry_path, "add-specimen", "1", "Plotosus canius", "--label", "5 pc") == 1
     err = capsys.readouterr().err
     assert "уже занят" in err and "База не изменена" in err
-    assert list((entry_path.parent / "backups").iterdir()) == []
+    assert list((entry_path.parent / "backups" / "pre-op").iterdir()) == []
 
 
 def test_import_refuses_after_manual_entry(entry_path, capsys):

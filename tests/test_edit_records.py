@@ -884,7 +884,7 @@ def test_create_specimens_one_backup(rec_path):
     rows = [{"species": "Plotosus canius"} for _ in range(5)]
     result = apply_edit(rec_path, lambda c: entry.create_specimens(c, event, rows))
     assert len(result.record_ids) == 5
-    assert len(list((rec_path.parent / "backups").iterdir())) == 1
+    assert len(list((rec_path.parent / "backups" / "pre-op").iterdir())) == 1
 
 
 def test_create_specimen_single_unchanged(rec_db, trawl_event):

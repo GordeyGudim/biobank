@@ -1,7 +1,8 @@
 """Командная строка: python -m biobank <команда>.
 
 Команды: init, import, check, export, report, sql, show, link-trawl, identify, resolve-issue,
-web (сайт);
+web (сайт); backup и restore (резервная копия и восстановление из неё),
+go-live / undo-go-live (пометка «рабочая база»);
 ввод новых данных (entry.py): add-expedition, add-site, add-event, add-trawling, add-water,
 next-label, add-specimen, update-measurements, add-sample, ship-sample, add-analysis, add-catch.
 """
@@ -15,12 +16,24 @@ from pathlib import Path
 from biobank.card import render_card, specimen_card
 from biobank.checks import summary_by_category
 from biobank.db import (
+    BACKUP_KINDS,
+    DAILY,
     DEFAULT_DB_PATH,
+    PRE_OP,
+    RETENTION,
+    LiveDatabaseError,
     backup_database,
     connect,
     connect_read_only,
     create_database,
+    ensure_not_live,
+    inspect_backup,
+    is_live,
     list_tables,
+    prune_backups,
+    restore_database,
+    run_backup,
+    set_live,
 )
 from biobank.edit import (
     CONFIDENCES,
@@ -79,6 +92,7 @@ CLI_HINTS = (
     ("Номера образцов — в карточке особи", "python -m biobank show <номер пробы>"),
     ("Базы нет:", "python -m biobank import data/source.xlsx"),
     ("нет в журнале", "список: python -m biobank report issues"),
+    ("снимите пометку «рабочая база»", "python -m biobank undo-go-live (только при аварии)"),
 )  # fmt: skip
 
 
@@ -102,12 +116,17 @@ def ask_yes_no(question: str) -> bool:
 
 def cmd_init(args: argparse.Namespace) -> int:
     db_path: Path = args.db
-    if db_path.exists() and not args.yes:
-        if not ask_yes_no(f"Файл {db_path} уже существует. Удалить и создать заново?"):
-            print("Отменено.")
-            return 1
-
-    create_database(db_path, overwrite=True)
+    try:
+        ensure_not_live(db_path)  # рабочую базу пересоздавать нельзя — и спрашивать незачем
+        if db_path.exists() and not args.yes:
+            if not ask_yes_no(f"Файл {db_path} уже существует. Удалить и создать заново?"):
+                print("Отменено.")
+                return 1
+        create_database(db_path, overwrite=True)
+    except (LiveDatabaseError, sqlite3.Error) as error:
+        print(f"Ошибка: {with_cli_hints(str(error))}", file=sys.stderr)
+        print("База не изменена.", file=sys.stderr)
+        return 1
 
     conn = connect(db_path)
     tables = list_tables(conn)
@@ -125,6 +144,9 @@ def cmd_import(args: argparse.Namespace) -> int:
     try:
         # новая база собирается во временном файле и сравнивается с текущей
         prepared = prepare_import(xlsx, args.db)
+    except LiveDatabaseError as error:
+        print(f"Импорт запрещён (даже с --force): {with_cli_hints(str(error))}", file=sys.stderr)
+        return 1
     except (ExcelReadError, sqlite3.Error) as error:
         print(f"Ошибка импорта, база не изменена: {error}", file=sys.stderr)
         return 1
@@ -154,9 +176,15 @@ def cmd_import(args: argparse.Namespace) -> int:
             if not args.yes and not ask_yes_no("Пересоздать базу из Excel?"):
                 print("Отменено, база не изменена.")
                 return 1
-        if prepared.exists:
-            print(f"Резервная копия текущей базы: {backup_database(args.db)}")
-        prepared.replace_database()
+        try:
+            if prepared.exists:
+                print(f"Резервная копия текущей базы: {backup_database(args.db, kind=PRE_OP)}")
+                prune_backups(args.db, PRE_OP)
+            prepared.replace_database()
+        except (LiveDatabaseError, OSError, sqlite3.Error) as error:
+            print(f"Ошибка: {with_cli_hints(str(error))}", file=sys.stderr)
+            print("Импорт отменён, база не изменена.", file=sys.stderr)
+            return 1
 
     print(f"Импорт завершён: {args.db}")
     width = max(len(name) for name in prepared.summary)
@@ -187,6 +215,144 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"  {r['category']:<12} {r['open']:>8} {r['resolved']:>7} {r['total']:>6}")
     print()
     print("Подробности: python -m biobank report issues")
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Резервная копия + очистка старых копий того же вида (для ночного таймера на сервере)."""
+    if not _require_db(args.db):
+        return 1
+    try:
+        report = run_backup(args.db, args.kind)
+    except (OSError, sqlite3.Error) as error:
+        print(f"Ошибка резервного копирования: {error}", file=sys.stderr)
+        return 1  # код ошибки — таймер на сервере увидит, что копия не сделана
+    for path in report.created:
+        print(f"Резервная копия: {path}")
+    print(f"Удалено старых копий по правилу хранения: {len(report.deleted)}")
+    for path in report.deleted:
+        print(f"  {path}")
+    if report.future:
+        # в stderr: таймер на сервере пишет его в журнал отдельно, его легче заметить
+        print(
+            f"Внимание: копии из будущего (время в имени позже текущего, {len(report.future)} "
+            "шт.) — проверьте часы компьютера. Такие копии не удаляются и не учитываются "
+            "в правиле хранения:",
+            file=sys.stderr,
+        )
+        for path in report.future:
+            print(f"  {path}", file=sys.stderr)
+    return 0
+
+
+def _live_status(db_path: Path) -> bool | None:
+    """is_live для команд: None и сообщение — если базу не удалось прочитать (занята…)."""
+    try:
+        return is_live(db_path)
+    except sqlite3.Error as error:
+        print(f"Ошибка: не удалось прочитать базу {db_path}: {error}", file=sys.stderr)
+        print("Если базу сейчас пишет другая программа — повторите позже.", file=sys.stderr)
+        return None
+
+
+def cmd_go_live(args: argparse.Namespace) -> int:
+    """Отметить базу как рабочую: после этого import и init на ней запрещены."""
+    if not _require_db(args.db):
+        return 1
+    live = _live_status(args.db)
+    if live is None:
+        return 1
+    if live:
+        print(f"База {args.db} уже отмечена как рабочая.")
+        return 0
+    print(
+        f"База {args.db} станет РАБОЧЕЙ — единственным источником данных. После этого\n"
+        "  import (пересоздание из Excel) и init на ней запрещены, даже с --force;\n"
+        "  сайт, правки и резервные копии работают как обычно; пометка сохраняется в\n"
+        "  самом файле базы — копии и восстановленная из копии база тоже рабочие."
+    )
+    if not args.yes and not ask_yes_no("Отметить базу как рабочую?"):
+        print("Отменено, база не изменена.")
+        return 1
+    try:
+        set_live(args.db, True)
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        return 1
+    print(f"База {args.db} отмечена как рабочая.")
+    return 0
+
+
+def cmd_undo_go_live(args: argparse.Namespace) -> int:
+    """Снять пометку «рабочая база» — только при аварии; всегда спрашивает подтверждение."""
+    if not _require_db(args.db):
+        return 1
+    live = _live_status(args.db)
+    if live is None:
+        return 1
+    if not live:
+        print(f"База {args.db} не отмечена как рабочая — снимать нечего.")
+        return 0
+    print(
+        "ВНИМАНИЕ: после снятия пометки команда import сможет пересоздать базу из Excel\n"
+        "  и стереть всё, что внесено через сайт. Снимайте только при аварии, когда базу\n"
+        "  действительно нужно собрать заново, и сначала сделайте копию: python -m biobank "
+        "backup --kind pre-op"
+    )
+    if not ask_yes_no(f"Снять пометку «рабочая база» с {args.db}?"):
+        print("Отменено, пометка осталась.")
+        return 1
+    try:
+        set_live(args.db, False)
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        return 1
+    print(f"Пометка снята: {args.db} больше не рабочая база (import снова возможен).")
+    return 0
+
+
+def _yes_no(flag: bool) -> str:
+    return "да" if flag else "нет"
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Заменить базу резервной копией (безопасно для режима WAL, в отличие от cp)."""
+    try:
+        info = inspect_backup(args.backup)
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        print("База не изменена.", file=sys.stderr)
+        return 1
+    if args.db.exists():
+        live = _live_status(args.db)
+        if live is None:
+            return 1
+        print(f"База {args.db} (рабочая: {_yes_no(live)}) будет ЗАМЕНЕНА копией")
+        print(f"  {info.path} (рабочая: {_yes_no(info.live)}).")
+        print("  Всё, что внесено после этой копии, пропадёт из базы; текущая база перед")
+        print("  заменой сохранится как копия pre-op.")
+        if live and not info.live:
+            print("  Внимание: копия НЕ помечена как рабочая — после восстановления import")
+            print("  на базе снова будет возможен (пометить: python -m biobank go-live).")
+    else:
+        print(f"Базы {args.db} нет — она будет создана из копии {info.path}.")
+    print("  Перед восстановлением остановите сайт и все программы, работающие с базой.")
+    if not args.yes and not ask_yes_no("Восстановить базу из копии?"):
+        print("Отменено, база не изменена.")
+        return 1
+    try:
+        result = restore_database(args.db, info.path)
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        print("База не изменена.", file=sys.stderr)
+        return 1
+    print(f"База {result.db_path} восстановлена из копии {result.source}.")
+    if result.backup is not None:
+        print(f"Резервная копия базы до восстановления: {result.backup}")
+    if result.live:
+        print("Восстановленная база — рабочая (go-live): import и init на ней запрещены.")
+    else:
+        print("Восстановленная база не помечена как рабочая (import на ней возможен).")
     return 0
 
 
@@ -667,6 +833,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_resolve.add_argument("issue_id", type=int, help="номер проблемы (report issues)")
     p_resolve.add_argument("resolution", help="как решили, в кавычках")
     p_resolve.set_defaults(func=cmd_resolve_issue)
+
+    rules = ", ".join(
+        f"{kind} — {rule.keep_last} последних"
+        + (f" и все за {rule.keep_days} дней" if rule.keep_days else "")
+        for kind, rule in RETENTION.items()
+    )
+    p_backup = sub.add_parser(
+        "backup",
+        help="резервная копия базы и очистка старых копий",
+        description=f"Копия в <папка базы>/backups/<вид>/. Хранятся: {rules}. "
+        "К ежедневной копии раз в 7 дней добавляется еженедельная.",
+    )
+    p_backup.add_argument(
+        "--kind", choices=BACKUP_KINDS, default=DAILY, help="вид копии (по умолчанию daily)"
+    )
+    p_backup.set_defaults(func=cmd_backup)
+
+    p_restore = sub.add_parser(
+        "restore",
+        help="заменить базу резервной копией (вместо cp; спросит подтверждение)",
+        description="Проверяет копию (целая база биобанка), сохраняет текущую базу как копию "
+        "pre-op и заменяет файл так, чтобы рядом не остался журнал -wal старой базы. "
+        "Сайт и другие программы, работающие с базой, перед этим нужно остановить.",
+    )
+    p_restore.add_argument("backup", type=Path, help="файл копии, напр. output/backups/daily/…")
+    p_restore.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждение")
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_live = sub.add_parser(
+        "go-live", help="отметить базу как рабочую: import и init на ней будут запрещены"
+    )
+    p_live.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждение")
+    p_live.set_defaults(func=cmd_go_live)
+
+    p_unlive = sub.add_parser(
+        "undo-go-live", help="снять пометку «рабочая база» (только при аварии; спросит)"
+    )
+    p_unlive.set_defaults(func=cmd_undo_go_live)
 
     p_web = sub.add_parser("web", help="веб-интерфейс на этом компьютере (127.0.0.1)")
     p_web.add_argument("--port", type=int, default=5000, help="порт (по умолчанию 5000)")

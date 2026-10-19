@@ -39,7 +39,7 @@ def client(path):
 
 
 def backups(path):
-    folder = path.parent / "backups"
+    folder = path.parent / "backups" / "pre-op"  # копии перед правками
     return sorted(folder.iterdir()) if folder.exists() else []
 
 

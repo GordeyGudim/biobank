@@ -343,13 +343,17 @@ def test_logic_messages_have_no_cli_flags(rw):
 
 
 def test_every_cli_hint_is_used():
-    """Каждый кусок текста из CLI_HINTS действительно встречается в коде логики."""
+    """Каждый кусок текста из CLI_HINTS действительно встречается в коде логики.
+
+    db.py — сообщение о рабочей базе (go-live) для import и init."""
     from pathlib import Path
 
     import biobank
 
     package = Path(biobank.__file__).parent
-    code = "".join((package / name).read_text() for name in ("entry.py", "records.py", "edit.py"))
+    code = "".join(
+        (package / name).read_text() for name in ("entry.py", "records.py", "edit.py", "db.py")
+    )
     for marker, _ in CLI_HINTS:
         assert marker in code, marker
 

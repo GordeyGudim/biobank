@@ -60,7 +60,10 @@ Excel-импорт — разовый перенос накопленных да
 
 Правки (`link-trawl`, `identify`, `resolve-issue`) — только через проверенные функции в
 `edit.py`, в транзакции, с понятным сообщением об ошибке. Перед любой массовой правкой —
-резервная копия файла БД (`output/backups/biobank_YYYYMMDD_HHMMSS.db`).
+резервная копия файла БД (`output/backups/pre-op/…`). Копии — только командой `backup` или через
+`db.backup_database` (backup API), не `cp`: база в режиме WAL, рядом бывают `-wal`/`-shm`; хранение —
+daily 7, weekly 4, pre-op 30 дней (не меньше 20). База, отмеченная `go-live` (`PRAGMA application_id`),
+не пересоздаётся (`import`, `init` отказывают даже с `--force`); `user_version` — для версий схемы.
 
 ## Ключевые решения схемы v2 (подробности и комментарии — в `db/schema.sql`)
 

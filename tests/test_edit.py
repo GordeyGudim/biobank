@@ -230,8 +230,8 @@ def test_resolved_check_issue_survives_recheck(edit_db):
 
 def test_backup_is_full_copy(edit_path):
     backup = backup_database(edit_path)
-    assert backup.parent.name == "backups"
-    assert backup.name.startswith("biobank_")
+    assert backup.parent == edit_path.parent / "backups" / "pre-op"
+    assert backup.name.startswith("biobank.db_pre-op_")
     conn = connect(backup)
     try:
         assert count(conn, "SELECT count(*) FROM specimen") == 462
@@ -247,13 +247,13 @@ def test_cli_edit_makes_backup(edit_path, capsys):
     assert main(["--db", str(edit_path), "link-trawl", "5 pc", "3"]) == 0
     out = capsys.readouterr().out
     assert "Резервная копия до правки" in out
-    assert len(list((edit_path.parent / "backups").iterdir())) == 1
+    assert len(list((edit_path.parent / "backups" / "pre-op").iterdir())) == 1
 
 
 def test_cli_failed_edit_leaves_no_backup(edit_path, capsys):
     assert main(["--db", str(edit_path), "link-trawl", "5 pc", "99"]) == 1
     assert "База не изменена" in capsys.readouterr().err
-    assert list((edit_path.parent / "backups").iterdir()) == []
+    assert list((edit_path.parent / "backups" / "pre-op").iterdir()) == []
 
 
 def test_cli_identify_question_mark(edit_path):
@@ -270,7 +270,7 @@ def test_reimport_with_force_and_yes_makes_backup(edit_path, capsys):
     assert main(["--db", str(edit_path), "link-trawl", "5 pc", "3"]) == 0
     assert main(["--db", str(edit_path), "import", str(SOURCE), "--force", "--yes"]) == 0
     assert "Резервная копия текущей базы" in capsys.readouterr().out
-    backups = sorted((edit_path.parent / "backups").iterdir())
+    backups = sorted((edit_path.parent / "backups" / "pre-op").iterdir())
     assert len(backups) == 2  # до правки и до импорта
     conn = connect(backups[-1])
     try:

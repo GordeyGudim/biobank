@@ -6,7 +6,8 @@
 - при ошибке — понятное сообщение (EditError), транзакция откатывается, база не меняется;
 - вместе с изменением перепроверяется журнал проблем (checks.run_checks): например,
   когда у всех особей выезда указано траление, проблема «особи не привязаны» закрывается сама;
-- apply_edit() перед правкой делает резервную копию файла базы.
+- apply_edit() перед правкой делает резервную копию файла базы (вид pre-op, см. db.py;
+  лишние старые копии удаляются по правилу хранения).
 
 Функции принимают подключение и не печатают ничего сами — их можно будет
 вызывать и из будущего веб-интерфейса. Подключение должно быть БЕЗ открытой
@@ -24,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from biobank.checks import CheckResult, run_checks
-from biobank.db import backup_database, connect
+from biobank.db import PRE_OP, backup_database, connect, prune_backups
 from biobank.parsing import parse_label
 
 METHODS = ("морфология", "ДНК", "другое")
@@ -82,6 +83,9 @@ def apply_edit(
 ) -> EditResult:
     """Резервная копия базы → правка action(conn) → результат с путём к копии.
 
+    Копия — вида pre-op (перед опасной операцией): пока нет журнала изменений (этап D3),
+    она делается перед каждой правкой. После удачной правки старые pre-op копии
+    подчищаются по правилу хранения (db.RETENTION: 30 дней, но не меньше 20 последних).
     Ошибка правки (EditError) и ошибка SQLite (база занята, повреждена…) — EditError;
     резервная копия при ошибке удаляется: правки не было, копия не нужна.
     """
@@ -90,7 +94,7 @@ def apply_edit(
         raise NotFoundError(f"Базы нет: {db_path}. Сначала создайте её импортом из Excel.")
     backup = None
     try:
-        backup = backup_database(db_path)
+        backup = backup_database(db_path, kind=PRE_OP)
         conn = connect(db_path)
         try:
             result = action(conn)
@@ -103,6 +107,10 @@ def apply_edit(
             raise
         raise EditError(f"Ошибка базы данных: {error}") from error
     result.backup = backup
+    try:
+        prune_backups(db_path, PRE_OP)
+    except OSError:
+        pass  # правка уже сохранена; лишние копии удалит следующая правка или backup
     return result
 
 

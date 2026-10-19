@@ -201,10 +201,20 @@ def invariant(conn, schema):
 # ---- копии базы в памяти ----
 
 
+def without_wal(data: bytes) -> bytes:
+    """Образ базы, помеченной в заголовке как WAL, → обычный режим журнала.
+
+    Байты 18 и 19 заголовка SQLite: 2 — режим WAL, 1 — обычный. База в памяти не может
+    работать в WAL (ей негде держать -wal), и deserialize такого образа даёт
+    «unable to open database file». Содержимое таблиц не меняется.
+    """
+    return data[:18] + b"\x01\x01" + data[20:]
+
+
 def memory_copy(data: bytes) -> sqlite3.Connection:
     """Свежая копия базы в оперативной памяти (deserialize — быстрее копии файла)."""
     conn = sqlite3.connect(":memory:", isolation_level=None)  # транзакции — вручную
-    conn.deserialize(data)
+    conn.deserialize(without_wal(data))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -228,7 +238,7 @@ def images(fresh):
     """Содержимое базы байтами: как есть и со сдвинутыми номерами (shift_all)."""
     data = fresh.serialize()
     conn = sqlite3.connect(":memory:")
-    conn.deserialize(data)
+    conn.deserialize(without_wal(data))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     shift_all(conn)

@@ -12,7 +12,13 @@ from conftest import SOURCE, count
 from biobank import edit
 from biobank.__main__ import main
 from biobank.checks import collapse_issues, run_checks
-from biobank.db import backup_database, connect, connect_read_only, create_database
+from biobank.db import (
+    BackupError,
+    backup_database,
+    connect,
+    connect_read_only,
+    create_database,
+)
 from biobank.excel_reader import Issue, SheetData, SpecimenRow
 from biobank.importer import (
     ImportContext,
@@ -53,7 +59,8 @@ def dump(p):
 
 
 def backups(p):
-    folder = p.parent / "backups"
+    """Копии перед правками (вид pre-op, db.backup_database)."""
+    folder = p.parent / "backups" / "pre-op"
     return sorted(folder.iterdir()) if folder.exists() else []
 
 
@@ -202,7 +209,9 @@ def test_import_refuses_without_force(path, capsys):
     assert "--force" in out.err
     assert dump(path) == before
     assert len(backups(path)) == 1  # только копия до правки link-trawl
-    assert sorted(f.name for f in path.parent.iterdir()) == ["backups", "biobank.db"]  # нет .tmp
+    # нет .tmp (и его -wal/-shm); -wal/-shm самой базы может оставить чтение (режим WAL)
+    names = {f.name for f in path.parent.iterdir()} - {"biobank.db-wal", "biobank.db-shm"}
+    assert sorted(names) == ["backups", "biobank.db"]
 
 
 def test_import_with_force_asks(path, monkeypatch, capsys):
@@ -356,10 +365,15 @@ def test_cli_edit_on_broken_db(tmp_path, capsys):
     assert backups(bad) == []
 
 
-def test_backup_of_non_database_copies_file(tmp_path):
+def test_backup_of_non_database_is_error(tmp_path):
+    """Не база SQLite — ошибка, файл копии не остаётся (копия «как есть» могла бы
+    оказаться неполной без -wal — см. tests/test_backup_wal.py)."""
     bad = tmp_path / "bad.db"
     bad.write_text("это не база")
-    assert backup_database(bad).read_text() == "это не база"
+    with pytest.raises(BackupError, match="не сделана"):
+        backup_database(bad)
+    assert list((tmp_path / "backups" / "pre-op").iterdir()) == []
+    assert bad.read_text() == "это не база"
 
 
 def test_backup_does_not_change_source(path):

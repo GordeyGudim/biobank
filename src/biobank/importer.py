@@ -26,10 +26,13 @@ from pathlib import Path
 from biobank.checks import collapse_issues, run_checks
 from biobank.db import (
     DEFAULT_DB_PATH,
+    close_wal,
     connect,
     connect_read_only,
     create_database,
+    ensure_not_live,
     list_tables,
+    remove_temp_database,
 )
 from biobank.excel_reader import (
     CoordinateEntry,
@@ -837,8 +840,9 @@ def _build_database(expeditions: list[ExpeditionData], path: Path) -> dict[str, 
     """Создать базу в файле path и записать в неё книгу. Вернуть {таблица: число строк}.
 
     При ошибке файл удаляется — полузаписанной базы не остаётся.
+    path — временный файл импорта: его (и его -wal/-shm от прошлого сбоя) удалять можно.
     """
-    path.unlink(missing_ok=True)
+    remove_temp_database(path)
     create_database(path)
     conn = connect(path)
     try:
@@ -855,7 +859,7 @@ def _build_database(expeditions: list[ExpeditionData], path: Path) -> dict[str, 
         }
     except Exception:
         conn.close()
-        path.unlink(missing_ok=True)
+        remove_temp_database(path)
         raise
     conn.close()
     return summary
@@ -1419,12 +1423,27 @@ class PreparedImport:
         return bool(self.differences) or self.unreadable is not None
 
     def replace_database(self) -> None:
-        """Атомарно заменить рабочую базу новой: старая исчезает только в этот момент."""
+        """Атомарно заменить рабочую базу новой: старая исчезает только в этот момент.
+
+        Перед заменой:
+        - ещё раз проверить пометку «рабочая база» (её могли поставить после
+          prepare_import) — LiveDatabaseError;
+        - закрыть журнал WAL обеих баз (db.close_wal): рядом с новым файлом не должен
+          остаться -wal старого; если старую базу держит открытой другая программа
+          (сайт) — DatabaseBusyError, база не меняется.
+        Остаётся окно в доли миллисекунды между close_wal и os.replace: если другая
+        программа откроет и изменит старую базу именно в этот миг, её -wal окажется рядом
+        с новым файлом. Поэтому перед import сайт и все программы, работающие с базой,
+        нужно остановить (файл-замок решим на этапе D4 вместе с systemd).
+        """
+        ensure_not_live(self.db_path)
+        close_wal(self.new_path)
+        close_wal(self.db_path)
         os.replace(self.new_path, self.db_path)
 
     def discard(self) -> None:
-        """Удалить временный файл (после replace_database его уже нет — это не ошибка)."""
-        self.new_path.unlink(missing_ok=True)
+        """Удалить временный файл и его -wal/-shm (после замены их уже нет — это не ошибка)."""
+        remove_temp_database(self.new_path)
 
     def __enter__(self) -> PreparedImport:
         return self
@@ -1440,7 +1459,9 @@ def prepare_import(
 ) -> PreparedImport:
     """Прочитать книгу, собрать новую базу во временном файле и сравнить с текущей.
 
-    Текущая база не меняется. Что видно при сравнении (compare=True):
+    Текущая база не меняется. Рабочую базу (go-live) пересоздавать нельзя ни при каких
+    флагах — LiveDatabaseError сразу, книга даже не читается.
+    Что видно при сравнении (compare=True):
     - любая запись, добавленная, удалённая или изменённая не через Excel, в любой
       таблице — в том числе исправленное значение в записи из Excel (TL особи)
       и вручную закрытая проблема журнала;
@@ -1451,6 +1472,7 @@ def prepare_import(
       во время импорта с базой никто не должен работать).
     """
     db_path = Path(db_path)
+    ensure_not_live(db_path)
     expeditions = read_workbook(xlsx_path)
     new_path = db_path.with_name(db_path.name + ".tmp")
     summary = _build_database(expeditions, new_path)
@@ -1491,8 +1513,9 @@ def import_workbook(
 ) -> dict[str, int]:
     """Пересоздать базу и импортировать книгу. Вернуть {таблица: число строк}.
 
-    Старая база заменяется БЕЗ проверки и без вопросов. Команда import вместо этого
-    вызывает prepare_import(), смотрит differences и делает резервную копию.
+    Старая база заменяется БЕЗ сравнения и без вопросов (но рабочую — не заменяет:
+    LiveDatabaseError). Команда import вместо этого вызывает prepare_import(), смотрит
+    differences и делает резервную копию.
     """
     with prepare_import(xlsx_path, db_path, compare=False) as prepared:
         prepared.replace_database()

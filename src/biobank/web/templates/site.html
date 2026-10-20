@@ -1,18 +1,20 @@
 {% extends "base.html" %}
-{% from "_macros.html" import section_table %}
+{% from "_macros.html" import section_table, added_by, history_block %}
 {#- Карточка места (browse.site_card): все разделы, все колонки, даже пустые. -#}
 {% block title %}Место {{ title }}{% endblock %}
 {% block content %}
 <p class="crumbs"><a href="{{ url_for('sites') }}">Места</a> /</p>
 <h1>{{ title }}</h1>
+{{ added_by(record) }}
 <p class="record-actions">
-  <a class="button-link" href="{{ url_for('record_edit', kind_name='site', record_id=site_id) }}">Изменить место</a>
-  <a class="button-link danger" href="{{ url_for('record_delete', kind_name='site', record_id=site_id) }}">Удалить место</a>
+  {% if may("site", site_id, UPDATE) %}<a class="button-link" href="{{ url_for('record_edit', kind_name='site', record_id=site_id) }}">Изменить место</a>{% endif %}
+  {% if may("site", site_id, DELETE) %}<a class="button-link danger" href="{{ url_for('record_delete', kind_name='site', record_id=site_id) }}">Удалить место</a>{% endif %}
+  {% if can(CREATE, "data_issue") %}<a href="{{ url_for('issue_new', table_name='sampling_site', record_id=site_id, object_label=title) }}">Сообщить о проблеме →</a>{% endif %}
 </p>
 <p><a href="{{ url_for('specimens', site=site_id) }}">Особи этого места — списком с фильтрами</a></p>
 {#- Выезд на это место: ссылки на экспедиции → её карточка с раскрытой формой «Новый выезд»
     и уже выбранным местом (?site=N). Обычные ссылки (GET) — база не меняется. -#}
-{% if expeditions %}
+{% if expeditions and can(CREATE, "sampling_event") %}
 <details class="edit-form">
   <summary>Добавить выезд на это место</summary>
   <ul class="links">
@@ -25,4 +27,5 @@
 </details>
 {% endif %}
 {% for view in views %}{{ section_table(view) }}{% endfor %}
+{{ history_block(history, history_link) }}
 {% endblock %}

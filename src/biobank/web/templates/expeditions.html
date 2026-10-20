@@ -4,6 +4,7 @@
 {% block title %}Экспедиции{% endblock %}
 {% block content %}
 <h1>Экспедиции</h1>
+{% if can(CREATE, "expedition") %}
 {% set f = form_view(submitted, "f-expedition") %}
 {% call entry_form(f, url_for('expedition_new'), "Новая экспедиция",
     "Даты можно не указывать: их заполнит первый выезд. Потом в карточке экспедиции добавьте выезды.") %}
@@ -15,6 +16,7 @@
   </div>
   {{ submit(f, "Создать экспедицию") }}
 {% endcall %}
+{% endif %}
 {% if expeditions %}
 <div class="table-wrap">
   <table class="list">

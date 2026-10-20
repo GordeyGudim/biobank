@@ -10,8 +10,15 @@
 - открытая проблема, которую проверка больше не находит (данные исправили),
   автоматически закрывается с пометкой в resolution.
 
-Проблемы проверок отличаются от проблем импорта текстом описания: у каждой
-проверки он постоянный (числа — в raw_value), см. CHECK_DESCRIPTIONS.
+Записи проверок отличаются от записей импорта и записей людей колонкой
+data_issue.source (схема v3): 'проверка' / 'импорт' / 'пользователь'. Текст описания
+у каждой проверки постоянный (числа — в raw_value), см. CHECK_DESCRIPTIONS: по нему
+(вместе с объектом) повторный запуск узнаёт уже известную запись.
+
+Журнал изменений (change_log) проверки НЕ пишут — ни новые записи, ни автоматическое
+закрытие («Проверка <дата> больше не находит эту проблему»): это работа программы, а не
+человека; что и когда закрыто, видно в самой записи (resolution, resolved_at). Иначе каждая
+новая база из Excel отличалась бы от прежней временем записей журнала.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
 
+from biobank.db import now_utc
 from biobank.excel_reader import Issue
 
 
@@ -53,6 +61,8 @@ DESC_DUPLICATE = "Номера повторяются в сквозной сер
 DESC_GAPS = "Номера пропущены в сквозной серии"
 DESC_NO_TRAWL = "Особи не привязаны к тралениям — восстановить по полевому журналу"
 
+# Все тексты описаний проверок. Источник записи определяется колонкой source, а не этим
+# списком; список — для справки и тестов (у каждой записи проверки описание отсюда).
 CHECK_DESCRIPTIONS = (
     DESC_SL_GT_TL, DESC_SL_TOO_SMALL, DESC_GUTTED_GT_MASS, DESC_COPIED, DESC_CONDITION,
     DESC_SUFFIX, DESC_DUPLICATE, DESC_GAPS, DESC_NO_TRAWL,
@@ -298,9 +308,10 @@ def find_issues(conn: sqlite3.Connection) -> list[Issue]:
     return collapse_issues(found)
 
 
-def is_check_issue(description: str) -> bool:
-    """Запись журнала создана проверкой (а не импортом)."""
-    return description.startswith(CHECK_DESCRIPTIONS)
+# Откуда запись журнала (data_issue.source; CHECK в схеме допускает только эти три)
+SOURCE_IMPORT = "импорт"
+SOURCE_CHECK = "проверка"
+SOURCE_USER = "пользователь"
 
 
 @dataclass
@@ -328,10 +339,14 @@ def run_checks(conn: sqlite3.Connection, today: str | None = None) -> CheckResul
     today = today or dt.date.today().isoformat()
     found = find_issues(conn)
     existing = {}
-    # список колонок — фиксированный текст из кода, не данные пользователя
-    for r in conn.execute(f"SELECT issue_id, resolved, {', '.join(_KEY_COLUMNS)} FROM data_issue"):
-        if is_check_issue(r["description"]):
-            existing[tuple(r[c] for c in _KEY_COLUMNS)] = r
+    # только записи проверок: записи импорта и людей проверки не трогают.
+    # Список колонок — фиксированный текст из кода, не данные пользователя.
+    rows = conn.execute(
+        f"SELECT issue_id, resolved, {', '.join(_KEY_COLUMNS)} FROM data_issue WHERE source = ?",
+        (SOURCE_CHECK,),
+    )
+    for r in rows:
+        existing[tuple(r[c] for c in _KEY_COLUMNS)] = r
 
     added = known = 0
     found_keys = set()
@@ -343,9 +358,9 @@ def run_checks(conn: sqlite3.Connection, today: str | None = None) -> CheckResul
             continue
         conn.execute(
             "INSERT INTO data_issue (category, table_name, record_id, sheet_name, cell, "
-            "object_label, raw_value, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "object_label, raw_value, description, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (i.category, i.table_name, i.record_id, i.sheet, i.cell, i.object_label,
-             i.raw_value, i.description),
+             i.raw_value, i.description, SOURCE_CHECK),
         )  # fmt: skip
         added += 1
 
@@ -353,8 +368,9 @@ def run_checks(conn: sqlite3.Connection, today: str | None = None) -> CheckResul
     for key, r in existing.items():
         if key not in found_keys and not r["resolved"]:
             conn.execute(
-                "UPDATE data_issue SET resolved = 1, resolution = ? WHERE issue_id = ?",
-                (f"Проверка {today} больше не находит эту проблему", r["issue_id"]),
+                "UPDATE data_issue SET resolved = 1, resolution = ?, resolved_at = ? "
+                "WHERE issue_id = ?",
+                (f"Проверка {today} больше не находит эту проблему", now_utc(), r["issue_id"]),
             )
             closed += 1
     return CheckResult(added, known, closed)

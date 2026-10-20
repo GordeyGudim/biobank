@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% from "_macros.html" import utc, value %}
+{#- Пользователи сайта (только админ): список и форма «Новый пользователь». Правка ролей,
+    сброс пароля, закрыть/открыть вход — на странице пользователя. -#}
+{% block title %}Пользователи{% endblock %}
+{% block content %}
+<h1>Пользователи</h1>
+{% include "_password_note.html" %}
+<p>Роли складываются: у человека их может быть несколько. Админ управляет только
+  пользователями и данные не правит — для правки дайте себе ещё и роль «куратор».</p>
+
+<details class="edit-form entry-form" id="f-user"{% if error %} open{% endif %}>
+  <summary>Новый пользователь</summary>
+  <form method="post" action="{{ url_for('admin_user_new') }}">
+    {% if error %}<p class="field-error flash flash-error" id="f-user-error" role="alert">{{ error }}</p>{% endif %}
+    {% set described %}{% if error %} aria-describedby="f-user-error"{% endif %}{% endset %}
+    <div class="form-grid">
+      <div class="field">
+        <label for="f-user-login">Логин <abbr class="req" title="обязательное поле">*</abbr></label>
+        <input id="f-user-login" name="login" type="text" required autocomplete="off" autocapitalize="none"
+               spellcheck="false" value="{{ form.login or '' }}"{{ described }}>
+        <span class="hint">латиница, цифры, «.», «_», «-», например ivanova</span>
+      </div>
+      <div class="field">
+        <label for="f-user-name">Имя для подписи <abbr class="req" title="обязательное поле">*</abbr></label>
+        <input id="f-user-name" name="display_name" type="text" required value="{{ form.display_name or '' }}"{{ described }}>
+        <span class="hint">так будет в карточках: «Внёс(ла): Иванова А.»</span>
+      </div>
+    </div>
+    <fieldset class="checks">
+      <legend>Роли <abbr class="req" title="хотя бы одна">*</abbr></legend>
+      {% for role in roles %}
+      <div class="field check">
+        <input type="checkbox" id="f-user-role-{{ loop.index }}" name="roles" value="{{ role }}"{% if role in form.roles %} checked{% endif %}>
+        <label for="f-user-role-{{ loop.index }}">{{ role }}</label> <span class="hint">— {{ role_hints[role] }}</span>
+      </div>
+      {% endfor %}
+    </fieldset>
+    <fieldset class="radios">
+      <legend>Пароль</legend>
+      <input type="radio" id="f-user-pw-gen" name="password_mode" value="generate"{% if form.password_mode != 'manual' %} checked{% endif %}>
+      <label for="f-user-pw-gen">придумать временный (покажем один раз)</label>
+      <input type="radio" id="f-user-pw-manual" name="password_mode" value="manual"{% if form.password_mode == 'manual' %} checked{% endif %}>
+      <label for="f-user-pw-manual">ввести самому</label>
+    </fieldset>
+    <div class="field">
+      <label for="f-user-password">Пароль (если «ввести самому»)</label>
+      <input id="f-user-password" name="password" type="password" autocomplete="new-password"{{ described }}>
+      <span class="hint">не короче 10 символов; при первом входе пользователь сменит его</span>
+    </div>
+    <div class="buttons"><button type="submit">Создать пользователя</button></div>
+  </form>
+</details>
+
+<div class="table-wrap">
+  <table class="list">
+    <thead><tr>
+      <th scope="col">логин</th><th scope="col">имя</th><th scope="col">роли</th>
+      <th scope="col">вход</th><th scope="col">последний вход</th><th scope="col">создан</th>
+    </tr></thead>
+    <tbody>
+    {% for u in users %}
+      <tr{% if not u.is_active %} class="inactive"{% endif %}>
+        <td><a href="{{ url_for('admin_user', user_id=u.user_id) }}">{{ u.login }}</a></td>
+        <td>{{ u.display_name }}</td>
+        <td>{{ u.roles | sort | join(", ") }}</td>
+        <td>{% if u.is_active %}открыт{% if u.must_change_password %} <span class="small">(временный пароль)</span>{% endif %}{% else %}<strong>закрыт</strong>{% endif %}</td>
+        <td class="nowrap">{% if u.last_login_at %}{{ utc(u.last_login_at) }}{% else %}{{ value(none) }}{% endif %}</td>
+        <td class="nowrap">{{ utc(u.created_at) }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

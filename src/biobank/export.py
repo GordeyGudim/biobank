@@ -1,6 +1,11 @@
 """Выгрузка базы в Excel (xlsx) или CSV.
 
 Порядок листов: журнал проблем (data_issue) → сводные таблицы → все таблицы базы.
+
+Учётные записи сайта (app_user) выгружаются без данных для входа: только номер,
+имя для подписи, ссылка на человека, активна ли, когда создана (EXPORT_COLUMNS).
+Номер нужен, чтобы понять created_by в других таблицах; хеш пароля и логин в файл,
+который пересылают коллегам, попадать не должны.
 """
 
 from __future__ import annotations
@@ -22,11 +27,18 @@ HEADER_FILL = PatternFill("solid", fgColor="DDEBF7")
 
 # порядок таблиц в выгрузке: от справочников к данным; остальные — по алфавиту в конце
 TABLE_ORDER = (
-    "region", "city", "sampling_site", "capture_method", "gear", "species", "lab",
-    "expedition", "sampling_event", "trawling", "water_measurement",
+    "region", "city", "sampling_site", "capture_method", "gear", "species", "lab", "person",
+    "expedition", "expedition_member", "sampling_event", "trawling", "water_measurement",
     "specimen", "species_identification", "sample", "sample_shipment", "analysis",
-    "catch_record",
+    "catch_record", "app_user", "user_role", "change_log",
 )  # fmt: skip
+
+# Таблицы, у которых выгружаются только перечисленные колонки (остальные — все).
+# Список «что можно», а не «что нельзя»: новая колонка app_user (например, токен
+# сброса пароля) в выгрузку не попадёт, пока её не добавят сюда явно.
+EXPORT_COLUMNS = {
+    "app_user": ("user_id", "display_name", "person_id", "is_active", "created_at"),
+}
 
 
 def export_sheets(conn: sqlite3.Connection) -> list[tuple[str, str]]:
@@ -35,8 +47,11 @@ def export_sheets(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     sheets += list(SUMMARY_QUERIES.items())
     tables = [t for t in list_tables(conn) if t != "data_issue"]
     ordered = [t for t in TABLE_ORDER if t in tables] + sorted(set(tables) - set(TABLE_ORDER))
-    # имена таблиц берутся из самой базы (sqlite_master), а не от пользователя
-    sheets += [(table, f"SELECT * FROM {table}") for table in ordered]
+    # имена таблиц — из самой базы (sqlite_master), колонки — из EXPORT_COLUMNS в коде;
+    # данные пользователя в текст запроса не попадают
+    for table in ordered:
+        columns = ", ".join(EXPORT_COLUMNS.get(table, ("*",)))
+        sheets.append((table, f"SELECT {columns} FROM {table}"))
     return sheets
 
 

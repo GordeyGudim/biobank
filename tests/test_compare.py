@@ -213,7 +213,8 @@ def test_specimen_added_through_entry(old, db_path):
     diff = differences(old, db_path)
     assert diff["specimen"] == (1, 0)
     assert diff["species_identification"] == (1, 0)
-    assert set(diff) <= {"specimen", "species_identification", "data_issue"}
+    assert diff["change_log"] == (2, 0)  # «создание» особи и её определения вида
+    assert set(diff) <= {"specimen", "species_identification", "data_issue", "change_log"}
 
 
 def test_tl_edit_and_sample_moved(old, db_path):

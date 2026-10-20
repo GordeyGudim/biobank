@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import section_table %}
+{% from "_macros.html" import section_table, added_by, history_block %}
 {#- Карточка выезда (browse.event_card): все разделы, все колонки, даже пустые.
     Строки таблицы «Траления» имеют id trawling-N — на них ведут ссылки «траление» из карточек особей.
     Под сведениями о выезде — формы ввода: траление (только у выезда-траления), замер воды,
@@ -9,13 +9,16 @@
 <p class="crumbs"><a href="{{ url_for('expeditions') }}">Экспедиции</a> /
   <a href="{{ url_for('expedition', expedition_id=ids.expedition_id) }}">экспедиция</a> /</p>
 <h1>Выезд {{ title }}</h1>
+{{ added_by(record) }}
 <p class="record-actions">
-  <a class="button-link" href="{{ url_for('record_edit', kind_name='event', record_id=event_id) }}">Изменить выезд</a>
-  <a class="button-link danger" href="{{ url_for('record_delete', kind_name='event', record_id=event_id) }}">Удалить выезд</a>
+  {% if may("event", event_id, UPDATE) %}<a class="button-link" href="{{ url_for('record_edit', kind_name='event', record_id=event_id) }}">Изменить выезд</a>{% endif %}
+  {% if may("event", event_id, DELETE) %}<a class="button-link danger" href="{{ url_for('record_delete', kind_name='event', record_id=event_id) }}">Удалить выезд</a>{% endif %}
+  {% if can(CREATE, "data_issue") %}<a href="{{ url_for('issue_new', table_name='sampling_event', record_id=event_id, object_label=title) }}">Сообщить о проблеме →</a>{% endif %}
 </p>
 <p><a href="{{ url_for('specimens', expedition=ids.expedition_id, event=event_id) }}">Особи этого выезда — списком с фильтрами</a></p>
 {{ section_table(views[0]) }}
 
+{% if can(CREATE, "specimen") %}
 <section class="section edits" id="entry">
   <h2>Добавить</h2>
   <p><a class="button-link" href="{{ url_for('specimen_batch', event_id=event_id) }}">Ввести несколько особей</a>
@@ -26,6 +29,8 @@
   {% include "_form_water.html" %}
   {% include "_form_catch.html" %}
 </section>
+{% endif %}
 
 {% for view in views[1:] %}{{ section_table(view) }}{% endfor %}
+{{ history_block(history, history_link) }}
 {% endblock %}

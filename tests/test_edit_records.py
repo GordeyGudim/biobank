@@ -252,12 +252,13 @@ def test_update_site_same_name_is_duplicate(rec_db):
 # ---------------------------------------------------------------------------
 
 
-def test_update_event_date_extends_expedition(rec_db, trawl_event):
+def test_update_event_date_recomputes_expedition(rec_db, trawl_event):
+    """Даты экспедиции — min/max дат её выездов: единственный выезд сдвинули — и даты тоже."""
     result = records.update_event(rec_db, trawl_event, event_date="2026-09-05", notes="правка")
     row = browse.get_record(rec_db, "event", trawl_event)
     assert (row["event_date"], row["notes"]) == ("2026-09-05", "правка")
     exp = one(rec_db, "SELECT date_start, date_end FROM expedition WHERE name = 'Кантхо 2027'")
-    assert tuple(exp) == ("2026-09-01", "2026-09-05")
+    assert tuple(exp) == ("2026-09-05", "2026-09-05")
     assert "дата «2026-09-01» → «2026-09-05»" in result.message
 
 
@@ -491,9 +492,9 @@ def test_update_specimen_move_to_other_event(rec_db, trawl_event):
 
 def test_update_sample(rec_db):
     sample = entry.add_sample(rec_db, "1 pc", "ДНК", sample_label="1 pc dna").record_id
-    records.update_sample(rec_db, sample, sample_type="гистология", organ="печень", label="1 pc a")
+    records.update_sample(rec_db, sample, sample_type="гистология", organ="почки", label="1 pc a")
     row = browse.get_record(rec_db, "sample", sample)
-    assert (row["sample_type"], row["organ"], row["label"]) == ("гистология", "печень", "1 pc a")
+    assert (row["sample_type"], row["organ"], row["label"]) == ("гистология", "почки", "1 pc a")
     records.update_sample(rec_db, sample, label="")  # пусто — номер особи
     assert browse.get_record(rec_db, "sample", sample)["label"] == "1 pc"
     expect_error(rec_db, "уже есть у особи 26 ph", records.update_sample, sample, label="26 ph")
@@ -906,8 +907,11 @@ def test_get_issue(ro):
     assert (issue["object_label"], issue["resolved"]) == ("155 pc", 0)
     assert set(issue) == {
         "issue_id", "category", "table_name", "record_id", "sheet_name", "cell",
-        "object_label", "raw_value", "description", "resolved", "resolution",
+        "object_label", "raw_value", "description", "source", "resolved", "resolution",
+        "resolved_at", "created_by", "created_at", "created_by_name", "resolved_by",
+        "resolved_by_name",
     }  # fmt: skip
+    assert issue["source"] == "импорт" and issue["resolved_at"] is None
     with pytest.raises(NotFoundError, match="999999"):
         browse.get_issue(ro, 999999)
 

@@ -43,6 +43,10 @@
   </td>
   {% endfor %}
   <td>
+    <label class="visually-hidden" for="{{ p }}identified_by">Строка {{ i }}: кто определил</label>
+    <input type="text" id="{{ p }}identified_by" name="{{ p }}identified_by" value="{{ row.identified_by }}" size="12" list="batch-people" autocomplete="off">
+  </td>
+  <td>
     <label class="visually-hidden" for="{{ p }}notes">Строка {{ i }}: примечание</label>
     <input type="text" id="{{ p }}notes" name="{{ p }}notes" value="{{ row.notes }}" size="14">
   </td>

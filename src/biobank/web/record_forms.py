@@ -20,6 +20,9 @@
 «Проверить» — entry.check_specimens (только чтение), «Сохранить» — entry.create_specimens
 (всё или ничего). Мягкие предупреждения — как у одиночной формы: «Всё равно сохранить».
 
+Права: страницы /edit/… и /delete/… без права на эту запись — 403 (auth.need по
+permissions.can с записью из browse.get_record: исследователь правит только свои записи);
+окончательно права проверяет сама функция записи. Кнопки в карточках — по record_permit.
 Все записи — только POST через edit.apply_edit (резервная копия + транзакция), после
 успеха — redirect (POST/redirect), ошибки — у формы, введённое не теряется.
 Здесь нет SQL и правил предметной области: только «какие поля показать и как их назвать».
@@ -32,13 +35,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from urllib.parse import unquote, urlsplit
 
-from flask import Flask, abort, current_app, flash, render_template, request, url_for
+from flask import Flask, abort, g, render_template, request, url_for
 
 from biobank import browse, entry, records
-from biobank.edit import EditError, NotFoundError, apply_edit, event_title
+from biobank.edit import EditError, NotFoundError, event_title
 from biobank.parsing import ORGANS
+from biobank.permissions import CREATE, DELETE, UPDATE
+from biobank.web.auth import allowed, flash_result, need, run_edit
 from biobank.web.entry_forms import confirmed, go
-from biobank.web.views import local_path
+from biobank.web.views import KIND_TABLES, local_path, ru_date
 
 # ---------------------------------------------------------------------------
 # Поля форм правки
@@ -78,6 +83,7 @@ class Kind:
     """Вид записи на сайте: как её найти, назвать, править и удалять.
 
     record — вид для browse.get_record; title — как называть («траление»);
+    таблица базы (для прав и истории изменений) — views.KIND_TABLES[вид];
     update / delete — функции records.py (update=None — правки нет, только удаление);
     together — что удаляется вместе с записью (правило records.py, для вопроса «Вы уверены?»).
     """
@@ -220,6 +226,27 @@ KINDS: dict[str, Kind] = {
 }  # fmt: skip
 
 
+def record_permit(kind_name: str, record_id: int, action: str) -> bool:
+    """Можно ли вошедшему действие (изменение / удаление) с записью — для кнопок.
+
+    Сначала без записи: куратору можно всё, читателю и админу — ничего, тогда база не
+    нужна. Иначе (исследователь: только свои записи) — запись из базы (browse.get_record,
+    created_by), один раз на запрос.
+    """
+    table = KIND_TABLES[kind_name]
+    if allowed(action, table):
+        return True
+    if not allowed(CREATE, table):  # не может менять данные вообще (читатель, админ)
+        return False
+    cache = g.setdefault("records", {})
+    key = (kind_name, record_id)
+    if key not in cache:
+        from biobank.web.app import read_db  # app.py импортирует этот модуль — здесь, не вверху
+
+        cache[key] = browse.get_record(read_db(), KINDS[kind_name].record, record_id)
+    return allowed(action, table, cache[key])
+
+
 def as_text(value) -> str:
     """Значение из базы → текст поля формы: None — пусто, 29.9 → '29.9', 3 → '3'.
 
@@ -265,6 +292,12 @@ def read_form(kind: Kind) -> tuple[dict[str, str], dict[str, str]]:
     return values, old
 
 
+def event_choice(e: dict) -> str:
+    """Подпись выезда в списке выбора: «Точка 1, 25.09.2025 — Участок у Кантхо»."""
+    date = f", {ru_date(e['event_date'])}" if e["source_sheet"] else ""
+    return f"{e['title']}{date} — {e['site']}"
+
+
 def build_choices(conn, kind: Kind, record: dict) -> dict[str, list[tuple[str, str]]]:
     """Варианты для полей выбора и подсказки (datalist) — только для полей этого вида."""
     keys = {f.choices for f in kind.fields if f.choices} | {
@@ -286,11 +319,7 @@ def build_choices(conn, kind: Kind, record: dict) -> dict[str, list[tuple[str, s
             ]
         elif key == "event_id":
             # у выездов из Excel title — лист, у введённых вручную — «№25 от <даты>»
-            out[key] = [
-                (str(e["event_id"]), e["title"] + (f", {e['event_date']}" if e["source_sheet"]
-                                                   else "") + f" — {e['site']}")
-                for e in browse.list_events(conn)
-            ]  # fmt: skip
+            out[key] = [(str(e["event_id"]), event_choice(e)) for e in browse.list_events(conn)]
         elif key == "trawl_no":
             out[key] = [
                 (str(t["trawl_no"]), f"№{t['trawl_no']}" + (f", {t['time_start']}"
@@ -319,7 +348,7 @@ def display_rows(conn, kind_name: str, kind: Kind, record: dict) -> list[tuple[s
             ("метод", record["method"]),
             ("уверенность", record["confidence"]),
             ("дата", record["identified_on"]),
-            ("кто определил", record["identified_by"]),
+            ("кто определил", record["identified_by_name"]),
             ("в таблице записано", record["raw_text"]),
             ("примечания", record["notes"]),
         ]
@@ -483,10 +512,10 @@ BATCH_TEXT = {
 }
 BATCH_CHECKS = {"is_dead": "мёртвая", "dna": "ДНК", "smear": "мазок крови"}
 BATCH_FIELDS = ("label", "species", "tl_cm", "sl_cm", "mass_g", "mass_gutted_g", "trawl_no",
-                "is_dead", "notes", "dna", "smear")  # fmt: skip
+                "is_dead", "identified_by", "notes", "dna", "smear")  # fmt: skip
 # Поля строки, которые передаются в entry.py как есть (галочки образцов — отдельно)
 BATCH_PASSED = ("label", "species", "tl_cm", "sl_cm", "mass_g", "mass_gutted_g", "trawl_no",
-                "is_dead", "notes")  # fmt: skip
+                "is_dead", "identified_by", "notes")  # fmt: skip
 # Образцы галочками → тип образца (метка — номер особи, фиксация не указана: не угадываем)
 BATCH_SAMPLES = {"dna": "ДНК", "smear": "мазок крови"}
 BATCH_START_ROWS = 10  # пустых строк в новой таблице и на кнопке «Ещё строки»
@@ -501,6 +530,11 @@ class RowStatus:
     auto: bool = False  # номер подобран («авто»)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+def people_names(conn) -> list[str]:
+    """Имена из справочника людей — подсказки (datalist) для поля «кто определил»."""
+    return list(dict.fromkeys(p["full_name"] for p in browse.list_people(conn)))
 
 
 def empty_row() -> dict[str, str]:
@@ -616,6 +650,7 @@ def register_record_routes(app: Flask, pages) -> None:
             abort(404)
         conn = pages.read_db()
         rec = browse.get_record(conn, kind.record, record_id)  # нет записи — 404
+        need(UPDATE, KIND_TABLES[kind_name], rec)  # нет права на эту запись — 403
         if request.method == "GET":
             values = record_values(kind, rec)
             return edit_page(kind_name, kind, rec, values, dict(values))
@@ -631,18 +666,16 @@ def register_record_routes(app: Flask, pages) -> None:
             options = {"new_region": request.form.get("new_region") == "1",
                        "allow_nearby": request.form.get("allow_nearby") == "1"}  # fmt: skip
 
-        def action(c):
-            return kind.update(c, record_id, **changes, **options)
+        def action(c, user):
+            return kind.update(c, record_id, **changes, **options, user=user)
 
         try:
-            result = apply_edit(current_app.config["DB_PATH"], action)
+            result = run_edit(action)
         except NotFoundError:
             raise
         except EditError as error:
             return edit_page(kind_name, kind, rec, values, old, str(error), 400)
-        flash(result.message, "ok")
-        for warning in result.warnings:
-            flash(f"Внимание: {warning}", "warn")
+        flash_result(result)
         # туда, откуда пришли; номер особи мог измениться — запись берём заново
         after = browse.get_record(conn, kind.record, record_id)
         return go(after_edit_url(conn, kind_name, rec, after, requested_next()))
@@ -662,14 +695,12 @@ def register_record_routes(app: Flask, pages) -> None:
         if request.form.get("confirm") != "1":
             return page(None, 200)
         try:
-            result = apply_edit(current_app.config["DB_PATH"], action)
+            result = run_edit(action)
         except NotFoundError:
             raise
         except EditError as error:  # есть зависимые записи и т.п. — база не изменена
             return page(str(error), 400)
-        flash(result.message, "ok")
-        for warning in result.warnings:
-            flash(f"Внимание: {warning}", "warn")
+        flash_result(result)
         return go(success_url)
 
     @app.route("/delete/<kind_name>/<int:record_id>", methods=["GET", "POST"],
@@ -679,6 +710,7 @@ def register_record_routes(app: Flask, pages) -> None:
         kind = kind_or_404(kind_name)
         conn = pages.read_db()
         rec = browse.get_record(conn, kind.record, record_id)  # нет записи — 404
+        need(DELETE, KIND_TABLES[kind_name], rec)  # нет права на эту запись — 403
         # всё, что нужно показать и куда вернуться, — до удаления: потом записи уже нет
         title = record_title(conn, kind_name, rec)
         rows = display_rows(conn, kind_name, kind, rec)
@@ -692,16 +724,18 @@ def register_record_routes(app: Flask, pages) -> None:
 
         if request.method == "GET":
             return page(None, 200)
-        return delete(lambda c: kind.delete(c, record_id), success, page)
+        return delete(lambda c, user: kind.delete(c, record_id, user=user), success, page)
 
     @app.route("/delete/shipment/<int:sample_id>/<int:lab_id>", methods=["GET", "POST"])
     def shipment_delete(sample_id: int, lab_id: int):
         """Удалить отметку «образец отправлен в лабораторию» (у отправки нет своего id)."""
+        need(CREATE, "sample_shipment")  # читатель, админ — 403 сразу, до поиска записи
         conn = pages.read_db()
         shipments = browse.list_shipments(conn, sample_id)  # нет образца — 404
         shipment = next((s for s in shipments if s["lab_id"] == lab_id), None)
         if shipment is None:
             raise NotFoundError(f"Отправки образца №{sample_id} в лабораторию №{lab_id} нет.")
+        need(DELETE, "sample_shipment", shipment)
         sample = browse.get_record(conn, "sample", sample_id)
         title = f"отметка об отправке: {record_title(conn, 'sample', sample)} → {shipment['lab']}"
         rows = [
@@ -718,7 +752,9 @@ def register_record_routes(app: Flask, pages) -> None:
 
         if request.method == "GET":
             return page(None, 200)
-        return delete(lambda c: records.delete_shipment(c, sample_id, lab_id), back, page)
+        return delete(
+            lambda c, user: records.delete_shipment(c, sample_id, lab_id, user=user), back, page
+        )
 
     # ---- пакетный ввод особей ----
 
@@ -738,11 +774,13 @@ def register_record_routes(app: Flask, pages) -> None:
             trawls=browse.event_trawls(conn, event_id),
             text_fields=BATCH_TEXT,
             checks=BATCH_CHECKS,
+            people=people_names(conn),
         ), status
 
     @app.route("/events/<int:event_id>/specimens/batch", methods=["GET", "POST"])
     def specimen_batch(event_id: int):
         """Таблица-форма для нескольких особей: проверить (только чтение) и сохранить."""
+        need(CREATE, "specimen")
         if request.method == "GET":
             return batch_page(event_id, [empty_row() for _ in range(BATCH_START_ROWS)])
         rows = read_batch_rows() or [empty_row()]
@@ -770,11 +808,11 @@ def register_record_routes(app: Flask, pages) -> None:
         if warnings and not confirmed(warnings):
             return batch_page(event_id, rows, statuses, warnings=warnings)
 
-        def action(c):
-            return entry.create_specimens(c, event_id, [backend_row(r) for r in rows])
+        def action(c, user):
+            return entry.create_specimens(c, event_id, [backend_row(r) for r in rows], user=user)
 
         try:
-            result = apply_edit(current_app.config["DB_PATH"], action)
+            result = run_edit(action)
         except NotFoundError:
             raise
         except entry.BatchError as error:  # кто-то успел занять номер и т.п.
@@ -783,9 +821,7 @@ def register_record_routes(app: Flask, pages) -> None:
             return batch_page(event_id, rows, statuses, message, batch_warnings(statuses), 400)
         except EditError as error:
             return batch_page(event_id, rows, statuses, str(error), warnings, 400)
-        flash(result.message, "ok")
-        for warning in result.warnings:
-            flash(f"Внимание: {warning}", "warn")
+        flash_result(result)
         return go(url_for("event", event_id=event_id))
 
     @app.get("/events/<int:event_id>/specimens/batch/row")

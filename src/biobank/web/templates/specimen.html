@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import section_table %}
+{% from "_macros.html" import section_table, added_by, history_block %}
 {#- views — разделы specimen_card со ссылками (views.section_views): первый — «Особь»
     (поле — значение), последний — проблемы из журнала (особь и её выезд).
     Всё содержимое — в блоке #card: формы правки (HTMX) берут из ответа сервера только его
@@ -11,9 +11,12 @@
 <p class="crumbs"><a href="{{ url_for('specimens') }}">Особи</a> /
   <a href="{{ url_for('specimens', expedition=ids.expedition_id, event=ids.event_id) }}">все особи этого выезда</a></p>
 <h1>Особь {{ label }}</h1>
-{#- «Изменить» — номер, выезд, траление, пол… (промеры и вид — своими формами ниже) -#}
+{{ added_by(record) }}
+{#- «Изменить» — номер, выезд, траление, пол… (промеры и вид — своими формами ниже).
+    Кнопки — только если есть права (исследователь — у своих записей, куратор — у всех). -#}
 <p class="record-actions">
   {% for text, url in own_actions %}<a class="button-link{% if text == 'Удалить' %} danger{% endif %}" href="{{ url }}">{{ text }} {{ "сведения об особи" if text == "Изменить" else "особь" }}</a>{% endfor %}
+  {% if can(CREATE, "data_issue") %}<a href="{{ url_for('issue_new', table_name='specimen', record_id=ids.specimen_id, object_label=label) }}">Сообщить о проблеме →</a>{% endif %}
 </p>
 {% set issues = views[-1].section %}
 {% set status = issues.columns.index("статус") %}
@@ -24,36 +27,43 @@
 {% endif %}
 {{ section_table(views[0]) }}
 
+{% set may_update = may("specimen", ids.specimen_id, UPDATE) %}
+{% set may_add = can(CREATE, "sample") %}
+{% if may_update or may_add or link_error or identify_error or submitted %}
 <section class="section edits" id="edits">
   <h2>Изменить</h2>
   {% include "_flashes.html" %}
   <p class="small">Перед каждой записью делается резервная копия базы. Изменения проверяются;
     если что-то не так — база не меняется, а причина написана у формы.</p>
   {#- особь получена не тралением (рынок, рыбак, аквахозяйство) — привязывать не к чему -#}
-  {% if is_trawled or link_error %}{% include "_link_trawl_form.html" %}{% endif %}
-  {% include "_identify_form.html" %}
-  {% include "_form_measurements.html" %}
-  {% include "_form_sample.html" %}
-  {% include "_form_ship.html" %}
+  {% if (is_trawled and may_update) or link_error %}{% include "_link_trawl_form.html" %}{% endif %}
+  {% if can(CREATE, "species_identification") %}{% include "_identify_form.html" %}{% endif %}
+  {% if may_update %}{% include "_form_measurements.html" %}{% endif %}
+  {% if may_add %}{% include "_form_sample.html" %}{% endif %}
+  {% if can(CREATE, "sample_shipment") %}{% include "_form_ship.html" %}{% endif %}
   {% if shipments %}
   <details class="edit-form" id="shipments">
     <summary>Отметки об отправке в лаборатории</summary>
     <p class="small">Ошибочную отметку можно удалить (сам образец останется).</p>
     <ul class="links">
       {% for sample, sh in shipments %}
-      <li>{{ sample["метка"] }} ({{ sample["тип"] }}) → {{ sh.lab }}{% if sh.sent_on %}, {{ sh.sent_on }}{% endif %}
+      <li>{{ sample["метка"] }} ({{ sample["тип"] }}) → {{ sh.lab }}{% if sh.sent_on %}, {{ sh.sent_on | ru_date }}{% endif %}
         <a class="button-link small-button danger" href="{{ url_for('shipment_delete', sample_id=sh.sample_id, lab_id=sh.lab_id) }}">Удалить отметку</a></li>
       {% endfor %}
     </ul>
   </details>
   {% endif %}
+  {% if can(CREATE, "specimen") %}
   <p><a href="{{ url_for('event', event_id=ids.event_id, form='specimen', _anchor='f-specimen') }}">Ввести ещё одну особь этого выезда →</a>
     · <a href="{{ url_for('specimen_batch', event_id=ids.event_id) }}">ввести несколько особей таблицей →</a></p>
+  {% endif %}
 </section>
+{% endif %}
 
 {% for view in views[1:] %}
   {% if loop.last %}{{ section_table(view, html_id="issues") }}
   {% else %}{{ section_table(view) }}{% endif %}
 {% endfor %}
+{{ history_block(history, history_link) }}
 </div>
 {% endblock %}

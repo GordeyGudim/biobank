@@ -266,6 +266,84 @@ CONSTRAINTS = [
         "SELECT sample_id, lab_id FROM sample_shipment LIMIT 1",
         "UNIQUE constraint failed: sample_shipment.sample_id, sample_shipment.lab_id",
     ),
+    (
+        "вторая пробирка с той же меткой у особи (тот же тип и орган)",
+        "INSERT INTO sample (specimen_id, sample_type, organ, label) "
+        "SELECT specimen_id, sample_type, organ, label FROM sample WHERE organ IS NOT NULL LIMIT 1",
+        "UNIQUE constraint failed: index 'ux_sample_label'",
+    ),
+    (
+        "вторая пробирка с той же меткой, орган пустой (ifnull в индексе)",
+        "INSERT INTO sample (specimen_id, sample_type, label) "
+        "SELECT specimen_id, sample_type, label FROM sample WHERE organ IS NULL "
+        "AND label IS NOT NULL LIMIT 1",
+        "UNIQUE constraint failed: index 'ux_sample_label'",
+    ),
+    # --- STRICT (v3): тип значения должен совпадать с типом колонки ---
+    (
+        "текст в REAL (промер «21,3 см»)",
+        "UPDATE specimen SET tl_cm = '21,3 см' WHERE label = '155 pc'",
+        "cannot store TEXT value in REAL column specimen.tl_cm",
+    ),
+    (
+        "дробное в INTEGER (номер траления)",
+        "UPDATE trawling SET trawl_no = 1.5 WHERE trawling_id = (SELECT min(trawling_id) "
+        "FROM trawling)",
+        "cannot store REAL value in INTEGER column trawling.trawl_no",
+    ),
+    (
+        "текст в ссылку INTEGER (кто определил — имя вместо номера человека)",
+        "UPDATE species_identification SET identified_by = 'Иванов' "
+        "WHERE identification_id = (SELECT min(identification_id) FROM species_identification)",
+        "cannot store TEXT value in INTEGER column species_identification.identified_by",
+    ),
+    # --- CHECK (v3): формат дат, времени, флагов, источника записи журнала ---
+    (
+        "дата не в ISO («25.09.25»)",
+        "UPDATE sampling_event SET event_date = '25.09.25' "
+        "WHERE event_id = (SELECT min(event_id) FROM sampling_event)",
+        "CHECK constraint failed",
+    ),
+    (
+        "несуществующая дата (30 февраля)",
+        "UPDATE sampling_event SET event_date = '2025-02-30' "
+        "WHERE event_id = (SELECT min(event_id) FROM sampling_event)",
+        "CHECK constraint failed",
+    ),
+    (
+        "время вне суток («25:10»)",
+        "UPDATE trawling SET time_start = '25:10' "
+        "WHERE trawling_id = (SELECT min(trawling_id) FROM trawling)",
+        "CHECK constraint failed",
+    ),
+    (
+        "время без двоеточия («10.48»)",
+        "UPDATE trawling SET time_start = '10.48' "
+        "WHERE trawling_id = (SELECT min(trawling_id) FROM trawling)",
+        "CHECK constraint failed",
+    ),
+    (
+        "отметка времени не в формате схемы",
+        "UPDATE specimen SET created_at = '2026-10-20T10:00:00' WHERE label = '155 pc'",
+        "CHECK constraint failed",
+    ),
+    (
+        "is_dead не 0/1",
+        "UPDATE specimen SET is_dead = 2 WHERE label = '155 pc'",
+        "CHECK constraint failed",
+    ),
+    (
+        "resolved не 0/1",
+        "UPDATE data_issue SET resolved = 2 "
+        "WHERE issue_id = (SELECT min(issue_id) FROM data_issue)",
+        "CHECK constraint failed",
+    ),
+    (
+        "источник записи журнала вне списка",
+        "UPDATE data_issue SET source = 'Excel' "
+        "WHERE issue_id = (SELECT min(issue_id) FROM data_issue)",
+        "CHECK constraint failed",
+    ),
     # --- NOT NULL ---
     (
         "особь без номера",
@@ -356,6 +434,32 @@ def test_schema_constraint_rejects_bad_value(conn, copy_path, sql, error):
     assert dump(copy_path) == before
 
 
+def test_unknown_role_rejected(conn, copy_path):
+    """Роль пользователя — только из списка схемы: читатель, исследователь, куратор, админ."""
+    with conn:
+        user = conn.execute(
+            "INSERT INTO app_user (login, password_hash, display_name, created_at) "
+            "VALUES ('ivanova', 'scrypt$…', 'Иванова А.', '2026-10-20 10:00:00')"
+        ).lastrowid
+        conn.execute("INSERT INTO user_role (user_id, role) VALUES (?, 'куратор')", (user,))
+    before = dump(copy_path)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        with conn:
+            conn.execute("INSERT INTO user_role (user_id, role) VALUES (?, 'бог')", (user,))
+    assert dump(copy_path) == before
+
+
+def test_same_label_allowed_for_other_sample_types(conn):
+    """ДНК, мазок и кишечник одной особи по традиции Excel носят одну метку («26 ph») —
+    это не дубль: уникальность — в пределах особи, типа образца и органа."""
+    groups = count(
+        conn,
+        "SELECT count(*) FROM (SELECT specimen_id, label FROM sample WHERE label IS NOT NULL "
+        "GROUP BY specimen_id, label HAVING count(DISTINCT sample_type) > 1)",
+    )
+    assert groups > 0
+
+
 def test_missing_measurements_are_allowed(conn):
     """Граничный случай: промеры NULL допустимы («целая рыба» — промеров нет),
     CHECK (tl_cm > 0) на NULL не срабатывает."""
@@ -371,9 +475,9 @@ def test_missing_measurements_are_allowed(conn):
 
 
 def test_imported_numeric_columns_hold_numbers_not_text(db):
-    """SQLite (без STRICT) молча сохранит текст «29,9» в колонку REAL, а CHECK (tl_cm > 0)
-    для текста выполняется. Поэтому проверяем результат импорта: во всех колонках
-    REAL/INTEGER — только числа или NULL (в Excel 2026 сотни чисел записаны текстом)."""
+    """SQLite без STRICT молча сохранил бы текст «29,9» в колонку REAL. В схеме v3 таблицы
+    STRICT и база такое не примет, но проверка результата импорта остаётся: во всех
+    колонках REAL/INTEGER — только числа или NULL (в Excel 2026 сотни чисел текстом)."""
     tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
     text_values = {}
     for table in tables:

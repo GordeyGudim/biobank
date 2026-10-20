@@ -4,7 +4,7 @@
 {% block content %}
 <h1>Места</h1>
 <p>Место — точка сбора, не меняется между экспедициями; на одно место может быть несколько выездов.</p>
-{% include "_form_site.html" %}
+{% if can(CREATE, "sampling_site") %}{% include "_form_site.html" %}{% endif %}
 {% if sites %}
 <div class="table-wrap">
   <table class="list">
@@ -23,7 +23,7 @@
         <td>{{ value(s.region) }}</td>
         <td class="nowrap">{% if s.lat is not none %}{{ s.lat | cell }}, {{ s.lon | cell }}{% else %}{{ value(none) }}{% endif %}</td>
         <td class="num">{{ s.event_count }}</td>
-        <td class="nowrap">{% if s.first_date %}{{ s.first_date }}{% if s.last_date != s.first_date %} — {{ s.last_date }}{% endif %}{% else %}{{ value(none) }}{% endif %}</td>
+        <td class="nowrap">{% if s.first_date %}{{ s.first_date | ru_date }}{% if s.last_date != s.first_date %} — {{ s.last_date | ru_date }}{% endif %}{% else %}{{ value(none) }}{% endif %}</td>
         <td class="num"><a href="{{ url_for('specimens', site=s.site_id) }}" title="список особей места">{{ s.specimen_count }}</a></td>
       </tr>
     {% endfor %}

@@ -8,6 +8,7 @@ app.test_client() — «браузер понарошку»: отправляе�
 
 import hashlib
 import shutil
+import time
 from urllib.parse import quote
 
 import pytest
@@ -16,6 +17,7 @@ pytest.importorskip("flask")
 
 from conftest import SOURCE, count  # noqa: E402
 
+from biobank import users  # noqa: E402
 from biobank.__main__ import main  # noqa: E402
 from biobank.db import connect  # noqa: E402
 from biobank.web.app import create_app  # noqa: E402
@@ -25,16 +27,74 @@ pytestmark = pytest.mark.skipif(not SOURCE.exists(), reason="нет data/source.
 HTMX = {"HX-Request": "true"}  # так помечает свои запросы HTMX
 
 
-@pytest.fixture
-def path(db_path, tmp_path):
-    p = tmp_path / "output" / "biobank.db"
-    p.parent.mkdir()
+# Пользователи тестовой базы: логин → роли. Пароль у всех один (PASSWORD).
+WEB_USERS = {
+    "curator": ["куратор"],
+    "researcher": ["исследователь"],
+    "researcher2": ["исследователь"],
+    "reader": ["читатель"],
+    "admin": ["админ"],
+}
+PASSWORD = "длинный-пароль-1"
+
+
+@pytest.fixture(autouse=True)
+def clean_web_env(monkeypatch):
+    """Настройки сервера из окружения (BIOBANK_…) не должны влиять на тесты."""
+    for name in ("BIOBANK_SECRET_KEY", "BIOBANK_SECURE_COOKIES", "BIOBANK_TRUSTED_HOSTS",
+                 "BIOBANK_TRUSTED_PROXIES"):  # fmt: skip
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(scope="session")
+def web_db(db_path, tmp_path_factory):
+    """Импортированная база + пользователи (один раз на прогон: хеш пароля считается долго)."""
+    p = tmp_path_factory.mktemp("web") / "biobank.db"
     shutil.copy(db_path, p)
+    conn = connect(p)
+    try:
+        for login, roles in WEB_USERS.items():
+            users.create_user(conn, login, PASSWORD, f"Имя {login}", roles,
+                              must_change_password=False)  # fmt: skip
+    finally:
+        conn.close()
     return p
 
 
 @pytest.fixture
+def path(web_db, tmp_path):
+    p = tmp_path / "output" / "biobank.db"
+    p.parent.mkdir()
+    shutil.copy(web_db, p)
+    return p
+
+
+def user_id(path, login):
+    return db_value(path, "SELECT user_id FROM app_user WHERE login = ?", login)
+
+
+def login_as(client, path, login):
+    """Войти без формы входа: положить номер пользователя в сессию (как это делает /login).
+
+    session_transaction — тестовый клиент Flask открывает сессию (cookie) для правки."""
+    uid = user_id(path, login)
+    version = db_value(path, "SELECT session_version FROM app_user WHERE user_id = ?", uid)
+    with client.session_transaction() as s:
+        s["user_id"] = uid
+        s["v"] = version  # версия сессий: выход, смена пароля её меняют
+        s["seen"] = time.time()
+    return client
+
+
+@pytest.fixture
 def client(path):
+    """Вошедший куратор: может всё с данными — для тестов существующих страниц."""
+    return login_as(create_app(path).test_client(), path, "curator")
+
+
+@pytest.fixture
+def anon(path):
+    """Тестовый клиент без входа."""
     return create_app(path).test_client()
 
 
@@ -640,6 +700,10 @@ def test_identify_form_changes_db(client, path):
     html = client.get("/specimen/1").get_data(as_text=True)
     assert "Pangasius sp. → Pangasius elongatus" in html
     assert "<script>alert(1)</script>" not in html and "&lt;script&gt;" in html
+    # «кто определил» — человек из справочника person: имя в карточке и в подсказках формы
+    assert db_value(path, "SELECT full_name FROM person") == "лаборатория"
+    assert "<td>лаборатория</td>" in html
+    assert '<datalist id="id-people"><option value="лаборатория">' in html
 
 
 def test_identify_unidentified(client, path):
@@ -1787,3 +1851,71 @@ def test_sample_form_does_not_suggest_ethanol(client):
     """Фиксацию не подсказываем «этанолом 96%»: пусто — значит не указана."""
     html = client.get("/specimen/155pc").get_data(as_text=True)
     assert 'placeholder="этанол' not in html
+
+
+# --- вёрстка: страница не шире окна (таблицы прокручиваются в своей рамке) ---
+
+LAYOUT_PAGES = ["/", "/specimens", "/specimen/155pc", "/expeditions", "/expeditions/1",
+                "/events/1", "/sites", "/sites/1", "/trawlings/1", "/reports",
+                "/reports/species", "/issues", "/issues/1", "/issues/new", "/changes",
+                "/people", "/edit/specimen/1", "/delete/sample/1",
+                "/events/1/specimens/batch", "/history/specimen/1"]  # fmt: skip
+
+
+def tables_outside_wrap(html):
+    """Сколько <table> стоит не внутри <div class="table-wrap">.
+
+    HTMLParser (стандартная библиотека) идёт по тегам по порядку; держим стек открытых
+    div и смотрим, есть ли среди них .table-wrap в момент встречи <table>."""
+    from html.parser import HTMLParser
+
+    class Finder(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.divs, self.bad = [], 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "div":
+                self.divs.append("table-wrap" in (dict(attrs).get("class") or "").split())
+            elif tag == "table" and not any(self.divs):
+                self.bad += 1
+
+        def handle_endtag(self, tag):
+            if tag == "div" and self.divs:
+                self.divs.pop()
+
+    f = Finder()
+    f.feed(html)
+    return f.bad
+
+
+@pytest.mark.parametrize("url", LAYOUT_PAGES)
+def test_tables_are_inside_scroll_wrap(client, url):
+    """Широкая таблица вне .table-wrap раздвигает всю страницу вправо (на телефоне — сразу)."""
+    r = client.get(url)
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert tables_outside_wrap(html) == 0
+
+
+def test_tables_outside_wrap_counts():
+    assert tables_outside_wrap('<div class="table-wrap"><div><table></table></div></div>') == 0
+    assert tables_outside_wrap('<div class="table-wrap"></div><table></table>') == 1
+    assert tables_outside_wrap('<div class="x"><table></table></div>') == 1
+
+
+def test_admin_tables_are_inside_scroll_wrap(path):
+    c = login_as(create_app(path).test_client(), path, "admin")
+    for url in ("/admin/users", f"/admin/users/{user_id(path, 'curator')}"):
+        r = c.get(url)
+        assert r.status_code == 200 and "<table" in r.get_data(as_text=True)
+        assert tables_outside_wrap(r.get_data(as_text=True)) == 0
+
+
+def test_visually_hidden_size_cannot_be_overridden(client):
+    """Скрытая подпись поиска в шапке получала width: 100% от «.search label» и уезжала
+    за правый край окна — у всех страниц была прокрутка вправо. Размер 1px — с !important."""
+    css = client.get("/static/style.css").get_data(as_text=True)
+    rule = css.split(".visually-hidden {", 1)[1].split("}", 1)[0]
+    assert "width: 1px !important" in rule
+    assert "position: relative" in css.split(".table-wrap {", 1)[1].split("}", 1)[0]

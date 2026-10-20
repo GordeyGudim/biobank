@@ -20,6 +20,9 @@ from pathlib import Path
 # src/biobank/db.py → parents[2] = корень репозитория
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = PROJECT_ROOT / "db" / "schema.sql"
+# Версия схемы, под которую написан код (= PRAGMA user_version в db/schema.sql; тест следит).
+# Копию с другой версией restore не восстанавливает: код с ней работать не умеет.
+SCHEMA_VERSION = 3
 DEFAULT_DB_PATH = PROJECT_ROOT / "output" / "biobank.db"
 
 # Сколько ждать, если базу сейчас пишет другой (сайт, вторая команда): 5 с, а не сразу
@@ -33,6 +36,17 @@ class DatabaseBusyError(sqlite3.OperationalError):
 
 class LiveDatabaseError(Exception):
     """База отмечена как рабочая (go-live) — пересоздавать её (import, init) нельзя."""
+
+
+def now_utc() -> str:
+    """Текущее время в UTC в формате схемы для колонок …_at: 'ГГГГ-ММ-ДД ЧЧ:ММ:СС'.
+
+    Схема проверяет формат (CHECK datetime(x) IS x): '2026-10-20T10:00:00+00:00' не примет.
+
+    >>> len(now_utc()), now_utc()[4], now_utc()[10]
+    (19, '-', ' ')
+    """
+    return dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -79,11 +93,20 @@ _SETTING_PRAGMAS = {
 }  # fmt: skip
 
 
+# Колонки, которые подключение на чтение не отдаёт: вместо значения — NULL (SQLITE_IGNORE).
+# Хеш пароля не нужен ни команде sql, ни сайту, ни отчётам; вход (users.authenticate)
+# читает его через обычное подключение connect().
+HIDDEN_COLUMNS = {("app_user", "password_hash")}
+
+
 def _read_only_authorizer(action, arg1, arg2, db_name, trigger) -> int:
-    """Разрешить только чтение (см. пояснение выше).
+    """Разрешить только чтение (см. пояснение выше); скрытые колонки читаются как NULL.
 
     Для PRAGMA arg1 — имя, arg2 — значение: «PRAGMA foreign_keys = OFF» → ('foreign_keys', 'OFF').
+    Для чтения колонки (SQLITE_READ) arg1 — таблица, arg2 — колонка.
     """
+    if action == sqlite3.SQLITE_READ and (arg1, arg2) in HIDDEN_COLUMNS:
+        return sqlite3.SQLITE_IGNORE
     if action in _READ_ACTIONS:
         return sqlite3.SQLITE_OK
     if action == sqlite3.SQLITE_PRAGMA:
@@ -554,8 +577,8 @@ def run_backup(
 # из Excel (import, init) нельзя. Пометка хранится в заголовке самого файла базы —
 # в числе PRAGMA application_id (4 байта, «какой программе принадлежит файл»).
 # Поэтому она путешествует вместе с файлом: копия (backup) и восстановление из копии
-# тоже помечены. Таблиц и колонок не добавляет. user_version не используем — он
-# пригодится для номера версии схемы при миграциях (этап D3).
+# тоже помечены. Таблиц и колонок не добавляет. user_version не используем — в нём
+# номер версии схемы (SCHEMA_VERSION).
 
 LIVE_APPLICATION_ID = 0x42424C56  # байты «BBLV»: BioBank, LiVe
 
@@ -763,12 +786,33 @@ class PreparedRestore:
         self.discard()
 
 
+def schema_version_message(source: Path | str, version: int) -> str:
+    """Почему копию другой версии схемы восстанавливать нельзя.
+
+    >>> print(schema_version_message("old.db", 0))  # doctest: +ELLIPSIS
+    Копия old.db — схема версии 0 (до v3: user_version не задан), а программа работает со ...
+    """
+    shown = f"{version} (до v3: user_version не задан)" if version == 0 else str(version)
+    text = (
+        f"Копия {source} — схема версии {shown}, а программа работает со схемой "
+        f"версии {SCHEMA_VERSION}. "
+    )
+    if version < SCHEMA_VERSION:
+        return text + (
+            "Такую копию нельзя восстановить напрямую: сначала её нужно перевести на новую "
+            "схему (миграция) — это отдельная работа. Возьмите копию, сделанную после перехода."
+        )
+    return text + "Копия сделана более новой версией программы — обновите программу."
+
+
 def prepare_restore(db_path: Path | str, source: Path | str) -> PreparedRestore:
     """Перенести копию source во временный файл <база>.restore и проверить его.
 
     Нет файла копии — FileNotFoundError. Копия и база — один файл, копия не база SQLite,
-    повреждена (PRAGMA integrity_check не «ok») или не база биобанка (нет таблицы
-    specimen) — ValueError с объяснением; временный файл при этом удаляется.
+    повреждена (PRAGMA integrity_check не «ok»), не база биобанка (нет таблицы
+    specimen) или другой версии схемы (PRAGMA user_version ≠ SCHEMA_VERSION: копия,
+    сделанная до перехода на новую схему) — ValueError с объяснением; временный файл
+    при этом удаляется.
     Сама база не меняется. Текущая база занята дольше BUSY_TIMEOUT_MS — ошибка SQLite.
     """
     db_path = Path(db_path)
@@ -792,6 +836,7 @@ def prepare_restore(db_path: Path | str, source: Path | str) -> PreparedRestore:
             check = [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()]
             tables = list_tables(conn)
             app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
         except sqlite3.DatabaseError as error:
             raise ValueError(f"{source} — не база SQLite или повреждена: {error}") from error
         finally:
@@ -800,6 +845,8 @@ def prepare_restore(db_path: Path | str, source: Path | str) -> PreparedRestore:
             raise ValueError(f"Копия {source} повреждена (integrity_check: {check[0]} …).")
         if "specimen" not in tables:
             raise ValueError(f"{source} — не база биобанка (нет таблицы specimen).")
+        if version != SCHEMA_VERSION:
+            raise ValueError(schema_version_message(source, version))
     except BaseException:
         remove_temp_database(new_path)
         raise

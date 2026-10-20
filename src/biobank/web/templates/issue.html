@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import value %}
+{% from "_macros.html" import value, raw, utc %}
 {#- Одна проблема журнала (browse.get_issue): на неё ведут ссылки из карточек и отчётов.
     Значения — как в базе; если проблема открыта — форма «Решено» (та же, что в журнале). -#}
 {% block title %}Проблема №{{ issue.issue_id }}{% endblock %}
@@ -7,19 +7,28 @@
 <p class="crumbs"><a href="{{ url_for('issues') }}">Журнал проблем</a> /
   <a href="{{ url_for('issues', category=issue.category) }}">{{ issue.category }}</a> /</p>
 <h1>Проблема №{{ issue.issue_id }}: {{ issue.category }}</h1>
-<table class="fields">
-  <tr><th scope="row">описание</th><td>{{ issue.description }}</td></tr>
-  <tr><th scope="row">к чему</th><td>{{ value(table_title) }}</td></tr>
-  <tr><th scope="row">объект</th><td>{% if object_url %}<a href="{{ object_url }}">{{ value(issue.object_label) }}</a>{% else %}{{ value(issue.object_label) }}{% endif %}</td></tr>
-  <tr><th scope="row">лист Excel</th><td>{{ value(issue.sheet_name) }}</td></tr>
-  <tr><th scope="row">ячейка</th><td>{{ value(issue.cell) }}</td></tr>
-  <tr><th scope="row">значение</th><td>{{ value(issue.raw_value) }}</td></tr>
-  <tr><th scope="row">статус</th><td>{% if issue.resolved %}<span class="resolved"><strong>Решено.</strong> {{ issue.resolution }}</span>{% else %}открыто{% endif %}</td></tr>
-</table>
-{% if not issue.resolved %}
+<div class="table-wrap">
+  <table class="fields">
+    <tr><th scope="row">описание</th><td>{{ issue.description }}</td></tr>
+    <tr><th scope="row">к чему</th><td>{{ value(table_title) }}</td></tr>
+    <tr><th scope="row">объект</th><td>{% if object_url %}<a href="{{ object_url }}">{{ value(issue.object_label) }}</a>{% else %}{{ value(issue.object_label) }}{% endif %}</td></tr>
+    <tr><th scope="row">лист Excel</th><td>{{ value(issue.sheet_name) }}</td></tr>
+    <tr><th scope="row">ячейка</th><td>{{ value(issue.cell) }}</td></tr>
+    <tr><th scope="row">значение</th><td>{{ raw(issue.raw_value) }}</td></tr>
+    <tr><th scope="row">откуда</th><td>{{ issue.source }}</td></tr>
+    <tr><th scope="row">добавил(а)</th><td>{% if issue.created_by_name %}{{ issue.created_by_name }}{% if issue.created_at %}, {{ utc(issue.created_at) }}{% endif %}{% else %}{{ "импорт из Excel" if issue.source == "импорт" else "программа (проверка данных)" if issue.source == "проверка" else "команда на сервере" }}{% endif %}</td></tr>
+    <tr><th scope="row">статус</th><td>{% if issue.resolved %}<span class="resolved"><strong>Решено.</strong> {{ issue.resolution }}</span>{% else %}открыто{% endif %}</td></tr>
+    {% if issue.resolved %}
+    <tr><th scope="row">закрыл(а)</th><td>{% if issue.resolved_by_name %}{{ issue.resolved_by_name }}{% else %}<span class="muted">без имени (команда на сервере или автоматически)</span>{% endif %}{% if issue.resolved_at %}, {{ utc(issue.resolved_at) }}{% endif %}</td></tr>
+    {% endif %}
+  </table>
+</div>
+{% if not issue.resolved and issue.can_resolve %}
 <section class="section">
   <h2>Отметить решённой</h2>
   {% with issue_id=issue.issue_id, resolution=none, error=none %}{% include "_resolve_form.html" %}{% endwith %}
 </section>
+{% elif not issue.resolved %}
+<p class="small">Закрыть проблему может куратор{% if issue.source == "пользователь" %} или тот, кто её добавил{% endif %}.</p>
 {% endif %}
 {% endblock %}

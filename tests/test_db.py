@@ -30,6 +30,12 @@ EXPECTED_TABLES = {
     "analysis",
     "catch_record",
     "data_issue",
+    # новое в схеме v3
+    "person",
+    "app_user",
+    "user_role",
+    "expedition_member",
+    "change_log",
 }
 
 
@@ -42,10 +48,22 @@ def db(tmp_path):
     conn.close()
 
 
-def test_schema_has_18_tables(db):
+def test_schema_has_23_tables(db):
     tables = list_tables(db)
-    assert len(tables) == 18
+    assert len(tables) == 23
     assert set(tables) == EXPECTED_TABLES
+
+
+def test_schema_version_is_3(db):
+    """PRAGMA user_version — номер версии схемы внутри файла (для будущих миграций)."""
+    assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+def test_all_tables_strict(db):
+    """Схема v3: все таблицы STRICT — текст в числовую колонку база не примет."""
+    rows = db.execute("SELECT name, strict FROM pragma_table_list WHERE schema = 'main'")
+    loose = [r["name"] for r in rows if not r["name"].startswith("sqlite_") and not r["strict"]]
+    assert loose == []
 
 
 def test_foreign_keys_enabled(db):
@@ -72,7 +90,7 @@ def test_cli_init(tmp_path, capsys):
     path = tmp_path / "cli.db"
     assert main(["--db", str(path), "init"]) == 0
     assert path.exists()
-    assert "Таблиц: 18" in capsys.readouterr().out
+    assert "Таблиц: 23" in capsys.readouterr().out
 
     # Повторно с --yes — пересоздаёт без вопросов
     assert main(["--db", str(path), "init", "--yes"]) == 0

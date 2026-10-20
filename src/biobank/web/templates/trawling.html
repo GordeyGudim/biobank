@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import section_table %}
+{% from "_macros.html" import section_table, added_by, history_block %}
 {#- Карточка траления (browse.trawling_card): сведения, замеры воды, привязанные особи,
     прилов, проблемы. Все колонки, даже пустые. -#}
 {% block title %}Траление {{ trawl_no }} — {{ event_title }}{% endblock %}
@@ -8,10 +8,13 @@
   <a href="{{ url_for('expedition', expedition_id=ids.expedition_id) }}">экспедиция</a> /
   <a href="{{ url_for('event', event_id=ids.event_id) }}">выезд {{ event_title }}</a> /</p>
 <h1>Траление {{ trawl_no }}, выезд {{ event_title }}</h1>
+{{ added_by(record) }}
 <p class="record-actions">
-  <a class="button-link" href="{{ url_for('record_edit', kind_name='trawling', record_id=trawling_id) }}">Изменить траление</a>
-  <a class="button-link danger" href="{{ url_for('record_delete', kind_name='trawling', record_id=trawling_id) }}">Удалить траление</a>
-  <a href="{{ url_for('event', event_id=ids.event_id, form='water', _anchor='f-water') }}">Добавить замер воды →</a>
+  {% if may("trawling", trawling_id, UPDATE) %}<a class="button-link" href="{{ url_for('record_edit', kind_name='trawling', record_id=trawling_id) }}">Изменить траление</a>{% endif %}
+  {% if may("trawling", trawling_id, DELETE) %}<a class="button-link danger" href="{{ url_for('record_delete', kind_name='trawling', record_id=trawling_id) }}">Удалить траление</a>{% endif %}
+  {% if can(CREATE, "water_measurement") %}<a href="{{ url_for('event', event_id=ids.event_id, form='water', _anchor='f-water') }}">Добавить замер воды →</a>{% endif %}
+  {% if can(CREATE, "data_issue") %}<a href="{{ url_for('issue_new', table_name='trawling', record_id=trawling_id, object_label=event_title ~ ' / траление ' ~ trawl_no) }}">Сообщить о проблеме →</a>{% endif %}
 </p>
 {% for view in views %}{{ section_table(view) }}{% endfor %}
+{{ history_block(history, history_link) }}
 {% endblock %}

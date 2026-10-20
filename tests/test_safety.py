@@ -167,10 +167,13 @@ def test_guard_sees_changed_and_deleted_excel_records(path, conn):
 
 
 def test_guard_sees_resolved_issue(path):
-    """Вручную закрытая проблема (resolved + resolution) — тоже правка."""
+    """Вручную закрытая проблема (resolved + resolution) — тоже правка.
+
+    Правка пишет и журнал изменений: 3 строки (resolved, resolution, resolved_at), которых
+    в свежей базе из Excel нет."""
     assert main(["--db", str(path), "resolve-issue", "30", "TL 3,1 — опечатка"]) == 0
     _, found, _, _ = guard(path)
-    assert found == {"data_issue": (1, 1)}
+    assert found == {"data_issue": (1, 1), "change_log": (3, 0)}
 
 
 def test_guard_after_check_on_clean_db(path):
@@ -183,6 +186,16 @@ def test_guard_other_schema(path, conn):
     conn.execute("DROP TABLE analysis")
     _, found, unreadable, needs_force = guard(path)
     assert needs_force and "analysis" in unreadable
+
+
+def test_guard_old_v2_database(path, conn):
+    """База схемы v2 (без таблиц v3, user_version 0) — импорт без --force её не заменит."""
+    for table in ("change_log", "expedition_member", "user_role", "app_user"):
+        conn.execute(f"DROP TABLE {table}")  # имена — из этого теста
+    conn.execute("PRAGMA user_version = 0")
+    conn.commit()
+    _, _, unreadable, needs_force = guard(path)
+    assert needs_force and "change_log" in unreadable
 
 
 def test_guard_unreadable_file(tmp_path):

@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{#- «Добавить проблему» (edit.add_issue): человек сам записывает сомнение в журнал
+    («сверить TL с полевым журналом»). Закрыть её потом может он сам или куратор.
+    Из карточки форма открывается уже заполненной: к чему относится, номер записи, объект. -#}
+{% block title %}Новая проблема{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('issues') }}">Журнал проблем</a> /</p>
+<h1>Новая проблема в журнале</h1>
+<form method="post" action="{{ url_for('issue_new') }}" class="entry-form">
+  {% if error %}<p class="field-error flash flash-error" id="issue-error" role="alert">{{ error }}</p>{% endif %}
+  {% set described %}{% if error %} aria-describedby="issue-error"{% endif %}{% endset %}
+  <div class="form-grid">
+    <div class="field">
+      <label for="i-category">Категория <abbr class="req" title="обязательное поле">*</abbr></label>
+      <input id="i-category" name="category" type="text" required list="i-categories" value="{{ values.category }}"{{ described }}>
+      <datalist id="i-categories">{% for c in categories %}<option value="{{ c.category }}">{% endfor %}</datalist>
+      <span class="hint">например «промеры», «вид», «номера»</span>
+    </div>
+    <div class="field wide">
+      <label for="i-description">Что не так <abbr class="req" title="обязательное поле">*</abbr></label>
+      <textarea id="i-description" name="description" rows="3" required{{ described }}>{{ values.description }}</textarea>
+    </div>
+    <div class="field">
+      <label for="i-table">К чему относится</label>
+      <select id="i-table" name="table_name"{{ described }}>
+        <option value="">— ни к какой записи —</option>
+        {% for table, title in tables.items() %}
+        <option value="{{ table }}"{% if values.table_name == table %} selected{% endif %}>{{ title }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="i-record">Номер записи</label>
+      <input id="i-record" name="record_id" type="text" inputmode="numeric" value="{{ values.record_id }}"{{ described }}>
+      <span class="hint">вместе с «к чему относится»; из карточки — уже заполнен</span>
+    </div>
+    <div class="field">
+      <label for="i-object">Объект для людей</label>
+      <input id="i-object" name="object_label" type="text" value="{{ values.object_label }}">
+      <span class="hint">номер пробы, «Точка 3 / траление 2»…</span>
+    </div>
+    <div class="field">
+      <label for="i-raw">Сомнительное значение</label>
+      <input id="i-raw" name="raw_value" type="text" value="{{ values.raw_value }}">
+    </div>
+  </div>
+  <div class="buttons"><button type="submit">Добавить проблему</button>
+    <a class="button-link" href="{{ url_for('issues') }}">Отмена</a></div>
+</form>
+{% endblock %}

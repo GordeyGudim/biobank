@@ -187,7 +187,7 @@ ALLOWED_SQL = {
     "integrity_check": ("PRAGMA integrity_check", "ok"),
     "quick_check": ("PRAGMA quick_check", "ok"),
     "foreign_keys_read": ("PRAGMA foreign_keys", 1),
-    "pragma_function": ("SELECT count(*) FROM pragma_table_info('specimen')", 19),
+    "pragma_function": ("SELECT count(*) FROM pragma_table_info('specimen')", 21),
     "trailing_semicolon": ("SELECT count(*) FROM gear;", 2),
 }
 
@@ -725,7 +725,8 @@ def test_sqlite_error_in_middle_of_identify_rolls_back(copy_path, capsys):
         "BEGIN SELECT RAISE(ABORT, 'сбой записи'); END",
     )
     before = sha(copy_path)
-    argv = ["--db", str(copy_path), "identify", "155 pc", "Plotosus canius",
+    # другой вид — иначе текущий вид не меняется и UPDATE не выполняется вовсе
+    argv = ["--db", str(copy_path), "identify", "155 pc", "Bagarius sp.",
             "--method", "ДНК", "--confidence", "точно"]  # fmt: skip
     assert main(argv) == 1
     assert "сбой записи" in capsys.readouterr().err

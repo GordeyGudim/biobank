@@ -30,6 +30,7 @@ from biobank.entry import (
 )
 from biobank.importer import CAPTURE_METHODS
 from biobank.parsing import _LOOKALIKES, parse_label
+from biobank.permissions import MANAGE_USERS, User, can
 from biobank.tables import CardSection, query_section
 
 DEFAULT_PER_PAGE = 50
@@ -631,6 +632,19 @@ def site_card(conn: sqlite3.Connection, site_id: int) -> list[CardSection]:
 # ---------------------------------------------------------------------------
 
 
+# Колонки записи журнала проблем + имена пользователей (кто добавил, кто закрыл).
+# Условия фильтров (category, resolved, table_name, issue_id) — колонки только data_issue.
+_ISSUE_SELECT = """
+SELECT d.issue_id, d.category, d.table_name, d.record_id, d.sheet_name, d.cell,
+       d.object_label, d.raw_value, d.description, d.source, d.resolved, d.resolution,
+       d.resolved_at, d.created_by, d.created_at, cu.display_name AS created_by_name,
+       d.resolved_by, ru.display_name AS resolved_by_name
+FROM data_issue d
+LEFT JOIN app_user cu ON cu.user_id = d.created_by
+LEFT JOIN app_user ru ON ru.user_id = d.resolved_by
+"""
+
+
 def list_issues(
     conn: sqlite3.Connection,
     *,
@@ -645,7 +659,11 @@ def list_issues(
     resolved: None — все, False — открытые, True — решённые.
     Порядок: сначала открытые, затем по категории и номеру.
     Запись (dict) — все колонки data_issue: issue_id, category, table_name, record_id,
-    sheet_name, cell, object_label, raw_value, description, resolved (0/1), resolution.
+    sheet_name, cell, object_label, raw_value, description, source (импорт / проверка /
+    пользователь), resolved (0/1), resolution, resolved_at (когда закрыта, UTC; может быть пусто),
+    created_by, created_at, created_by_name (кто добавил; пусто — импорт, проверка, CLI),
+    resolved_by, resolved_by_name (кто закрыл). Кнопку «Решено» показывать по
+    permissions.can(user, RESOLVE, "data_issue", запись).
     """
     conditions: list[str] = []
     params: list = []
@@ -658,11 +676,7 @@ def list_issues(
     if table_name:
         conditions.append("table_name = ?")
         params.append(table_name)
-    sql = (
-        "SELECT issue_id, category, table_name, record_id, sheet_name, cell, object_label, "
-        "raw_value, description, resolved, resolution FROM data_issue "
-        f"WHERE {_where(conditions)} ORDER BY resolved, category, issue_id"
-    )
+    sql = f"{_ISSUE_SELECT} WHERE {_where(conditions)} ORDER BY resolved, category, issue_id"
     return _paginate(conn, sql, params, page, per_page)
 
 
@@ -679,8 +693,7 @@ def get_issue(conn: sqlite3.Connection, issue_id: int) -> dict:
     """
     row = _require(
         conn,
-        "SELECT issue_id, category, table_name, record_id, sheet_name, cell, object_label, "
-        "raw_value, description, resolved, resolution FROM data_issue WHERE issue_id = ?",
+        f"{_ISSUE_SELECT} WHERE issue_id = ?",
         issue_id,
         f"Проблемы №{issue_id} нет в журнале.",
     )
@@ -825,6 +838,24 @@ def list_gear(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def list_people(conn: sqlite3.Connection) -> list[dict]:
+    """Справочник людей по имени: person_id, full_name, name_latin, organization,
+    identification_count (сколько определений вида за человеком).
+
+    Для подсказок в поле «кто определил» (имя ищется точно — edit.find_or_create_person).
+    """
+    rows = conn.execute(
+        """
+        SELECT p.person_id, p.full_name, p.name_latin, p.organization,
+               (SELECT count(*) FROM species_identification si
+                WHERE si.identified_by = p.person_id) AS identification_count
+        FROM person p
+        ORDER BY p.full_name, p.person_id
+        """
+    )
+    return [dict(r) for r in rows]
+
+
 def list_regions(conn: sqlite3.Connection) -> list[dict]:
     """Провинции по id: region_id, name, country, city_count."""
     rows = conn.execute(
@@ -866,7 +897,9 @@ def list_cities(conn: sqlite3.Connection, region_id: int | None = None) -> list[
 
 
 def list_shipments(conn: sqlite3.Connection, sample_id: int) -> list[dict]:
-    """Куда отправлен образец: sample_id, lab_id, lab, sent_on (для кнопки «удалить отправку»).
+    """Куда отправлен образец: sample_id, lab_id, lab, sent_on, created_by, created_at,
+    created_by_name (кто отметил; пусто — из Excel или CLI) — для кнопки «удалить отправку»
+    (показывать по permissions.can(user, DELETE, "sample_shipment", запись)).
 
     Нет такого образца — NotFoundError.
     """
@@ -874,8 +907,10 @@ def list_shipments(conn: sqlite3.Connection, sample_id: int) -> list[dict]:
         conn, "SELECT 1 FROM sample WHERE sample_id = ?", sample_id, f"Образца №{sample_id} нет."
     )
     rows = conn.execute(
-        "SELECT sh.sample_id, sh.lab_id, l.name AS lab, sh.sent_on FROM sample_shipment sh "
-        "JOIN lab l ON l.lab_id = sh.lab_id WHERE sh.sample_id = ? ORDER BY l.name",
+        "SELECT sh.sample_id, sh.lab_id, l.name AS lab, sh.sent_on, sh.created_by, "
+        "sh.created_at, u.display_name AS created_by_name FROM sample_shipment sh "
+        "JOIN lab l ON l.lab_id = sh.lab_id LEFT JOIN app_user u ON u.user_id = sh.created_by "
+        "WHERE sh.sample_id = ? ORDER BY l.name",
         (sample_id,),
     )
     return [dict(r) for r in rows]
@@ -963,7 +998,9 @@ RECORD_SQL = {
         "Записи прилова",
     ),
     "identification": (
-        "SELECT * FROM species_identification WHERE identification_id = ?",
+        """SELECT si.*, p.full_name AS identified_by_name FROM species_identification si
+           LEFT JOIN person p ON p.person_id = si.identified_by
+           WHERE si.identification_id = ?""",
         "Определения вида",
     ),
 }
@@ -976,8 +1013,10 @@ def get_record(conn: sqlite3.Connection, kind: str, record_id: int) -> dict:
     water_measurement, specimen, sample, catch_record, identification.
     Дополнительно к колонкам таблицы: у места — city, region (названия); у выезда —
     capture_method, gear_mesh, gear_size; у замера, особи, прилова — trawl_no; у особи —
-    capture_method (свой способ; None — как у выезда). Числа — числами: промеры особи
-    (tl_cm, sl_cm, mass_g, mass_gutted_g), координаты, параметры воды — float или None.
+    capture_method (свой способ; None — как у выезда); у определения вида —
+    identified_by_name (имя из справочника людей; identified_by — номер человека).
+    Числа — числами: промеры особи (tl_cm, sl_cm, mass_g, mass_gutted_g), координаты,
+    параметры воды — float или None.
     Неизвестный kind — ValueError; нет записи — NotFoundError.
     """
     if kind not in RECORD_SQL:
@@ -1007,3 +1046,128 @@ def specimen_measurements(conn: sqlite3.Connection, label_or_id: str | int) -> d
     )
     # колонки REAL: SQLite отдаёт их как float (целое 30 — как 30.0), пустые — None
     return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Журнал изменений (change_log)
+# ---------------------------------------------------------------------------
+
+# Кто что видит: изменения учётных записей и ролей (app_user, user_role) — только тот, кто
+# управляет пользователями (админ); остальным эти строки не отдаются вовсе — ни в списке,
+# ни в истории, ни в фильтре таблиц. Имя автора — подпись (display_name); логин —
+# только админу (user_login), остальным его нет в записи.
+PRIVATE_CHANGE_TABLES = ("app_user", "user_role")
+_HIDE_PRIVATE = "c.table_name NOT IN ('app_user', 'user_role')"  # фиксированный кусок SQL
+
+# user_name — подпись пользователя; пусто — системный режим (команды CLI на сервере)
+_CHANGES_SQL = """
+SELECT c.change_id, c.changed_at, c.user_id, u.display_name AS user_name,
+       u.login AS user_login, c.action,
+       c.table_name, c.record_key, c.record_label, c.column_name, c.old_value, c.new_value
+FROM change_log c
+LEFT JOIN app_user u ON u.user_id = c.user_id
+"""
+
+
+def _sees_users(viewer: User | None) -> bool:
+    return can(viewer, MANAGE_USERS)
+
+
+def _change_row(row, admin: bool) -> dict:
+    item = dict(row)
+    if not admin:
+        item.pop("user_login", None)
+    return item
+
+
+def record_history(
+    conn: sqlite3.Connection, table: str, record_key: str | int, *, viewer: User | None = None
+) -> list[dict]:
+    """История одной записи — все строки журнала изменений, старые первыми.
+
+    table — имя таблицы ('specimen'), record_key — id записи (12 или '12'); у составного
+    ключа — текст как в журнале ('sample_id=812, lab_id=1', см. audit.record_key).
+    viewer — кто смотрит: историю учётных записей и ролей видит только админ (остальным —
+    пустой список); логин автора (user_login) — тоже только админу.
+    Запись (dict): change_id, changed_at (UTC, 'ГГГГ-ММ-ДД ЧЧ:ММ:СС'), user_id, user_name
+    (пусто — команда CLI), action (создание / изменение / удаление), table_name,
+    record_key, record_label, column_name (у изменения), old_value, new_value
+    (у создания / удаления — вся запись в JSON).
+    Записи из Excel без правок — пустой список (импорт журнал не пишет).
+    """
+    admin = _sees_users(viewer)
+    if table in PRIVATE_CHANGE_TABLES and not admin:
+        return []
+    rows = conn.execute(
+        _CHANGES_SQL + "WHERE c.table_name = ? AND c.record_key = ? ORDER BY c.change_id",
+        (table, str(record_key)),
+    )
+    return [_change_row(r, admin) for r in rows]
+
+
+def list_changes(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int | None = None,
+    table: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    page: int = 1,
+    per_page: int = DEFAULT_PER_PAGE,
+    viewer: User | None = None,
+) -> Page:
+    """Последние изменения (страница «журнал изменений»): новые первыми, постранично.
+
+    Фильтры: user_id — кто менял; table — таблица; date_from / date_to — даты ГГГГ-ММ-ДД
+    включительно (по времени UTC). Записи (dict) — как у record_history.
+    viewer — кто смотрит: изменения app_user / user_role и логины авторов — только админу.
+    """
+    admin = _sees_users(viewer)
+    conditions: list[str] = [] if admin else [_HIDE_PRIVATE]
+    params: list = []
+    if user_id is not None:
+        conditions.append("c.user_id = ?")
+        params.append(user_id)
+    if table:
+        conditions.append("c.table_name = ?")
+        params.append(table)
+    if date_from:
+        conditions.append("c.changed_at >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("c.changed_at < date(?, '+1 day')")
+        params.append(date_to)
+    sql = _CHANGES_SQL + f"WHERE {_where(conditions)} ORDER BY c.change_id DESC"
+    result = _paginate(conn, sql, params, page, per_page)
+    result.items = [_change_row(item, admin) for item in result.items]
+    return result
+
+
+def change_tables(conn: sqlite3.Connection, *, viewer: User | None = None) -> list[str]:
+    """Таблицы, которые есть в журнале изменений, — для фильтра на странице журнала
+    (app_user и user_role — только админу)."""
+    where = "" if _sees_users(viewer) else f" WHERE {_HIDE_PRIVATE.replace('c.', '')}"
+    rows = conn.execute(f"SELECT DISTINCT table_name FROM change_log{where} ORDER BY table_name")
+    return [r[0] for r in rows]
+
+
+def change_authors(conn: sqlite3.Connection, *, viewer: User | None = None) -> list[dict]:
+    """Кто менял данные — для фильтра «Кто» на странице журнала, по имени.
+
+    Только авторы изменений, видимых viewer (автор одних лишь правок пользователей
+    остальным не показывается). Запись (dict): user_id, display_name; login — только админу.
+    """
+    admin = _sees_users(viewer)
+    where = "" if admin else f"AND {_HIDE_PRIVATE}"
+    rows = conn.execute(
+        "SELECT DISTINCT u.user_id, u.display_name, u.login FROM change_log c "
+        f"JOIN app_user u ON u.user_id = c.user_id WHERE 1 {where} "
+        "ORDER BY u.display_name, u.user_id"
+    )
+    authors = []
+    for r in rows:
+        item = dict(r)
+        if not admin:
+            item.pop("login")
+        authors.append(item)
+    return authors

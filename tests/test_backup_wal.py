@@ -11,12 +11,13 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 from conftest import SOURCE, count
 
 from biobank import db as dbmod
-from biobank import edit
+from biobank import edit, users
 from biobank.__main__ import main
 from biobank.db import (
     BUSY_TIMEOUT_MS,
@@ -248,7 +249,7 @@ def test_backup_name_and_folder_show_kind(empty, kind):
     assert target == empty.parent / "backups" / kind / f"biobank.db_{kind}_20261019_030000.db"
     conn = connect_read_only(target)
     try:
-        assert len(dbmod.list_tables(conn)) == 18
+        assert len(dbmod.list_tables(conn)) == 23
     finally:
         conn.close()
 
@@ -414,7 +415,8 @@ def test_set_live_and_is_live(empty):
     conn = connect_read_only(empty)
     try:
         assert count(conn, "PRAGMA application_id") == LIVE_APPLICATION_ID
-        assert count(conn, "PRAGMA user_version") == 0  # user_version — для миграций (D3)
+        # user_version — версия схемы (3), пометка go-live её не трогает
+        assert count(conn, "PRAGMA user_version") == 3
     finally:
         conn.close()
     assert set_live(empty, False) is True
@@ -554,7 +556,17 @@ def test_web_works_on_live_db(path):
     from biobank.web.app import create_app
 
     set_live(path, True)
+    conn = connect(path)
+    try:  # сайт — только после входа (этап D3): читатель, вход через сессию
+        reader = users.create_user(conn, "reader", "длинный-пароль-1", "Читатель", ["читатель"],
+                                   must_change_password=False)  # fmt: skip
+    finally:
+        conn.close()
     client = create_app(path).test_client()
+    with client.session_transaction() as session:
+        session["user_id"] = reader.user_id
+        session["v"] = reader.session_version
+        session["seen"] = time.time()
     assert client.get("/").status_code == 200
     assert client.get("/specimen/5 pc").status_code == 200
 

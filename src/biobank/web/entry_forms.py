@@ -4,7 +4,9 @@
 Каждая форма устроена одинаково:
 - страница с формой — обычный GET (только чтение); форма — <details> с id (f-expedition…);
 - кнопка отправляет POST; запись — только через функции entry.py внутри edit.apply_edit
-  (резервная копия базы + проверка и запись в одной транзакции);
+  (резервная копия базы + проверка и запись в одной транзакции) от имени вошедшего
+  (auth.run_edit: user=…); права проверяются до всего остального (auth.need) и ещё раз —
+  самой функцией записи;
 - ошибка (EditError) — та же страница с кодом 400: форма раскрыта, введённое на месте,
   текст ошибки — над полями; HTMX берёт из ответа только блок формы (hx-select) и меняет его;
 - успех — сообщение (flash) и переход на карточку созданной записи. Обычная форма получает
@@ -24,11 +26,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from flask import Flask, current_app, flash, redirect, render_template, request, url_for
+from flask import Flask, current_app, redirect, render_template, request, url_for
 
 from biobank import entry
-from biobank.edit import EditError, NotFoundError, apply_edit
+from biobank.edit import EditError, NotFoundError
 from biobank.parsing import SUFFIXES
+from biobank.permissions import CREATE, UPDATE
+from biobank.web.auth import flash_result, need, run_edit
 
 # ---------------------------------------------------------------------------
 # Состояние отправленной формы
@@ -103,21 +107,20 @@ def go(url: str):
 
 
 def save(action, on_error, success_url):
-    """apply_edit(action) → сообщение и переход на success_url(result) или on_error(текст).
+    """run_edit(action) → сообщение и переход на success_url(result) или on_error(текст).
 
-    NotFoundError (нет экспедиции, выезда, особи…) не ловим — её покажет общий обработчик
-    ошибок страницей 404. Предупреждения записи (EditResult.warnings) — жёлтым: запись
+    action(conn, user) — запись от имени вошедшего. NotFoundError (нет экспедиции, выезда,
+    особи…) не ловим — её покажет общий обработчик ошибок страницей 404; нет прав — 403
+    (run_edit). Предупреждения записи (EditResult.warnings, notices) — жёлтым: запись
     сохранена; проблемы данных (SL > TL и т.п.) при этом уже записаны в журнал.
     """
     try:
-        result = apply_edit(current_app.config["DB_PATH"], action)
+        result = run_edit(action)
     except NotFoundError:
         raise
     except EditError as error:
         return on_error(str(error))
-    flash(result.message, "ok")
-    for warning in result.warnings:
-        flash(f"Внимание: {warning}", "warn")
+    flash_result(result)
     return go(success_url(result))
 
 
@@ -209,12 +212,14 @@ def register_entry_routes(app: Flask, pages) -> None:
 
     @app.post("/expeditions/new")
     def expedition_new():
+        need(CREATE, "expedition")
         values = form_values("name", "date_start", "date_end", text=("notes",))
 
-        def action(conn):
+        def action(conn, user):
             return entry.create_expedition(
-                conn, values["name"], values["date_start"], values["date_end"], values["notes"]
-            )
+                conn, values["name"], values["date_start"], values["date_end"], values["notes"],
+                user=user,
+            )  # fmt: skip
 
         return save(
             action,
@@ -226,6 +231,7 @@ def register_entry_routes(app: Flask, pages) -> None:
 
     @app.post("/sites/new")
     def site_new():
+        need(CREATE, "sampling_site")
         values = form_values("site_type", "name", "city", "region", "lat", "lon",
                              text=("description",))  # fmt: skip
         values["new_region"] = "1" if checked("new_region") else ""
@@ -248,12 +254,12 @@ def register_entry_routes(app: Flask, pages) -> None:
         if nearby and not allow:
             return page(200, nearby=nearby)
 
-        def action(conn):
+        def action(conn, user):
             return entry.create_site(
                 conn, values["site_type"], name=values["name"], lat=values["lat"],
                 lon=values["lon"], city=values["city"], region=values["region"],
                 description=values["description"], new_region=checked("new_region"),
-                allow_nearby=allow,
+                allow_nearby=allow, user=user,
             )  # fmt: skip
 
         return save(
@@ -266,6 +272,7 @@ def register_entry_routes(app: Flask, pages) -> None:
 
     @app.post("/expeditions/<int:expedition_id>/events/new")
     def event_new(expedition_id: int):
+        need(CREATE, "sampling_event")
         values = form_values("site_id", "event_date", "capture_method", "gear_mesh",
                              "gear_size", text=("notes",))  # fmt: skip
 
@@ -283,11 +290,11 @@ def register_entry_routes(app: Flask, pages) -> None:
         if not values["capture_method"]:
             return page("Выберите способ получения.")
 
-        def action(conn):
+        def action(conn, user):
             return entry.create_event(
                 conn, expedition_id, site_id, values["event_date"], values["capture_method"],
                 gear_mesh=values["gear_mesh"], gear_size=values["gear_size"],
-                notes=values["notes"],
+                notes=values["notes"], user=user,
             )  # fmt: skip
 
         return save(action, page, lambda result: url_for("event", event_id=result.record_id))
@@ -302,6 +309,7 @@ def register_entry_routes(app: Flask, pages) -> None:
 
     @app.post("/events/<int:event_id>/trawlings/new")
     def trawling_new(event_id: int):
+        need(CREATE, "trawling")
         values = form_values("trawl_no", "time_start", "time_end", "duration_min",
                              "speed_kmh", "intermediate_depth_m", "catch_note",
                              text=("notes",))  # fmt: skip
@@ -311,19 +319,20 @@ def register_entry_routes(app: Flask, pages) -> None:
         except ValueError:
             return page(f"Номер траления — целое число (введено «{values['trawl_no']}»).")
 
-        def action(conn):
+        def action(conn, user):
             return entry.add_trawling(
                 conn, event_id, trawl_no, time_start=values["time_start"],
                 time_end=values["time_end"], duration_min=values["duration_min"],
                 speed_kmh=values["speed_kmh"],
                 intermediate_depth_m=values["intermediate_depth_m"],
-                catch_note=values["catch_note"], notes=values["notes"],
+                catch_note=values["catch_note"], notes=values["notes"], user=user,
             )  # fmt: skip
 
         return save(action, page, lambda _result: url_for("event", event_id=event_id))
 
     @app.post("/events/<int:event_id>/water/new")
     def water_new(event_id: int):
+        need(CREATE, "water_measurement")
         values = form_values("point_type", "trawl_no", "measured_time", "coord_source",
                              "garmin_wp", *entry.WATER_NUMBERS, text=("notes",))  # fmt: skip
         page = event_form_error(event_id, "f-water", values)
@@ -332,11 +341,11 @@ def register_entry_routes(app: Flask, pages) -> None:
         except EditError as error:
             return page(str(error))
 
-        def action(conn):
+        def action(conn, user):
             return entry.add_water_measurement(
                 conn, event_id, values["point_type"], trawl_no,
                 measured_time=values["measured_time"], coord_source=values["coord_source"],
-                garmin_wp=values["garmin_wp"], notes=values["notes"],
+                garmin_wp=values["garmin_wp"], notes=values["notes"], user=user,
                 **{column: values[column] for column in entry.WATER_NUMBERS},
             )  # fmt: skip
 
@@ -344,6 +353,7 @@ def register_entry_routes(app: Flask, pages) -> None:
 
     @app.post("/events/<int:event_id>/catch/new")
     def catch_new(event_id: int):
+        need(CREATE, "catch_record")
         values = form_values("trawl_no", "taxon_text", "count_n", "mass_g", text=("raw_text",))
         page = event_form_error(event_id, "f-catch", values)
         try:
@@ -351,10 +361,11 @@ def register_entry_routes(app: Flask, pages) -> None:
         except EditError as error:
             return page(str(error))
 
-        def action(conn):
+        def action(conn, user):
             return entry.create_catch_record(
                 conn, event_id, raw_text=values["raw_text"], taxon_text=values["taxon_text"],
                 count_n=values["count_n"], mass_g=values["mass_g"], trawl_no=trawl_no,
+                user=user,
             )  # fmt: skip
 
         return save(action, page, lambda _result: url_for("event", event_id=event_id))
@@ -363,6 +374,7 @@ def register_entry_routes(app: Flask, pages) -> None:
 
     @app.post("/events/<int:event_id>/specimens/new")
     def specimen_new(event_id: int):
+        need(CREATE, "specimen")
         values = form_values("label", "suffix", "species", "confidence", *entry.MEASUREMENTS,
                              "sex", "trawl_no", "capture_method", "capture_site_id",
                              "capture_date", "identified_by", text=("notes",))  # fmt: skip
@@ -402,8 +414,10 @@ def register_entry_routes(app: Flask, pages) -> None:
             values["label"] = label or ""  # номер, который будет записан, — виден сразу
             return page(200, warnings=check.warnings)
 
-        def action(conn):
-            return entry.create_specimen(conn, event_id, values["species"], label, **arguments)
+        def action(conn, user):
+            return entry.create_specimen(
+                conn, event_id, values["species"], label, **arguments, user=user
+            )
 
         # номер известен заранее (введён или подобран выше) — по нему откроем карточку;
         # без номера (вид без кода) create_specimen откажет и объяснит, что указать
@@ -415,15 +429,16 @@ def register_entry_routes(app: Flask, pages) -> None:
 
     @app.post("/specimen/<path:label>/samples/new")
     def sample_new(label: str):
+        need(CREATE, "sample")
         values = form_values("sample_type", "organ", "sample_label", "preservative",
                              text=("notes", "labs"))  # fmt: skip
         labs = [line.strip() for line in values["labs"].splitlines() if line.strip()]
 
-        def action(conn):
+        def action(conn, user):
             return entry.add_sample(
                 conn, label, values["sample_type"], organ=values["organ"],
                 sample_label=values["sample_label"], preservative=values["preservative"],
-                notes=values["notes"], labs=labs,
+                notes=values["notes"], labs=labs, user=user,
             )  # fmt: skip
 
         return save(
@@ -434,6 +449,7 @@ def register_entry_routes(app: Flask, pages) -> None:
 
     @app.post("/specimen/<path:label>/ship")
     def sample_ship(label: str):
+        need(CREATE, "sample_shipment")
         values = form_values("sample_id", "lab", "sent_on")
         values["new_lab"] = "1" if checked("new_lab") else ""
 
@@ -447,15 +463,21 @@ def register_entry_routes(app: Flask, pages) -> None:
         if sample_id is None:
             return page("Выберите образец из списка.")
 
-        def action(conn):
+        def action(conn, user):
             return entry.ship_sample(
-                conn, sample_id, values["lab"], values["sent_on"], new_lab=checked("new_lab")
+                conn,
+                sample_id,
+                values["lab"],
+                values["sent_on"],
+                new_lab=checked("new_lab"),
+                user=user,
             )
 
         return save(action, page, lambda _result: url_for("specimen", label=label))
 
     @app.post("/specimen/<path:label>/measurements")
     def measurements(label: str):
+        need(UPDATE, "specimen", pages.specimen_record(label))
         names = tuple(entry.MEASUREMENTS)
         values = form_values(*names, *(f"old_{name}" for name in names))
 
@@ -479,8 +501,8 @@ def register_entry_routes(app: Flask, pages) -> None:
         if check.warnings and not confirmed(check.warnings):
             return page(200, warnings=check.warnings)
 
-        def action(conn):
-            return entry.update_measurements(conn, label, **changes)
+        def action(conn, user):
+            return entry.update_measurements(conn, label, **changes, user=user)
 
         return save(
             action, lambda error: page(error=error), lambda _r: url_for("specimen", label=label)

@@ -45,10 +45,11 @@ WHERE s.specimen_id = ?
 IDENTIFICATIONS_SQL = """
 SELECT si.identified_on AS "дата", si.method AS "метод", si.confidence AS "уверенность",
        coalesce(sp.scientific_name, '(не определён)') AS "вид",
-       si.identified_by AS "кто", si.raw_text AS "в таблице записано", si.notes AS "примечания",
+       pe.full_name AS "кто", si.raw_text AS "в таблице записано", si.notes AS "примечания",
        si.identification_id AS _identification_id, si.species_id AS _species_id
 FROM species_identification si
 LEFT JOIN species sp ON sp.species_id = si.species_id
+LEFT JOIN person pe  ON pe.person_id = si.identified_by   -- кто определил (справочник людей)
 WHERE si.specimen_id = ?
 ORDER BY si.identification_id
 """

@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Установка
-        run: pip install -e '.[dev]'
+        run: pip install -e '.[dev,web]'   # web — Flask: модули сайта проверяются doctest'ами
       - name: Стиль (ruff)
         run: |
           ruff check .

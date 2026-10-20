@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from biobank.checks import collapse_issues, run_checks
+from biobank.checks import SOURCE_IMPORT, collapse_issues, run_checks
 from biobank.db import (
     DEFAULT_DB_PATH,
     close_wal,
@@ -814,10 +814,10 @@ def _write_issues(ctx: ImportContext) -> int:
     issues = collapse_issues(ctx.issues)
     ctx.conn.executemany(
         "INSERT INTO data_issue (category, table_name, record_id, sheet_name, cell, "
-        "object_label, raw_value, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "object_label, raw_value, description, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (i.category, i.table_name, i.record_id, i.sheet, i.cell, i.object_label,
-             i.raw_value, i.description)
+             i.raw_value, i.description, SOURCE_IMPORT)
             for i in issues
         ],
     )  # fmt: skip
@@ -932,6 +932,12 @@ TABLE_TITLES = {
     "analysis": "результаты анализов",
     "catch_record": "прилов",
     "data_issue": "журнал проблем",
+    # новое в схеме v3 (импорт эти таблицы не заполняет — всё в них появилось не из Excel)
+    "person": "справочник людей",
+    "expedition_member": "участники экспедиций",
+    "app_user": "пользователи сайта",
+    "user_role": "роли пользователей",
+    "change_log": "журнал изменений",
 }
 
 

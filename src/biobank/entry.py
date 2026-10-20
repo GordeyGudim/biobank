@@ -13,7 +13,10 @@ Excel-импорт — разовый перенос накопленных да
     а проблема попадает в журнал data_issue теми же проверками, что и у импорта
     (checks.run_checks в той же транзакции); тексты — в EditResult.warnings;
 - функции принимают подключение и простые значения (числа можно строкой «29,3» —
-  как из формы), ничего не печатают и возвращают EditResult с id созданной записи.
+  как из формы), ничего не печатают и возвращают EditResult с id созданной записи;
+- кто вносит — параметр user (User или user_id; None — системный режим CLI): права
+  проверяются внутри транзакции (нет прав — PermissionDenied), created_by / created_at
+  и журнал изменений (change_log) заполняются через audit.py.
 
 Выезды, введённые вручную, — без листа Excel: source_sheet = NULL. Пометку
 «ввод вручную» туда не пишем: проверки сворачивают одинаковые проблемы одного
@@ -27,6 +30,8 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from biobank import audit
+from biobank.audit import UserRef
 from biobank.checks import (
     DESC_SUFFIX,
     FISH_LIMITS,
@@ -41,6 +46,7 @@ from biobank.edit import (
     EditResult,
     NotFoundError,
     event_title,
+    find_or_create_person,
     find_species,
     find_specimen,
     write_transaction,
@@ -147,7 +153,7 @@ def parse_entry_number(
     >>> parse_entry_number("0", "TL", positive=True)
     Traceback (most recent call last):
     ...
-    biobank.edit.EditError: TL должна быть больше 0 (введено 0).
+    biobank.errors.EditError: TL должна быть больше 0 (введено 0).
     """
     if isinstance(value, str) and is_blank(value.strip()):
         return None
@@ -283,17 +289,12 @@ def validate_specimen(
 
 
 def _insert(conn: sqlite3.Connection, table: str, **values) -> int:
-    """INSERT одной строки; вернуть её id.
+    """INSERT одной строки от имени текущего пользователя; вернуть её id (audit.insert).
 
-    Имена таблицы и колонок — из кода этого модуля (не от пользователя),
-    значения — через «?», как в importer.ImportContext.insert.
+    Права на создание, created_by / created_at и строка журнала изменений — там.
+    Имена таблицы и колонок — из кода этого модуля (не от пользователя), значения — через «?».
     """
-    columns = ", ".join(values)
-    marks = ", ".join("?" for _ in values)
-    cursor = conn.execute(
-        f"INSERT INTO {table} ({columns}) VALUES ({marks})", tuple(values.values())
-    )
-    return cursor.lastrowid
+    return audit.insert(conn, table, **values)
 
 
 def _expedition(conn: sqlite3.Connection, expedition_id: int) -> sqlite3.Row:
@@ -317,7 +318,7 @@ def _site(conn: sqlite3.Connection, site_id: int) -> sqlite3.Row:
 
 _EVENT_SQL = """
     SELECT e.event_id, e.event_date, e.source_sheet, e.site_id, e.capture_method_id,
-           m.name AS method
+           e.expedition_id, m.name AS method
     FROM sampling_event e JOIN capture_method m USING (capture_method_id)
     WHERE e.event_id = ?
 """
@@ -394,6 +395,8 @@ def create_expedition(
     date_start: str | None = None,
     date_end: str | None = None,
     notes: str | None = None,
+    *,
+    user: UserRef = None,
 ) -> EditResult:
     """Новая экспедиция. Даты можно не указывать — их заполнит первый выезд (create_event)."""
     name = clean_text(name)
@@ -403,7 +406,7 @@ def create_expedition(
     end = parse_entry_date(date_end, "Дата окончания")
     if start and end and start > end:
         raise EditError(f"Дата начала {start} позже даты окончания {end}.")
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         if conn.execute("SELECT 1 FROM expedition WHERE name = ?", (name,)).fetchone():
             raise EditError(f"Экспедиция «{name}» уже есть — выберите другое название.")
         expedition_id = _insert(
@@ -581,6 +584,7 @@ def create_site(
     description: str | None = None,
     new_region: bool = False,
     allow_nearby: bool = False,
+    user: UserRef = None,
 ) -> EditResult:
     """Новое место (участок реки, рынок, аквахозяйство, точка рыбака).
 
@@ -593,7 +597,7 @@ def create_site(
     """
     name, lat, lon = _site_values(site_type, name, lat, lon, city)
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         nearby = find_nearby_sites(conn, site_type, lat, lon, name)
         if nearby and not allow_nearby:
             listed = "; ".join(site.describe() for site in nearby)
@@ -629,27 +633,35 @@ def _gear_id(conn: sqlite3.Connection, mesh: str | None, size: str | None) -> in
     return _insert(conn, "gear", gear_type=GEAR_TYPE, mesh_cm=mesh, size_m=size)
 
 
-def _extend_expedition_dates(
-    conn: sqlite3.Connection, expedition: sqlite3.Row, date: str
+def _sync_expedition_dates(
+    conn: sqlite3.Connection, expedition_id: int, date: str | None = None
 ) -> list[str]:
-    """Расширить даты экспедиции, чтобы они включали дату выезда (как при импорте: min/max).
+    """Даты экспедиции = min / max дат её выездов (как при импорте). Вызывать ПОСЛЕ записи
+    выезда: при создании, правке, переносе в другую экспедицию (для обеих) и удалении.
 
-    Если дата выходит за уже записанные даты — предупреждение (возможно, опечатка в годе).
+    Поэтому опечатка в годе выезда не портит даты экспедиции навсегда: исправили или
+    удалили выезд — даты пересчитались по оставшимся. Экспедиция без выездов не меняется
+    (её даты могли ввести вручную). Изменение — следствие правки выезда (derived), в журнале.
+    date — дата нового/изменённого выезда: если она вне прежних дат экспедиции —
+    предупреждение (возможно, опечатка в годе).
     """
+    expedition = _expedition(conn, expedition_id)
+    first, last = conn.execute(
+        "SELECT min(event_date), max(event_date) FROM sampling_event WHERE expedition_id = ?",
+        (expedition_id,),
+    ).fetchone()
     start, end = expedition["date_start"], expedition["date_end"]
-    new_start = min(start, date) if start else date
-    new_end = max(end, date) if end else date
-    if (new_start, new_end) == (start, end):
+    if first is None or (first, last) == (start, end):
         return []
-    conn.execute(
-        "UPDATE expedition SET date_start = ?, date_end = ? WHERE expedition_id = ?",
-        (new_start, new_end, expedition["expedition_id"]),
-    )
-    if not (start and end):
+    audit.update(  # следствие правки выезда — права на выезд уже проверены
+        conn, "expedition", {"expedition_id": expedition_id},
+        {"date_start": first, "date_end": last}, derived=True,
+    )  # fmt: skip
+    if date is None or not (start and end) or start <= date <= end:
         return []
     return [
         f"Дата выезда {date} вне дат экспедиции «{expedition['name']}» "
-        f"({start} – {end}); даты экспедиции изменены: {new_start} – {new_end}."
+        f"({start} – {end}); даты экспедиции изменены: {first} – {last}."
     ]
 
 
@@ -663,13 +675,14 @@ def create_event(
     gear_mesh: str | None = None,
     gear_size: str | None = None,
     notes: str | None = None,
+    user: UserRef = None,
 ) -> EditResult:
     """Новый выезд: экспедиция, место, дата, способ получения; сеть — только у тралений.
 
     Тип места должен соответствовать способу (траление → участок реки, рыбак → точка
-    рыбака…), как при импорте. Даты экспедиции расширяются, чтобы включать дату выезда
-    (при импорте даты экспедиции — min/max дат выездов); если дата выходит за уже
-    записанные даты — предупреждение.
+    рыбака…), как при импорте. Даты экспедиции пересчитываются по её выездам (min/max,
+    как при импорте — _sync_expedition_dates); если дата выходит за прежние даты
+    экспедиции — предупреждение.
     """
     date = parse_entry_date(event_date, "Дата выезда")
     if date is None:
@@ -679,7 +692,7 @@ def create_event(
     if (mesh or size) and method != "траление":
         raise EditError(f"Сеть указывают только у тралений, а способ получения — «{method}».")
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         expedition = _expedition(conn, expedition_id)
         site = _site(conn, site_id)
         method_id = _method_id(conn, method)
@@ -704,7 +717,7 @@ def create_event(
             source_sheet=None, notes=clean_text(notes),
         )  # fmt: skip
 
-        warnings = _extend_expedition_dates(conn, expedition, date)
+        warnings = _sync_expedition_dates(conn, expedition_id, date)
         if method == "траление" and gear_id is None:
             warnings.append("Сеть не указана — её можно будет добавить позже.")
         message = (
@@ -726,6 +739,7 @@ def add_trawling(
     intermediate_depth_m=None,
     catch_note: str | None = None,
     notes: str | None = None,
+    user: UserRef = None,
 ) -> EditResult:
     """Траление выезда-траления; номер траления в пределах выезда уникален."""
     if not isinstance(trawl_no, int) or trawl_no <= 0:
@@ -741,7 +755,7 @@ def add_trawling(
         catch_note=clean_text(catch_note),
         notes=clean_text(notes),
     )
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         event = _event(conn, event_id)
         if event["method"] != "траление":
             raise EditError(
@@ -783,6 +797,7 @@ def add_water_measurement(
     coord_source: str | None = None,
     garmin_wp: str | None = None,
     notes: str | None = None,
+    user: UserRef = None,
     **numbers,
 ) -> EditResult:
     """Замер воды: 'старт'/'финиш' траления (trawl_no обязателен) или 'точка' без траления.
@@ -807,7 +822,7 @@ def add_water_measurement(
         raise EditError("Координаты нужны обе — широта и долгота — или ни одной.")
     source = parse_coord_source(coord_source)
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         event = _event(conn, event_id)
         trawling_id = None if trawl_no is None else _trawling(conn, event, trawl_no)
         if (
@@ -965,14 +980,56 @@ def _draft_sample(
         owner = batch_owner  # у другой особи того же пакета
     if owner:
         raise EditError(f"Метка образца «{tag}» уже есть у особи {owner}.")
+    organ = clean_text(organ)
+    if specimen_id is not None:
+        same = same_sample(conn, specimen_id, sample_type, organ, tag)
+        if same is not None:
+            raise EditError(duplicate_sample_message(specimen_label, sample_type, organ, tag, same))
     found = []
     for lab in dict.fromkeys(labs):  # без повторов, порядок сохраняется
         found.append((_lab_id(conn, lab)[0], clean_text(lab)))
     values = dict(
-        sample_type=sample_type, organ=clean_text(organ), label=tag,
+        sample_type=sample_type, organ=organ, label=tag,
         preservative=clean_text(preservative), raw_value=None, notes=clean_text(notes),
     )  # fmt: skip
     return _SampleDraft(values, found)
+
+
+def same_sample(
+    conn: sqlite3.Connection,
+    specimen_id: int,
+    sample_type: str,
+    organ: str | None,
+    label: str | None,
+    exclude_id: int | None = None,
+) -> int | None:
+    """Номер образца той же особи с тем же типом, органом и меткой (или None).
+
+    Две такие пробирки схема v3 не допускает (уникальный индекс ux_sample_label).
+    Пустой орган равен пустому (ifnull — как в индексе). exclude_id — сам правимый образец.
+    """
+    row = conn.execute(
+        "SELECT sample_id FROM sample WHERE specimen_id = ? AND sample_type = ? "
+        "AND ifnull(organ, '') = ifnull(?, '') AND label = ? AND sample_id IS NOT ?",
+        (specimen_id, sample_type, organ, label, exclude_id),
+    ).fetchone()
+    return row["sample_id"] if row else None
+
+
+def duplicate_sample_message(
+    specimen_label: str, sample_type: str, organ: str | None, label: str, sample_id: int | None
+) -> str:
+    """Текст ошибки «такой образец уже есть» (ввод и правка образца).
+
+    >>> print(duplicate_sample_message("1 pc", "гистология", "печень", "1 pc", 116)[:65])
+    У особи 1 pc уже есть образец «1 pc» (гистология, печень) — №116.
+    """
+    what = f"{sample_type}, {organ}" if organ else sample_type
+    number = f" — №{sample_id}" if sample_id is not None else " в этом вводе"
+    return (
+        f"У особи {specimen_label} уже есть образец «{label}» ({what}){number}. "
+        f"Укажите другую метку образца, например «{label} a»."
+    )
 
 
 def _write_sample(conn: sqlite3.Connection, specimen_id: int, draft: _SampleDraft) -> int:
@@ -994,6 +1051,7 @@ class _SpecimenDraft:
     summary: str  # «Plotosus canius, точно» — для сообщения
     warnings: list[str]
     samples: list[_SampleDraft] = field(default_factory=list)
+    new_person: str | None = None  # «кто определил» добавлен в справочник при записи
 
 
 def _draft_specimen(
@@ -1116,6 +1174,8 @@ def _draft_specimen(
         capture_site_id=site_id, capture_date=own_date, sex=clean_text(sex),
         is_dead=int(bool(is_dead)), notes=clean_text(notes), source_row=None, **measured,
     )  # fmt: skip
+    # identified_by здесь — ИМЯ; в person_id его переводит _write_specimen (черновик
+    # только читает базу, а нового человека надо записать в справочник)
     identification = dict(
         species_id=species_id, method="морфология", confidence=confidence,
         identified_by=clean_text(identified_by),
@@ -1128,12 +1188,26 @@ def _draft_specimen(
 
 
 def _write_specimen(conn: sqlite3.Connection, draft: _SpecimenDraft) -> int:
-    """Записать особь, её первое определение вида и образцы; вернуть specimen_id."""
+    """Записать особь, её первое определение вида и образцы; вернуть specimen_id.
+
+    Имя «кто определил» → person_id (find_or_create_person: точное совпадение имени,
+    иначе новый человек в справочнике — его имя остаётся в draft.new_person).
+    """
     specimen_id = _insert(conn, "specimen", **draft.specimen)
-    _insert(conn, "species_identification", specimen_id=specimen_id, **draft.identification)
+    identification = dict(draft.identification)
+    name = identification["identified_by"]
+    identification["identified_by"], created = find_or_create_person(conn, name)
+    draft.new_person = name if created else None
+    _insert(conn, "species_identification", specimen_id=specimen_id, **identification)
     for sample in draft.samples:
         _write_sample(conn, specimen_id, sample)
     return specimen_id
+
+
+def _new_people_note(drafts: list[_SpecimenDraft]) -> str:
+    """« В справочник людей добавлены: …» — если при записи появились новые люди."""
+    names = list(dict.fromkeys(d.new_person for d in drafts if d.new_person))
+    return f" В справочник людей добавлены: {', '.join(names)}." if names else ""
 
 
 def create_specimen(
@@ -1156,6 +1230,7 @@ def create_specimen(
     identified_by: str | None = None,
     notes: str | None = None,
     limits: MeasurementLimits = FISH_LIMITS,
+    user: UserRef = None,
 ) -> EditResult:
     """Новая особь вместе с первой записью истории определений (метод «морфология»).
 
@@ -1166,7 +1241,7 @@ def create_specimen(
     совпадающие с выездом не записываются). trawl_no — траление этого же выезда.
     Несколько особей одним сохранением — create_specimens.
     """
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         event = _event(conn, event_id)
         draft = _draft_specimen(
             conn, event, species, label, confidence=confidence, tl_cm=tl_cm, sl_cm=sl_cm,
@@ -1176,6 +1251,7 @@ def create_specimen(
         )  # fmt: skip
         specimen_id = _write_specimen(conn, draft)
         message = f"Добавлена особь {draft.label} (выезд {_title(event)}): {draft.summary}."
+        message += _new_people_note([draft])
         return _done(conn, message, specimen_id, draft.warnings)
 
 
@@ -1372,6 +1448,13 @@ def _draft_row(
             preservative=sample.get("preservative"), notes=sample.get("notes"),
             labs=sample.get("labs") or (), reserved=reserved,
         )  # fmt: skip
+        values = sample_draft.values
+        key = (values["sample_type"], values["organ"] or "", values["label"])
+        if any((d.values["sample_type"], d.values["organ"] or "", d.values["label"]) == key
+               for d in draft.samples):  # fmt: skip
+            raise EditError(duplicate_sample_message(
+                draft.label, values["sample_type"], values["organ"], values["label"], None
+            ))  # fmt: skip
         draft.samples.append(sample_draft)
         reserved.sample_labels.setdefault(sample_draft.values["label"], draft.label)
     return draft
@@ -1437,6 +1520,8 @@ def create_specimens(
     event_id: int,
     rows: Sequence[Mapping],
     limits: MeasurementLimits = FISH_LIMITS,
+    *,
+    user: UserRef = None,
 ) -> EditResult:
     """Несколько особей выезда одним сохранением: всё или ничего.
 
@@ -1452,7 +1537,7 @@ def create_specimens(
     ничего не записано. Иначе — все особи записаны, журнал перепроверен один раз;
     record_ids — id особей по порядку строк, warnings — «строка N (номер): …».
     """
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         event = _event(conn, event_id)
         check, drafts = _check_batch(conn, event, rows, limits)
         if not check.ok:
@@ -1463,7 +1548,7 @@ def create_specimens(
             f"Добавлено особей: {len(ids)} (выезд {_title(event)}): "
             f"{', '.join(d.label for d in drafts)}"
             + (f"; образцов: {samples}." if samples else ".")
-        )
+        ) + _new_people_note(drafts)
         warnings = [f"строка {r.row} ({r.label}): {w}" for r in check.rows for w in r.warnings]
         result = _done(conn, message, None, warnings)
         result.record_ids = ids
@@ -1535,6 +1620,8 @@ def update_measurements(
     conn: sqlite3.Connection,
     label: str | int,
     limits: MeasurementLimits = FISH_LIMITS,
+    *,
+    user: UserRef = None,
     **changes,
 ) -> EditResult:
     """Изменить промеры особи: tl_cm=…, sl_cm=…, mass_g=…, mass_gutted_g=….
@@ -1547,17 +1634,13 @@ def update_measurements(
     """
     new = _parse_measurements(changes)
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         specimen = _find_specimen(conn, label)
         old, check = _measurements_check(conn, specimen["specimen_id"], new, limits)
         if check.errors:
             raise EditError(" ".join(check.errors))
-        # список колонок — только из MEASUREMENTS (проверено выше), значения — через «?»
-        assignments = ", ".join(f"{column} = ?" for column in new)
-        conn.execute(
-            f"UPDATE specimen SET {assignments} WHERE specimen_id = ?",
-            (*new.values(), specimen["specimen_id"]),
-        )
+        # колонки — только из MEASUREMENTS (проверено выше); права — на эту особь
+        audit.update(conn, "specimen", {"specimen_id": specimen["specimen_id"]}, new)
 
         def show(x):
             return "—" if x is None else f"{x:g}"
@@ -1586,6 +1669,7 @@ def add_sample(
     preservative: str | None = None,
     notes: str | None = None,
     labs: tuple[str, ...] | list[str] = (),
+    user: UserRef = None,
 ) -> EditResult:
     """Образец особи (пробирка, стекло, целая особь); labs — куда сразу отправлен.
 
@@ -1596,7 +1680,7 @@ def add_sample(
         raise EditError(
             f"Тип образца «{sample_type}» не подходит. Возможные: {', '.join(SAMPLE_TYPES)}."
         )
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         specimen = find_specimen(conn, label)
         draft = _draft_sample(
             conn, specimen["label"], specimen["specimen_id"], sample_type, organ=organ,
@@ -1626,10 +1710,12 @@ def ship_sample(
     lab: str,
     sent_on: str | None = None,
     new_lab: bool = False,
+    *,
+    user: UserRef = None,
 ) -> EditResult:
     """Отметить, что образец отправлен в лабораторию (sample_shipment)."""
     date = parse_entry_date(sent_on, "Дата отправки")
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         sample = _sample(conn, sample_id)
         lab_id, created = _lab_id(conn, lab, create=new_lab)
         if conn.execute(
@@ -1659,13 +1745,14 @@ def add_analysis(
     result: str | None = None,
     accession: str | None = None,
     notes: str | None = None,
+    user: UserRef = None,
 ) -> EditResult:
     """Результат исследования образца (analysis): секвенирование, гистология…"""
     analysis_type = clean_text(analysis_type)
     if analysis_type is None:
         raise EditError("Укажите вид анализа, например «секвенирование COI».")
     date = parse_entry_date(analysed_on, "Дата анализа")
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         sample = _sample(conn, sample_id)
         lab_id = _lab_id(conn, lab)[0] if clean_text(lab) else None
         analysis_id = _insert(
@@ -1690,6 +1777,7 @@ def create_catch_record(
     count_n=None,
     mass_g=None,
     trawl_no: int | None = None,
+    user: UserRef = None,
 ) -> EditResult:
     """Прилов / общий улов выезда или траления (catch_record).
 
@@ -1709,7 +1797,7 @@ def create_catch_record(
         if not parts:
             raise EditError("Укажите, что поймали: текст, таксон, число или массу.")
         text = " - ".join(parts)
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         event = _event(conn, event_id)
         trawling_id = None if trawl_no is None else _trawling(conn, event, trawl_no)
         catch_id = _insert(

@@ -11,12 +11,14 @@ GET-параметры — часть адреса после «?»: /specimens?
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from flask import url_for
 
+from biobank.permissions import DELETE, UPDATE
 from biobank.tables import CardSection
 
 # ---------------------------------------------------------------------------
@@ -76,6 +78,21 @@ ROW_KINDS = (
 NO_ACTIONS = ("issue_id", "analysis_id")
 # Записи, которые можно только удалить (правки нет: вид меняют новым определением)
 DELETE_ONLY = ("identification",)
+# Вид записи на сайте → таблица базы (для permissions.can и истории изменений)
+KIND_TABLES = {
+    "expedition": "expedition",
+    "site": "sampling_site",
+    "event": "sampling_event",
+    "trawling": "trawling",
+    "water": "water_measurement",
+    "specimen": "specimen",
+    "sample": "sample",
+    "catch": "catch_record",
+    "identification": "species_identification",
+}
+# Можно ли действие (изменение / удаление) с записью вида kind и номером record_id;
+# функцию даёт app.py (record_forms.record_permit): она знает вошедшего пользователя
+Permit = Callable[[str, int, str], bool]
 
 
 def local_path(value: str | None) -> str | None:
@@ -102,11 +119,24 @@ def local_path(value: str | None) -> str | None:
     return value
 
 
-def row_actions(ids: Mapping, here: str | None = None) -> list[tuple[str, str]]:
-    """Кнопки строки таблицы: «Изменить» и «Удалить» для записи этой строки.
+def history_url(table: str, record_id) -> str:
+    """Адрес страницы «История изменений» одной записи."""
+    return url_for("history", table=table, key=str(record_id))
+
+
+def row_actions(
+    ids: Mapping,
+    here: str | None = None,
+    permit: Permit | None = None,
+    *,
+    history: bool = True,
+) -> list[tuple[str, str]]:
+    """Кнопки строки таблицы: «Изменить», «Удалить» (если можно) и ссылка «История».
 
     here — адрес текущей страницы: передаётся в ссылки параметром next, чтобы после
     сохранения или удаления вернуться сюда же (None — на страницу самой записи).
+    permit(вид, id, действие) — есть ли право (None — кнопок правки нет, только «История»).
+    history=False — без «Истории» (у самой записи страницы история показана отдельно).
     """
     if any(key in ids for key in NO_ACTIONS):
         return []
@@ -116,13 +146,16 @@ def row_actions(ids: Mapping, here: str | None = None) -> list[tuple[str, str]]:
         if record_id is None:
             continue
         buttons = []
-        if kind not in DELETE_ONLY:
+        if kind not in DELETE_ONLY and permit is not None and permit(kind, record_id, UPDATE):
             buttons.append(
                 ("Изменить", url_for("record_edit", kind_name=kind, record_id=record_id, **back))
             )
-        buttons.append(
-            ("Удалить", url_for("record_delete", kind_name=kind, record_id=record_id, **back))
-        )
+        if permit is not None and permit(kind, record_id, DELETE):
+            buttons.append(
+                ("Удалить", url_for("record_delete", kind_name=kind, record_id=record_id, **back))
+            )
+        if history:
+            buttons.append(("История", history_url(KIND_TABLES[kind], record_id)))
         return buttons
     return []
 
@@ -158,6 +191,7 @@ def section_views(
     id_column: str | None = None,
     actions: bool = False,
     here: str | None = None,
+    permit: Permit | None = None,
 ) -> list[SectionView]:
     """Ссылки для всех разделов страницы.
 
@@ -165,7 +199,8 @@ def section_views(
     event_id — выезд страницы (оставлен для совместимости, ссылки от него не зависят);
     id_column — что лежит в колонке «id» отчёта без row_ids («issue_id», «site_id»);
     actions — у строк-записей кнопки «Изменить»/«Удалить» (карточки; в отчётах — нет);
-    here — адрес страницы: туда кнопки вернут после сохранения/удаления (параметр next).
+    here — адрес страницы: туда кнопки вернут после сохранения/удаления (параметр next);
+    permit — право на «Изменить»/«Удалить» у записи строки (см. row_actions).
     Строки таблицы «Траления» (только trawling_id) получают якорь trawling-N.
     """
     views = []
@@ -196,7 +231,9 @@ def section_views(
                 if id_column == "site_id" and "id" in sec.columns:
                     links[sec.columns.index("id")] = _url("site_id", named["id"], named, None)
             view.links.append(links)
-            view.actions.append(row_actions(ids, here) if actions and not sec.is_fields else [])
+            view.actions.append(
+                row_actions(ids, here, permit) if actions and not sec.is_fields else []
+            )
             only_trawl = set(ids) == {"trawling_id"} and ids["trawling_id"] is not None
             view.anchors.append(f"trawling-{ids['trawling_id']}" if only_trawl else None)
         views.append(view)
@@ -344,3 +381,46 @@ def issue_object_url(issue: Mapping) -> str | None:
     if table == "trawling":
         return url_for("trawling", trawling_id=record_id)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Даты и время
+# ---------------------------------------------------------------------------
+
+_ISO_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+_UTC_TIME = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
+
+
+def ru_date(value):
+    """Дата из базы (ГГГГ-ММ-ДД) → ДД.ММ.ГГГГ; всё остальное — без изменений.
+
+    В базе даты остаются в ISO: так их правильно сравнивает и сортирует SQL.
+
+    >>> ru_date("2025-09-25"), ru_date("25.09.2025"), ru_date(None), ru_date(29.9)
+    ('25.09.2025', '25.09.2025', None, 29.9)
+    """
+    if isinstance(value, str):
+        match = _ISO_DATE.fullmatch(value)
+        if match:
+            year, month, day = match.groups()
+            return f"{day}.{month}.{year}"
+    return value
+
+
+def utc_parts(value: str | None) -> tuple[str, str] | None:
+    """Время UTC из базы ('2026-10-20 08:24:14') → (машинное '2026-10-20T08:24:14Z',
+    для людей '20.10.2026 08:24 UTC'); не время — None.
+
+    >>> utc_parts("2026-10-20 08:24:14")
+    ('2026-10-20T08:24:14Z', '20.10.2026 08:24 UTC')
+    >>> utc_parts(None), utc_parts("вчера")
+    (None, None)
+    """
+    if not isinstance(value, str):
+        return None
+    match = _UTC_TIME.fullmatch(value.strip())
+    if not match:
+        return None
+    year, month, day, hour, minute, second = match.groups()
+    machine = f"{year}-{month}-{day}T{hour}:{minute}:{second or '00'}Z"
+    return machine, f"{day}.{month}.{year} {hour}:{minute} UTC"

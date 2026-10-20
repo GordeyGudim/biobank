@@ -4,10 +4,17 @@
 web (сайт); backup и restore (резервная копия и восстановление из неё),
 go-live / undo-go-live (пометка «рабочая база»);
 ввод новых данных (entry.py): add-expedition, add-site, add-event, add-trawling, add-water,
-next-label, add-specimen, update-measurements, add-sample, ship-sample, add-analysis, add-catch.
+next-label, add-specimen, update-measurements, add-sample, ship-sample, add-analysis, add-catch;
+пользователи сайта (users.py): create-user, reset-password, set-roles, deactivate-user,
+activate-user, list-users.
+
+Команды работают в системном режиме (user=None): права не проверяются — у того, кто
+запускает команды на сервере, и так есть доступ к файлу базы; в журнал изменений
+(change_log) они пишутся без пользователя (user_id = NULL).
 """
 
 import argparse
+import getpass
 import shutil
 import sqlite3
 import sys
@@ -66,10 +73,19 @@ from biobank.entry import (
 from biobank.excel_reader import ExcelReadError
 from biobank.export import export_csv, export_xlsx
 from biobank.importer import prepare_import
+from biobank.permissions import ROLES, normalize_role, roles_help
 from biobank.reports import REPORTS, render_report
 from biobank.tables import format_table, run_query
+from biobank.users import (
+    activate,
+    create_user,
+    deactivate,
+    list_users,
+    reset_password,
+    set_roles,
+)
 
-WEB_HOST = "127.0.0.1"  # сайт доступен только с этого компьютера (до входа по паролю)
+WEB_HOST = "127.0.0.1"  # встроенный сервер — только для этого компьютера (см. cmd_web)
 
 # Подсказки командной строки к сообщениям логики. Сами сообщения (entry.py, records.py)
 # нейтральны — их показывает и сайт («отметьте «это новая лаборатория»»), а здесь к ним
@@ -448,8 +464,12 @@ def cmd_web(args: argparse.Namespace) -> int:
         print("Для сайта нужен Flask: .venv/bin/pip install -e '.[web]'", file=sys.stderr)
         return 1
     print(f"Сайт: http://{WEB_HOST}:{args.port}/  (остановить — Ctrl+C)")
-    # только 127.0.0.1: входа по паролю пока нет, из сети сайт открываться не должен
-    create_app(args.db).run(host=WEB_HOST, port=args.port, debug=False)
+    # Вход по паролю есть, но встроенный сервер Flask — для работы на своём компьютере:
+    # без HTTPS пароль шёл бы по сети открытым текстом. На сервере сайт ставят за прокси
+    # с HTTPS (nginx…) и настраивают переменными окружения — README, раздел «Сайт».
+    # secure_cookies: ключ --secure-cookies или BIOBANK_SECURE_COOKIES=1 (None — из окружения)
+    secure = True if args.secure_cookies else None
+    create_app(args.db, secure_cookies=secure).run(host=WEB_HOST, port=args.port, debug=False)
     return 0
 
 
@@ -616,6 +636,169 @@ def cmd_add_catch(args: argparse.Namespace) -> int:
     )  # fmt: skip
 
 
+# --- Пользователи сайта (users.py) --------------------------------------------
+
+
+def ask_new_password() -> str | None:
+    """Пароль — только с клавиатуры, дважды и без показа на экране (getpass).
+
+    Не аргументом командной строки: аргументы видны другим пользователям сервера
+    (список процессов) и остаются в истории команд терминала.
+    """
+    first = getpass.getpass("Пароль (не меньше 10 символов): ")
+    second = getpass.getpass("Пароль ещё раз: ")
+    if first != second:
+        print("Ошибка: пароли не совпадают. Пользователь не создан.", file=sys.stderr)
+        return None
+    return first
+
+
+def _run_users(args: argparse.Namespace, action) -> int:
+    """Общая обёртка команд пользователей: подключение → action(conn) → ошибка или 0."""
+    if not _require_db(args.db):
+        return 1
+    conn = connect(args.db)
+    try:
+        action(conn)
+    except EditError as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        print("База не изменена.", file=sys.stderr)
+        return 1
+    except sqlite3.Error as error:
+        print(f"Ошибка базы данных: {error}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    return 0
+
+
+def _roles_text(user) -> str:
+    return ", ".join(role for role in ROLES if role in user.roles)
+
+
+def cmd_create_user(args: argparse.Namespace) -> int:
+    if not _require_db(args.db):
+        return 1
+    password = ask_new_password()
+    if password is None:
+        return 1
+
+    def action(conn):
+        user = create_user(
+            conn, args.login, password, args.name, args.role, args.person,
+            must_change_password=args.must_change,
+        )  # fmt: skip
+        print(f"Создан пользователь {user.login} «{user.display_name}»: {_roles_text(user)}.")
+        if user.must_change_password:
+            print("При первом входе сайт попросит сменить пароль.")
+
+    return _run_users(args, action)
+
+
+def cmd_reset_password(args: argparse.Namespace) -> int:
+    def action(conn):
+        temporary = reset_password(conn, args.login)
+        print(f"Временный пароль для {args.login}: {temporary}")
+        print("Он показан один раз. При входе сайт попросит сменить его.")
+
+    return _run_users(args, action)
+
+
+def cmd_set_roles(args: argparse.Namespace) -> int:
+    def action(conn):
+        user = set_roles(conn, args.login, args.role)
+        print(f"Роли {user.login}: {_roles_text(user)}.")
+
+    return _run_users(args, action)
+
+
+def cmd_deactivate_user(args: argparse.Namespace) -> int:
+    def action(conn):
+        user = deactivate(conn, args.login)
+        print(f"Вход для {user.login} закрыт. Записи и история пользователя сохранены.")
+
+    return _run_users(args, action)
+
+
+def cmd_activate_user(args: argparse.Namespace) -> int:
+    def action(conn):
+        user = activate(conn, args.login)
+        print(f"Вход для {user.login} открыт.")
+
+    return _run_users(args, action)
+
+
+def cmd_list_users(args: argparse.Namespace) -> int:
+    if not _require_db(args.db):
+        return 1
+    conn = connect_read_only(args.db)
+    try:
+        users = list_users(conn)
+    finally:
+        conn.close()
+    if not users:
+        print("Пользователей нет. Первого админа: python -m biobank create-user <логин> "
+              "--role админ --name «Имя»")  # fmt: skip
+        return 0
+    rows = [
+        (u.user_id, u.login, u.display_name, _roles_text(u), "да" if u.is_active else "нет",
+         u.last_login_at or "—")
+        for u in users
+    ]  # fmt: skip
+    columns = ["№", "логин", "имя", "роли", "вход открыт", "последний вход (UTC)"]
+    print(format_table(columns, rows, total_width=screen_width()))
+    return 0
+
+
+def role_arg(text: str) -> str:
+    """--role: русское или английское имя роли в любом регистре → русское (как в базе)."""
+    try:
+        return normalize_role(text)
+    except EditError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _add_user_parsers(sub) -> None:
+    roles = roles_help()
+    p = sub.add_parser(
+        "create-user",
+        help="новый пользователь сайта (пароль спросит дважды)",
+        description="Пароль вводится с клавиатуры (не аргументом). Так создаётся и первый админ.",
+    )
+    p.add_argument("login", help="логин: латиница, цифры, «.», «_», «-»")
+    p.add_argument("--name", required=True, help="имя для подписи в карточках, напр. «Иванова А.»")
+    p.add_argument("--role", action="append", required=True, type=role_arg, metavar="РОЛЬ",
+                   help=f"роль (можно несколько --role): {roles}")  # fmt: skip
+    p.add_argument("--person", type=int, help="этот же человек в справочнике людей (person_id)")
+    p.add_argument(
+        "--must-change",
+        action="store_true",
+        help="при первом входе попросить сменить пароль (если его придумали вы)",
+    )
+    p.set_defaults(func=cmd_create_user)
+
+    p = sub.add_parser("reset-password", help="новый временный пароль (покажет один раз)")
+    p.add_argument("login")
+    p.set_defaults(func=cmd_reset_password)
+
+    p = sub.add_parser("set-roles", help="заменить роли пользователя")
+    p.add_argument("login")
+    p.add_argument("--role", action="append", required=True, type=role_arg, metavar="РОЛЬ",
+                   help=f"роль (можно несколько --role): {roles}")  # fmt: skip
+    p.set_defaults(func=cmd_set_roles)
+
+    p = sub.add_parser("deactivate-user", help="закрыть вход пользователю (записи остаются)")
+    p.add_argument("login")
+    p.set_defaults(func=cmd_deactivate_user)
+
+    p = sub.add_parser("activate-user", help="снова открыть вход пользователю")
+    p.add_argument("login")
+    p.set_defaults(func=cmd_activate_user)
+
+    p = sub.add_parser("list-users", help="пользователи сайта и их роли")
+    p.set_defaults(func=cmd_list_users)
+
+
 def _add_entry_parsers(sub) -> None:
     """Команды ввода новых данных. Числа можно писать с запятой: 29,3."""
     p = sub.add_parser("add-expedition", help="новая экспедиция")
@@ -703,7 +886,7 @@ def _add_entry_parsers(sub) -> None:
     p.add_argument("--method", help="способ получения, если отличается от выезда (напр. рыбак)")
     p.add_argument("--site", type=int, help="место поимки (site_id), если отличается от выезда")
     p.add_argument("--date", help="дата поимки, если отличается от даты выезда")
-    p.add_argument("--by", help="кто определил вид")
+    p.add_argument("--by", help="кто определил вид (имя; новое — в справочник людей)")
     p.add_argument("--notes", help="примечание")
     p.set_defaults(func=cmd_add_specimen)
 
@@ -825,7 +1008,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ident.add_argument("--method", choices=METHODS, required=True)
     p_ident.add_argument("--confidence", choices=CONFIDENCES, required=True)
-    p_ident.add_argument("--by", help="кто определил")
+    p_ident.add_argument("--by", help="кто определил (имя; новое — в справочник людей)")
     p_ident.add_argument("--date", help="дата определения ГГГГ-ММ-ДД (по умолчанию сегодня)")
     p_ident.add_argument("--notes", help="примечание, напр. номер в GenBank")
     p_ident.set_defaults(func=cmd_identify)
@@ -875,9 +1058,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_web = sub.add_parser("web", help="веб-интерфейс на этом компьютере (127.0.0.1)")
     p_web.add_argument("--port", type=int, default=5000, help="порт (по умолчанию 5000)")
+    p_web.add_argument(
+        "--secure-cookies",
+        action="store_true",
+        help="cookie входа только по HTTPS (за прокси с HTTPS; то же — BIOBANK_SECURE_COOKIES=1)",
+    )
     p_web.set_defaults(func=cmd_web)
 
     _add_entry_parsers(sub)
+    _add_user_parsers(sub)
     return parser
 
 

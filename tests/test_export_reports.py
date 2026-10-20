@@ -1,13 +1,14 @@
 """Тесты этапа 6: выгрузка xlsx/csv, отчёты, команда sql."""
 
 import csv
+import shutil
 
 import openpyxl
 import pytest
 from conftest import SOURCE, count
 
 from biobank.__main__ import main
-from biobank.db import connect_read_only
+from biobank.db import connect, connect_read_only
 from biobank.export import ISSUES_SHEET, export_csv, export_xlsx
 from biobank.reports import REPORTS, render_report
 from biobank.tables import run_query
@@ -62,6 +63,50 @@ def test_csv_files(ro, tmp_path):
         rows = list(csv.reader(f))
     assert rows[0][0] == "№ пробы"
     assert len(rows) == 462 + 1
+
+
+SECRET_HASH = "scrypt:32768:8:1$соль$секретный-хеш"
+
+
+@pytest.fixture
+def with_user(db_path, tmp_path):
+    """Копия базы с одной учётной записью сайта (с хешем пароля) — только на чтение."""
+    path = tmp_path / "users.db"
+    shutil.copy(db_path, path)
+    conn = connect(path)
+    with conn:
+        conn.execute(
+            "INSERT INTO app_user (login, password_hash, display_name, created_at) "
+            "VALUES ('ivanova', ?, 'Иванова А.', '2026-10-20 10:00:00')",
+            (SECRET_HASH,),
+        )
+    conn.close()
+    ro = connect_read_only(path)
+    yield ro
+    ro.close()
+
+
+def test_export_has_v3_tables(ro, tmp_path):
+    out = tmp_path / "out.xlsx"
+    export_xlsx(ro, out)
+    sheets = openpyxl.load_workbook(out).sheetnames
+    for table in ("person", "expedition_member", "app_user", "user_role", "change_log"):
+        assert table in sheets
+
+
+def test_export_hides_password_hash_and_login(with_user, tmp_path):
+    """Хеш пароля и логин не попадают ни в xlsx, ни в csv; имя для подписи — попадает."""
+    out = tmp_path / "out.xlsx"
+    export_xlsx(with_user, out)
+    ws = openpyxl.load_workbook(out)["app_user"]
+    header = [c.value for c in ws[1]]
+    assert header == ["user_id", "display_name", "person_id", "is_active", "created_at"]
+    assert [c.value for c in ws[2]][1] == "Иванова А."
+
+    export_csv(with_user, tmp_path / "csv")
+    text = "".join(p.read_text(encoding="utf-8-sig") for p in (tmp_path / "csv").iterdir())
+    assert "Иванова А." in text
+    assert SECRET_HASH not in text and "password_hash" not in text and "ivanova" not in text
 
 
 # ---------------------------------------------------------------------------

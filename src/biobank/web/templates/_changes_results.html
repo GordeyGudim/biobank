@@ -1,0 +1,9 @@
+{#- Таблица журнала изменений. Фрагмент для HTMX (фильтры, страницы). -#}
+{% from "_macros.html" import change_table, pager, warnings %}
+<div id="results" class="results">
+  {{ warnings(query.warnings) }}
+  <p class="count">Изменений: <strong>{{ page.total }}</strong>. Даты фильтра — по времени UTC.</p>
+  {% if page.items %}{{ change_table(page.items, with_record=true) }}
+  {% else %}<p class="empty">По этим фильтрам изменений нет.</p>{% endif %}
+  {{ pager(page, 'changes', query.args) }}
+</div>

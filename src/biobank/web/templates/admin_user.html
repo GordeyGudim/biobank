@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% from "_macros.html" import utc, value %}
+{#- Один пользователь (только админ): роли, сброс пароля, закрыть / открыть вход.
+    Каждая кнопка — отдельная форма POST; ошибка (например «последний админ») — у своей формы. -#}
+{% block title %}Пользователь {{ target.login }}{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('admin_users') }}">Пользователи</a> /</p>
+<h1>{{ target.display_name }} ({{ target.login }})</h1>
+{% include "_password_note.html" %}
+<div class="table-wrap">
+  <table class="fields">
+    <tr><th scope="row">роли</th><td>{{ target.roles | sort | join(", ") }}</td></tr>
+    <tr><th scope="row">вход</th><td>{% if target.is_active %}открыт{% else %}<strong>закрыт</strong>{% endif %}</td></tr>
+    <tr><th scope="row">временный пароль</th><td>{% if target.must_change_password %}да — сменит при входе{% else %}нет{% endif %}</td></tr>
+    <tr><th scope="row">последний вход</th><td>{% if target.last_login_at %}{{ utc(target.last_login_at) }}{% else %}{{ value(none) }}{% endif %}</td></tr>
+    <tr><th scope="row">создан</th><td>{{ utc(target.created_at) }}</td></tr>
+  </table>
+</div>
+<p><a href="{{ url_for('changes', user=target.user_id) }}">Что менял(а) этот пользователь — журнал изменений</a></p>
+
+<section class="section">
+  <h2>Роли</h2>
+  <form method="post" action="{{ url_for('admin_user_roles', user_id=target.user_id) }}">
+    {% if errors.roles %}<p class="field-error flash flash-error" id="roles-error" role="alert">{{ errors.roles }}</p>{% endif %}
+    <fieldset class="checks"{% if errors.roles %} aria-describedby="roles-error"{% endif %}>
+      <legend>Роли пользователя</legend>
+      {% for role in roles %}
+      <div class="field check">
+        <input type="checkbox" id="role-{{ loop.index }}" name="roles" value="{{ role }}"{% if role in target.roles %} checked{% endif %}>
+        <label for="role-{{ loop.index }}">{{ role }}</label> <span class="hint">— {{ role_hints[role] }}</span>
+      </div>
+      {% endfor %}
+    </fieldset>
+    <div class="buttons"><button type="submit">Сохранить роли</button></div>
+  </form>
+</section>
+
+<section class="section">
+  <h2>Пароль</h2>
+  <form method="post" action="{{ url_for('admin_user_reset', user_id=target.user_id) }}">
+    {% if errors.password %}<p class="field-error flash flash-error" role="alert">{{ errors.password }}</p>{% endif %}
+    <p class="small">Прежний пароль перестанет действовать. Новый временный покажем один раз;
+      при входе пользователь придумает свой.</p>
+    <div class="buttons"><button type="submit" class="danger">Сбросить пароль</button></div>
+  </form>
+</section>
+
+<section class="section">
+  <h2>Сессии</h2>
+  <form method="post" action="{{ url_for('admin_user_sessions', user_id=target.user_id) }}">
+    {% if errors.sessions %}<p class="field-error flash flash-error" role="alert">{{ errors.sessions }}</p>{% endif %}
+    <p class="small">Пользователь выйдет на всех устройствах (например, забыл выйти на чужом
+      компьютере или потерял телефон). Пароль не меняется — войти можно снова.</p>
+    <div class="buttons"><button type="submit">Завершить все сессии</button></div>
+  </form>
+</section>
+
+<section class="section">
+  <h2>Вход на сайт</h2>
+  <form method="post" action="{{ url_for('admin_user_active', user_id=target.user_id) }}">
+    {% if errors.active %}<p class="field-error flash flash-error" role="alert">{{ errors.active }}</p>{% endif %}
+    {% if target.is_active %}
+    <p class="small">Закрыть вход: пользователь сразу перестанет иметь доступ (и уже открытые
+      страницы перестанут работать). Его записи и история остаются.</p>
+    <input type="hidden" name="active" value="0">
+    <div class="buttons"><button type="submit" class="danger">Закрыть вход</button></div>
+    {% else %}
+    <input type="hidden" name="active" value="1">
+    <div class="buttons"><button type="submit">Открыть вход</button></div>
+    {% endif %}
+  </form>
+</section>
+{% endblock %}

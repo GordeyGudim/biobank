@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% from "_macros.html" import value %}
+{#- Справочник людей (browse.list_people): кто определял виды, участники экспедиций.
+    Куратор может объединить дубли (опечатка в имени): сначала вопрос «Вы уверены?»,
+    потом кнопка «Да, объединить» (POST с confirm=1) → edit.merge_people. -#}
+{% block title %}Люди{% endblock %}
+{% block content %}
+<h1>Люди</h1>
+<p>Справочник людей: кто определял вид, участники экспедиций. Не обязательно пользователи сайта.
+  Новый человек добавляется сам, когда его имя впервые вписывают в поле «кто определил».</p>
+
+{% if confirm %}
+<section class="section" id="merge-confirm">
+  <h2>Объединить?</h2>
+  <p><strong>Вы уверены?</strong> «{{ confirm.remove.full_name }}» (№{{ confirm.remove.person_id }},
+    определений вида: {{ confirm.remove.identification_count }}) будет удалён(а) из справочника,
+    а все ссылки на него/неё перейдут к «{{ confirm.keep.full_name }}» (№{{ confirm.keep.person_id }}).</p>
+  <form method="post" action="{{ url_for('people_merge') }}">
+    <input type="hidden" name="keep_id" value="{{ confirm.keep.person_id }}">
+    <input type="hidden" name="remove_id" value="{{ confirm.remove.person_id }}">
+    <div class="buttons">
+      <button type="submit" name="confirm" value="1" class="danger">Да, объединить</button>
+      <a class="button-link" href="{{ url_for('people') }}">Отмена</a>
+    </div>
+  </form>
+</section>
+{% elif can_merge %}
+<details class="edit-form" id="f-merge"{% if error %} open{% endif %}>
+  <summary>Объединить двух людей (дубль)</summary>
+  <form method="post" action="{{ url_for('people_merge') }}">
+    {% if error %}<p class="field-error flash flash-error" id="merge-error" role="alert">{{ error }}</p>{% endif %}
+    <div class="form-grid">
+      {% for name, title in (("keep_id", "Оставить"), ("remove_id", "Убрать (дубль)")) %}
+      <div class="field">
+        <label for="f-merge-{{ name }}">{{ title }}</label>
+        <select id="f-merge-{{ name }}" name="{{ name }}" required{% if error %} aria-describedby="merge-error"{% endif %}>
+          <option value="">— выберите —</option>
+          {% for p in people %}
+          <option value="{{ p.person_id }}"{% if form.get(name) == p.person_id | string %} selected{% endif %}>{{ p.full_name }} (№{{ p.person_id }}{% if p.organization %}, {{ p.organization }}{% endif %})</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="buttons"><button type="submit">Объединить…</button>
+      <span class="small">Сначала покажем, что произойдёт, и спросим подтверждение.</span></div>
+  </form>
+</details>
+{% endif %}
+
+{% if people %}
+<div class="table-wrap">
+  <table class="list">
+    <thead><tr><th scope="col">№</th><th scope="col">имя</th><th scope="col">латиницей</th>
+      <th scope="col">организация</th><th scope="col">определений вида</th><th scope="col"><span class="visually-hidden">история</span></th></tr></thead>
+    <tbody>
+    {% for p in people %}
+      <tr>
+        <td class="num">{{ p.person_id }}</td>
+        <td>{{ p.full_name }}</td>
+        <td>{{ value(p.name_latin) }}</td>
+        <td>{{ value(p.organization) }}</td>
+        <td class="num">{{ p.identification_count }}</td>
+        <td><a class="small" href="{{ history_url('person', p.person_id) }}">история</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="empty">В справочнике пока никого нет.</p>
+{% endif %}
+{% endblock %}

@@ -10,7 +10,10 @@
 - проверка и запись — в одной транзакции BEGIN IMMEDIATE (edit.write_transaction);
   резервная копия — apply_edit(db_path, lambda conn: update_…(conn, …));
 - жёсткие ошибки — EditError (в базу ничего не записано), нет записи — NotFoundError;
-- функции ничего не печатают и возвращают EditResult (record_id — id изменённой записи).
+- функции ничего не печатают и возвращают EditResult (record_id — id изменённой записи);
+- кто правит — параметр user (None — системный режим CLI). Исследователь правит и удаляет
+  только свои записи (created_by = он), куратор — любые; при удалении проверяются права на
+  каждую удаляемую запись (у особи — и на её определения вида). Всё — в change_log.
 
 ПРАВКА: update_<запись>(conn, id, поле=значение, …) — меняются только переданные поля;
 None или пустая строка — стереть значение (у обязательных полей — EditError);
@@ -38,7 +41,10 @@ import datetime as dt
 import sqlite3
 from collections.abc import Iterable
 
+from biobank import audit
+from biobank.audit import UserRef
 from biobank.checks import suffix_mismatch
+from biobank.db import now_utc
 from biobank.edit import (
     EditError,
     EditResult,
@@ -57,22 +63,24 @@ from biobank.entry import (
     _done,
     _event,
     _expedition,
-    _extend_expedition_dates,
     _gear_id,
     _method_id,
     _numbering_warnings,
     _row_flag,
     _row_int,
     _site,
+    _sync_expedition_dates,
     _title,
     _trawling,
     clean_text,
+    duplicate_sample_message,
     find_nearby_sites,
     normalize_gear_size,
     parse_coord_source,
     parse_entry_date,
     parse_entry_number,
     parse_entry_time,
+    same_sample,
 )
 from biobank.importer import SITE_TYPE
 from biobank.parsing import SUFFIXES, parse_label
@@ -165,15 +173,12 @@ def _get(conn: sqlite3.Connection, sql: str, record_id, message: str) -> sqlite3
 def _apply(conn: sqlite3.Connection, table: str, key: str, record_id: int, old, new: dict) -> dict:
     """UPDATE только тех колонок, значение которых правда меняется; вернуть их.
 
+    Через audit.update: права текущего пользователя на эту запись (исследователь — только
+    своя) и строки журнала изменений «было → стало». old здесь не нужен (audit читает
+    запись сам) — параметр оставлен, чтобы не менять вызовы.
     Имена таблицы и колонок — из кода этого модуля (не от пользователя), значения — через «?».
     """
-    changed = {column: value for column, value in new.items() if old[column] != value}
-    if changed:
-        assignments = ", ".join(f"{column} = ?" for column in changed)
-        conn.execute(
-            f"UPDATE {table} SET {assignments} WHERE {key} = ?", (*changed.values(), record_id)
-        )
-    return changed
+    return audit.update(conn, table, {key: record_id}, new)
 
 
 def _describe(names: dict[str, str], old, changed: dict, shown: dict | None = None) -> list[str]:
@@ -210,7 +215,9 @@ def _id(value, what: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def update_expedition(conn: sqlite3.Connection, expedition_id: int, **changes) -> EditResult:
+def update_expedition(
+    conn: sqlite3.Connection, expedition_id: int, *, user: UserRef = None, **changes
+) -> EditResult:
     """Изменить экспедицию: name, date_start, date_end, notes (EXPEDITION_FIELDS).
 
     Название уникально. Даты должны включать даты всех выездов экспедиции
@@ -227,7 +234,7 @@ def update_expedition(conn: sqlite3.Connection, expedition_id: int, **changes) -
     if "notes" in changes:
         new["notes"] = clean_text(changes["notes"])
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn, "SELECT * FROM expedition WHERE expedition_id = ?", expedition_id,
             f"Экспедиции №{expedition_id} нет.",
@@ -296,6 +303,7 @@ def update_site(
     *,
     allow_nearby: bool = False,
     new_region: bool = False,
+    user: UserRef = None,
     **changes,
 ) -> EditResult:
     """Изменить место: name, site_type, lat, lon, city, region, description (SITE_FIELDS).
@@ -324,7 +332,7 @@ def update_site(
     if "description" in changes:
         new["description"] = clean_text(changes["description"])
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(conn, _SITE_SQL, site_id, f"Места №{site_id} нет.")
         merged = {**dict(old), **new}
         if (merged["lat"] is None) != (merged["lon"] is None):
@@ -388,15 +396,17 @@ def _gear_text(mesh: str | None, size: str | None) -> str:
     return "—" if not (mesh or size) else f"ячея {mesh or '?'} см, сеть {size or '?'} м"
 
 
-def update_event(conn: sqlite3.Connection, event_id: int, **changes) -> EditResult:
+def update_event(
+    conn: sqlite3.Connection, event_id: int, *, user: UserRef = None, **changes
+) -> EditResult:
     """Изменить выезд: expedition_id, site_id, event_date, capture_method, gear_mesh,
     gear_size, notes (EVENT_FIELDS). Лист Excel (source_sheet) не меняется — это происхождение.
 
     Проверки как у create_event: тип места подходит к способу получения, такого же выезда
     ещё нет, сеть — только у тралений. Способ «траление» нельзя сменить, пока у выезда
     есть траления; чтобы сменить на другой способ, сеть убирают в той же правке
-    (gear_mesh=None, gear_size=None). Даты экспедиции расширяются до даты выезда;
-    даты прежней экспедиции (при переносе) не сужаются — их правят update_expedition.
+    (gear_mesh=None, gear_size=None). Даты экспедиции пересчитываются по её выездам
+    (min/max); при переносе в другую экспедицию — у обеих.
     """
     _check_fields(changes, EVENT_FIELDS)
     new_date = None
@@ -407,7 +417,7 @@ def update_event(conn: sqlite3.Connection, event_id: int, **changes) -> EditResu
     if "capture_method" in changes:
         _required(changes["capture_method"], "Способ получения")
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(conn, _EVENT_FULL_SQL, event_id, f"Выезда №{event_id} нет.")
         title = event_title(old["source_sheet"], event_id, old["event_date"])
         expedition_id = old["expedition_id"]
@@ -459,7 +469,7 @@ def update_event(conn: sqlite3.Connection, event_id: int, **changes) -> EditResu
         if "notes" in changes:
             new["notes"] = clean_text(changes["notes"])
 
-        warnings = _extend_expedition_dates(conn, expedition, date)
+        warnings: list[str] = []
         if date != old["event_date"]:
             n = conn.execute(
                 "SELECT count(*) FROM species_identification si JOIN specimen s "
@@ -472,6 +482,10 @@ def update_event(conn: sqlite3.Connection, event_id: int, **changes) -> EditResu
                     f"({old['event_date']}); они не изменены."
                 )
         changed = _apply(conn, "sampling_event", "event_id", event_id, old, new)
+        # даты экспедиции — по её выездам; при переносе — у обеих экспедиций
+        warnings[:0] = _sync_expedition_dates(conn, expedition_id, date)
+        if expedition_id != old["expedition_id"]:
+            _sync_expedition_dates(conn, old["expedition_id"])
         shown = {
             "expedition_id": (_show(old["expedition"]), _show(expedition["name"])),
             "site_id": (_show(old["site"]), _show(site["name"])),
@@ -490,7 +504,9 @@ def _trawl_no(value) -> int | None:
     return number
 
 
-def update_trawling(conn: sqlite3.Connection, trawling_id: int, **changes) -> EditResult:
+def update_trawling(
+    conn: sqlite3.Connection, trawling_id: int, *, user: UserRef = None, **changes
+) -> EditResult:
     """Изменить траление: trawl_no, time_start, time_end, duration_min, speed_kmh,
     intermediate_depth_m, catch_note, notes (TRAWLING_FIELDS).
 
@@ -518,7 +534,7 @@ def update_trawling(conn: sqlite3.Connection, trawling_id: int, **changes) -> Ed
         if column in changes:
             new[column] = clean_text(changes[column])
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn, "SELECT * FROM trawling WHERE trawling_id = ?", trawling_id,
             f"Траления №{trawling_id} нет.",
@@ -538,7 +554,7 @@ def update_trawling(conn: sqlite3.Connection, trawling_id: int, **changes) -> Ed
 
 
 def update_water_measurement(
-    conn: sqlite3.Connection, measurement_id: int, **changes
+    conn: sqlite3.Connection, measurement_id: int, *, user: UserRef = None, **changes
 ) -> EditResult:
     """Изменить замер воды: point_type, trawl_no, measured_time, coord_source, garmin_wp,
     notes и числа WATER_NUMBERS (lat, lon, depth_m, o2_pct, ppm, …) — WATER_FIELDS.
@@ -567,7 +583,7 @@ def update_water_measurement(
             new[column] = parse_entry_number(changes[column], what, minimum=low, maximum=high)
     trawl_no = _trawl_no(changes["trawl_no"]) if "trawl_no" in changes else None
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn,
             "SELECT w.*, t.trawl_no FROM water_measurement w "
@@ -669,7 +685,9 @@ def _relabel(conn: sqlite3.Connection, old: sqlite3.Row, text, warnings: list[st
     return dict(label=parsed.label, series=parsed.series, series_no=parsed.number)
 
 
-def update_specimen(conn: sqlite3.Connection, specimen_id: int, **changes) -> EditResult:
+def update_specimen(
+    conn: sqlite3.Connection, specimen_id: int, *, user: UserRef = None, **changes
+) -> EditResult:
     """Изменить особь (кроме промеров и вида): label, event_id, trawl_no, sex, is_dead, notes,
     capture_method, capture_site_id, capture_date (SPECIMEN_FIELDS).
 
@@ -693,7 +711,7 @@ def update_specimen(conn: sqlite3.Connection, specimen_id: int, **changes) -> Ed
         raise EditError(f"Пол «{changes['sex']}» не подходит. Возможные: {', '.join(SEXES)}.")
     own_date = parse_entry_date(changes.get("capture_date"), "Дата поимки")
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(conn, _SPECIMEN_FULL_SQL, specimen_id, f"Особи №{specimen_id} нет.")
         warnings: list[str] = []
         new = {}
@@ -786,7 +804,9 @@ def update_specimen(conn: sqlite3.Connection, specimen_id: int, **changes) -> Ed
         return _finish(conn, f"Особь {label}", lines, specimen_id, warnings)
 
 
-def update_sample(conn: sqlite3.Connection, sample_id: int, **changes) -> EditResult:
+def update_sample(
+    conn: sqlite3.Connection, sample_id: int, *, user: UserRef = None, **changes
+) -> EditResult:
     """Изменить образец: sample_type, organ, label (метка), preservative, notes (SAMPLE_FIELDS).
 
     Пустая метка — номер особи (как при вводе). Метка, которая есть у образца
@@ -805,7 +825,7 @@ def update_sample(conn: sqlite3.Connection, sample_id: int, **changes) -> EditRe
         if column in changes:
             new[column] = clean_text(changes[column])
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn,
             "SELECT sa.*, sp.label AS specimen FROM sample sa "
@@ -823,12 +843,18 @@ def update_sample(conn: sqlite3.Connection, sample_id: int, **changes) -> EditRe
             if other:
                 raise EditError(f"Метка образца «{tag}» уже есть у особи {other['label']}.")
             new["label"] = tag
+        after = {c: new.get(c, old[c]) for c in ("sample_type", "organ", "label")}
+        same = same_sample(conn, old["specimen_id"], *after.values(), exclude_id=sample_id)
+        if same is not None:
+            raise EditError(duplicate_sample_message(old["specimen"], *after.values(), same))
         changed = _apply(conn, "sample", "sample_id", sample_id, old, new)
         title = f"Образец №{sample_id} особи {old['specimen']}"
         return _finish(conn, title, _describe(SAMPLE_FIELDS, old, changed), sample_id)
 
 
-def update_catch_record(conn: sqlite3.Connection, catch_id: int, **changes) -> EditResult:
+def update_catch_record(
+    conn: sqlite3.Connection, catch_id: int, *, user: UserRef = None, **changes
+) -> EditResult:
     """Изменить запись прилова: raw_text, taxon_text, count_n, mass_g, trawl_no (CATCH_FIELDS).
 
     raw_text обязателен; trawl_no — траление того же выезда, None — улов всего выезда.
@@ -848,7 +874,7 @@ def update_catch_record(conn: sqlite3.Connection, catch_id: int, **changes) -> E
         new["mass_g"] = parse_entry_number(changes["mass_g"], "Масса", minimum=0)
     trawl_no = _trawl_no(changes["trawl_no"]) if "trawl_no" in changes else None
 
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn,
             "SELECT c.*, t.trawl_no FROM catch_record c "
@@ -937,11 +963,12 @@ def _retire_issues(
             resolution = f"{r['resolution'] or 'решено'}; {note}"
         else:
             resolution = note[0].upper() + note[1:]
-        conn.execute(
-            "UPDATE data_issue SET resolved = 1, resolution = ?, record_id = NULL "
-            "WHERE issue_id = ?",
-            (resolution, r["issue_id"]),
-        )
+        actor = audit.current_user()
+        new = {"resolved": 1, "resolution": resolution, "record_id": None}
+        if not r["resolved"]:  # когда и кем закрыта; у уже решённой не меняется
+            new.update(resolved_at=now_utc(), resolved_by=actor.user_id if actor else None)
+        # следствие удаления (права на удаление уже проверены)
+        audit.update(conn, "data_issue", {"issue_id": r["issue_id"]}, new, derived=True)
     return len(rows)
 
 
@@ -957,42 +984,44 @@ def _deleted(
     return _done(conn, message, record_id)
 
 
-def delete_expedition(conn: sqlite3.Connection, expedition_id: int) -> EditResult:
+def delete_expedition(
+    conn: sqlite3.Connection, expedition_id: int, *, user: UserRef = None
+) -> EditResult:
     """Удалить экспедицию без выездов."""
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _expedition(conn, expedition_id)
         what = f"экспедиция «{old['name']}»"
         _refuse_if_dependents(conn, f"Экспедицию «{old['name']}»", expedition_id, [
             ("SELECT count(*) FROM sampling_event WHERE expedition_id = ?", EVENTS),
         ])  # fmt: skip
-        conn.execute("DELETE FROM expedition WHERE expedition_id = ?", (expedition_id,))
+        audit.delete(conn, "expedition", {"expedition_id": expedition_id})
         retired = _retire_issues(conn, "expedition", expedition_id, what)
         return _deleted(conn, f"Удалена {what}.", expedition_id, retired)
 
 
-def delete_site(conn: sqlite3.Connection, site_id: int) -> EditResult:
+def delete_site(conn: sqlite3.Connection, site_id: int, *, user: UserRef = None) -> EditResult:
     """Удалить место, на которое нет выездов и особей с этим местом поимки.
 
     Город и провинция остаются в справочнике.
     """
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _site(conn, site_id)
         what = f"место №{site_id} «{old['name']}»"
         _refuse_if_dependents(conn, f"Место «{old['name']}»", site_id, [
             ("SELECT count(*) FROM sampling_event WHERE site_id = ?", EVENTS),
             ("SELECT count(*) FROM specimen WHERE capture_site_id = ?", SPECIMENS),
         ])  # fmt: skip
-        conn.execute("DELETE FROM sampling_site WHERE site_id = ?", (site_id,))
+        audit.delete(conn, "sampling_site", {"site_id": site_id})
         retired = _retire_issues(conn, "sampling_site", site_id, what)
         return _deleted(conn, f"Удалено {what}.", site_id, retired)
 
 
-def delete_event(conn: sqlite3.Connection, event_id: int) -> EditResult:
+def delete_event(conn: sqlite3.Connection, event_id: int, *, user: UserRef = None) -> EditResult:
     """Удалить выезд без особей, тралений, замеров воды и прилова.
 
-    Даты экспедиции не сужаются (их можно поправить update_expedition).
+    Даты экспедиции пересчитываются по оставшимся выездам (min / max).
     """
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         event = _event(conn, event_id)
         what = f"выезд {_title(event)}"
         _refuse_if_dependents(conn, f"Выезд {_title(event)}", event_id, [
@@ -1003,17 +1032,20 @@ def delete_event(conn: sqlite3.Connection, event_id: int) -> EditResult:
              WATERS),
             ("SELECT count(*) FROM catch_record WHERE event_id = ?", CATCHES),
         ])  # fmt: skip
-        conn.execute("DELETE FROM sampling_event WHERE event_id = ?", (event_id,))
+        audit.delete(conn, "sampling_event", {"event_id": event_id})
+        _sync_expedition_dates(conn, event["expedition_id"])  # по оставшимся выездам
         retired = _retire_issues(conn, "sampling_event", event_id, what)
         return _deleted(conn, f"Удалён {what}.", event_id, retired)
 
 
-def delete_trawling(conn: sqlite3.Connection, trawling_id: int) -> EditResult:
+def delete_trawling(
+    conn: sqlite3.Connection, trawling_id: int, *, user: UserRef = None
+) -> EditResult:
     """Удалить траление вместе с его замерами воды (старт/финиш).
 
     Нельзя, если к тралению привязаны особи или прилов.
     """
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn, "SELECT * FROM trawling WHERE trawling_id = ?", trawling_id,
             f"Траления №{trawling_id} нет.",
@@ -1030,22 +1062,22 @@ def delete_trawling(conn: sqlite3.Connection, trawling_id: int) -> EditResult:
         ).fetchall()
         retired = 0
         for w in waters:
-            conn.execute(
-                "DELETE FROM water_measurement WHERE measurement_id = ?", (w["measurement_id"],)
-            )
+            audit.delete(conn, "water_measurement", {"measurement_id": w["measurement_id"]})
             retired += _retire_issues(
                 conn, "water_measurement", w["measurement_id"], f"замер «{w['point_type']}», {what}"
             )
-        conn.execute("DELETE FROM trawling WHERE trawling_id = ?", (trawling_id,))
+        audit.delete(conn, "trawling", {"trawling_id": trawling_id})
         retired += _retire_issues(conn, "trawling", trawling_id, what)
         return _deleted(
             conn, f"Удалено {what}.", trawling_id, retired, [plural(len(waters), WATERS)]
         )
 
 
-def delete_water_measurement(conn: sqlite3.Connection, measurement_id: int) -> EditResult:
+def delete_water_measurement(
+    conn: sqlite3.Connection, measurement_id: int, *, user: UserRef = None
+) -> EditResult:
     """Удалить замер воды."""
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn,
             "SELECT w.event_id, w.point_type, t.trawl_no FROM water_measurement w "
@@ -1056,17 +1088,19 @@ def delete_water_measurement(conn: sqlite3.Connection, measurement_id: int) -> E
         event = _event(conn, old["event_id"])
         where = f"траление {old['trawl_no']}, " if old["trawl_no"] is not None else ""
         what = f"замер воды №{measurement_id} ({where}{old['point_type']}, выезд {_title(event)})"
-        conn.execute("DELETE FROM water_measurement WHERE measurement_id = ?", (measurement_id,))
+        audit.delete(conn, "water_measurement", {"measurement_id": measurement_id})
         retired = _retire_issues(conn, "water_measurement", measurement_id, what)
         return _deleted(conn, f"Удалён {what}.", measurement_id, retired)
 
 
-def delete_specimen(conn: sqlite3.Connection, specimen_id: int) -> EditResult:
+def delete_specimen(
+    conn: sqlite3.Connection, specimen_id: int, *, user: UserRef = None
+) -> EditResult:
     """Удалить особь вместе с историей определений вида. Нельзя, если у неё есть образцы.
 
     Номер пробы освобождается (next_label его не выдаст: он берёт наибольший номер + 1).
     """
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn, "SELECT specimen_id, label, event_id FROM specimen WHERE specimen_id = ?",
             specimen_id, f"Особи №{specimen_id} нет.",
@@ -1082,8 +1116,11 @@ def delete_specimen(conn: sqlite3.Connection, specimen_id: int) -> EditResult:
                 (specimen_id,),
             )
         ]
-        conn.execute("DELETE FROM species_identification WHERE specimen_id = ?", (specimen_id,))
-        conn.execute("DELETE FROM specimen WHERE specimen_id = ?", (specimen_id,))
+        # каждая запись — со своей проверкой прав: определение, добавленное другим
+        # пользователем, исследователь вместе со своей особью не удалит
+        for ident in idents:
+            audit.delete(conn, "species_identification", {"identification_id": ident})
+        audit.delete(conn, "specimen", {"specimen_id": specimen_id})
         retired = _retire_issues(conn, "specimen", specimen_id, what, old["label"])
         for ident in idents:
             retired += _retire_issues(conn, "species_identification", ident, what)
@@ -1092,9 +1129,9 @@ def delete_specimen(conn: sqlite3.Connection, specimen_id: int) -> EditResult:
         )
 
 
-def delete_sample(conn: sqlite3.Connection, sample_id: int) -> EditResult:
+def delete_sample(conn: sqlite3.Connection, sample_id: int, *, user: UserRef = None) -> EditResult:
     """Удалить образец вместе с отметками об отправке. Нельзя, если есть результаты анализов."""
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn,
             "SELECT sa.label, sa.sample_type, sp.label AS specimen FROM sample sa "
@@ -1108,21 +1145,29 @@ def delete_sample(conn: sqlite3.Connection, sample_id: int) -> EditResult:
         _refuse_if_dependents(conn, f"Образец №{sample_id}", sample_id, [
             ("SELECT count(*) FROM analysis WHERE sample_id = ?", ANALYSES),
         ])  # fmt: skip
-        shipments = conn.execute(
-            "DELETE FROM sample_shipment WHERE sample_id = ?", (sample_id,)
-        ).rowcount
-        conn.execute("DELETE FROM sample WHERE sample_id = ?", (sample_id,))
+        labs = [
+            r[0]
+            for r in conn.execute(
+                "SELECT lab_id FROM sample_shipment WHERE sample_id = ?", (sample_id,)
+            )
+        ]
+        for lab_id in labs:
+            audit.delete(conn, "sample_shipment", {"sample_id": sample_id, "lab_id": lab_id})
+        shipments = len(labs)
+        audit.delete(conn, "sample", {"sample_id": sample_id})
         retired = _retire_issues(conn, "sample", sample_id, what)
         return _deleted(conn, f"Удалён {what}.", sample_id, retired, [plural(shipments, SHIPMENTS)])
 
 
-def delete_shipment(conn: sqlite3.Connection, sample_id: int, lab_id: int) -> EditResult:
+def delete_shipment(
+    conn: sqlite3.Connection, sample_id: int, lab_id: int, *, user: UserRef = None
+) -> EditResult:
     """Удалить отметку «образец отправлен в лабораторию» (sample_shipment).
 
     У отправки нет своего id (ключ — образец + лаборатория), поэтому записей журнала
     с record_id у неё не бывает — журнал не меняется.
     """
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         row = conn.execute(
             "SELECT sa.label, l.name FROM sample_shipment sh "
             "JOIN sample sa ON sa.sample_id = sh.sample_id JOIN lab l ON l.lab_id = sh.lab_id "
@@ -1131,28 +1176,30 @@ def delete_shipment(conn: sqlite3.Connection, sample_id: int, lab_id: int) -> Ed
         ).fetchone()
         if row is None:
             raise NotFoundError(f"Отправки образца №{sample_id} в лабораторию №{lab_id} нет.")
-        conn.execute(
-            "DELETE FROM sample_shipment WHERE sample_id = ? AND lab_id = ?", (sample_id, lab_id)
-        )
+        audit.delete(conn, "sample_shipment", {"sample_id": sample_id, "lab_id": lab_id})
         message = f"Удалена отправка образца №{sample_id} «{row['label']}» в «{row['name']}»."
         return _done(conn, message, sample_id)
 
 
-def delete_catch_record(conn: sqlite3.Connection, catch_id: int) -> EditResult:
+def delete_catch_record(
+    conn: sqlite3.Connection, catch_id: int, *, user: UserRef = None
+) -> EditResult:
     """Удалить запись прилова."""
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn, "SELECT event_id, raw_text FROM catch_record WHERE catch_id = ?", catch_id,
             f"Записи прилова №{catch_id} нет.",
         )  # fmt: skip
         event = _event(conn, old["event_id"])
         what = f"прилов №{catch_id} «{old['raw_text']}» (выезд {_title(event)})"
-        conn.execute("DELETE FROM catch_record WHERE catch_id = ?", (catch_id,))
+        audit.delete(conn, "catch_record", {"catch_id": catch_id})
         retired = _retire_issues(conn, "catch_record", catch_id, what)
         return _deleted(conn, f"Удалён {what}.", catch_id, retired)
 
 
-def delete_identification(conn: sqlite3.Connection, identification_id: int) -> EditResult:
+def delete_identification(
+    conn: sqlite3.Connection, identification_id: int, *, user: UserRef = None
+) -> EditResult:
     """Удалить запись из истории определений вида (например, ошибочно добавленную).
 
     Последнюю оставшуюся запись удалить нельзя: у каждой особи есть хотя бы одно
@@ -1160,7 +1207,7 @@ def delete_identification(conn: sqlite3.Connection, identification_id: int) -> E
     после удаления — вид самого нового оставшегося определения: так же, как identify
     делает текущим последнее добавленное.
     """
-    with write_transaction(conn):
+    with write_transaction(conn, user):
         old = _get(
             conn,
             "SELECT si.specimen_id, si.method, si.confidence, s.label, s.species_id AS current, "
@@ -1185,16 +1232,14 @@ def delete_identification(conn: sqlite3.Connection, identification_id: int) -> E
             f"определение вида особи {old['label']}: {old['species']} "
             f"({old['method']}, {old['confidence']})"
         )
-        conn.execute(
-            "DELETE FROM species_identification WHERE identification_id = ?", (identification_id,)
-        )
+        audit.delete(conn, "species_identification", {"identification_id": identification_id})
         current = left[0]["species_id"]  # самое новое из оставшихся
         message = f"Удалено {what}."
         if current != old["current"]:
-            conn.execute(
-                "UPDATE specimen SET species_id = ? WHERE specimen_id = ?",
-                (current, old["specimen_id"]),
-            )
+            audit.update(  # текущий вид — следствие удаления определения
+                conn, "specimen", {"specimen_id": old["specimen_id"]}, {"species_id": current},
+                derived=True,
+            )  # fmt: skip
             name = conn.execute(
                 "SELECT scientific_name FROM species WHERE species_id = ?", (current,)
             ).fetchone()

@@ -83,3 +83,82 @@
 {% macro warnings(items) %}
 {% for w in items %}<p class="flash flash-warn" role="status">{{ w }}</p>{% endfor %}
 {% endmacro %}
+
+{#- Значение как в базе (без перевода дат в ДД.ММ.ГГГГ): исходные значения журнала проблем,
+    «было → стало» в журнале изменений. -#}
+{% macro raw(v) -%}
+  {%- set text = v | cell(false) -%}
+  {%- if text is none -%}<span class="empty" title="не заполнено">—</span>
+  {%- else -%}{{ text }}{%- endif -%}
+{%- endmacro %}
+
+{#- Время из базы (UTC). Без JavaScript видно «20.10.2026 08:24 UTC»; маленький скрипт
+    static/localtime.js переводит его в пояс браузера: «20.10.2026 15:24 (UTC+7)».
+    Атрибут datetime — то же время в машинном виде (по нему и считает скрипт). -#}
+{% macro utc(ts) -%}
+  {%- set parts = utc_parts(ts) -%}
+  {%- if parts -%}<time class="utc" datetime="{{ parts[0] }}">{{ parts[1] }}</time>
+  {%- else -%}{{ value(ts) }}{%- endif -%}
+{%- endmacro %}
+
+{#- «Внёс(ла) Иванова А., 20.10.2026 15:24» или «импорт из Excel» (created_by пустой). -#}
+{% macro added_by(record) -%}
+  {%- set a = author_of(record) -%}
+  <p class="author small">{% if a %}Внёс(ла): {{ a.name }}, {{ utc(a.at) }}{% else %}Внесено: импорт из Excel{% endif %}</p>
+{%- endmacro %}
+
+{#- Кто изменил: имя (логин — только админу: browse отдаёт user_login лишь ему);
+    пусто — команда на сервере (CLI работает без входа). -#}
+{% macro who(item) -%}
+  {%- if item.user_name %}{{ item.user_name }}{% if item.user_login %} <span class="small">({{ item.user_login }})</span>{% endif %}
+  {%- else %}<span class="muted">команда на сервере</span>{% endif -%}
+{%- endmacro %}
+
+{#- Было / стало. У создания и удаления там вся запись (JSON) — спрятана под «вся запись». -#}
+{% macro change_value(item, v) -%}
+  {%- if item.column_name is none and v is not none -%}
+  <details class="json"><summary>вся запись</summary><pre>{{ v }}</pre></details>
+  {%- else -%}{{ raw(v) }}{%- endif -%}
+{%- endmacro %}
+
+{#- Таблица строк журнала изменений (browse.record_history / list_changes).
+    with_record — колонки «таблица» и «запись» (на странице всего журнала). -#}
+{% macro change_table(items, with_record=false) %}
+<div class="table-wrap">
+  <table class="changes">
+    <thead><tr>
+      <th scope="col">когда</th><th scope="col">кто</th><th scope="col">действие</th>
+      {% if with_record %}<th scope="col">таблица</th><th scope="col">запись</th>{% endif %}
+      <th scope="col">поле</th><th scope="col">было</th><th scope="col">стало</th>
+    </tr></thead>
+    <tbody>
+    {% for item in items %}
+      <tr>
+        <td class="nowrap">{{ utc(item.changed_at) }}</td>
+        <td>{{ who(item) }}</td>
+        <td>{{ item.action }}</td>
+        {% if with_record %}
+        <td>{{ table_title(item.table_name) }}</td>
+        <td>{% if item.url %}<a href="{{ item.url }}">{{ item.record_label or item.record_key }}</a>{% else %}{{ item.record_label or item.record_key }}{% endif %}
+          <a class="small" href="{{ history_url(item.table_name, item.record_key) }}">история</a></td>
+        {% endif %}
+        <td>{{ value(item.column_name) }}</td>
+        <td>{{ change_value(item, item.old_value) }}</td>
+        <td>{{ change_value(item, item.new_value) }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endmacro %}
+
+{#- История изменений записи в карточке — свёрнутым блоком. -#}
+{% macro history_block(items, link) %}
+<details class="edit-form history" id="history">
+  <summary>История изменений ({{ items | length }})</summary>
+  {% if items %}{{ change_table(items) }}
+  {% else %}<p class="empty">На сайте эту запись не меняли (импорт из Excel журнал не пишет).</p>{% endif %}
+  <p class="small"><a href="{{ link }}">История отдельной страницей</a> ·
+    <a href="{{ url_for('changes') }}">весь журнал изменений</a></p>
+</details>
+{% endmacro %}

@@ -7,7 +7,7 @@
   {% for group in events | groupby("expedition_id") %}
     <optgroup label="{{ group.list[0].expedition }}">
     {% for e in group.list %}
-      <option value="{{ e.event_id }}"{% if event_id == e.event_id %} selected{% endif %}>{{ e.event_date }} {{ e.title }}</option>
+      <option value="{{ e.event_id }}"{% if event_id == e.event_id %} selected{% endif %}>{{ e.event_date | ru_date }} {{ e.title }}</option>
     {% endfor %}
     </optgroup>
   {% endfor %}

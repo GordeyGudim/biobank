@@ -40,8 +40,9 @@
         <input id="id-date" name="identified_on" type="date" value="{{ form.identified_on or '' }}"{{ invalid }}>
       </div>
       <div>
-        <label for="id-by">Кто определил</label>
-        <input id="id-by" name="identified_by" type="text" value="{{ form.identified_by or '' }}">
+        <label for="id-by">Кто определил <span class="small">(нового человека добавим в справочник)</span></label>
+        <input id="id-by" name="identified_by" type="text" list="id-people" value="{{ form.identified_by or '' }}">
+        <datalist id="id-people">{% for name in people %}<option value="{{ name }}">{% endfor %}</datalist>
       </div>
     </div>
     <label for="id-notes">Примечание</label>

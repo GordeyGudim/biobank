@@ -10,9 +10,11 @@
 <div id="f-delete">
   {% if error %}<p class="flash flash-error field-error" role="alert">{{ error }}</p>{% endif %}
   <p><strong>Вы уверены? Будет удалено:</strong></p>
-  <table class="fields">
-    {% for name, v in rows %}<tr><th scope="row">{{ name }}</th><td>{{ value(v) }}</td></tr>{% endfor %}
-  </table>
+  <div class="table-wrap">
+    <table class="fields">
+      {% for name, v in rows %}<tr><th scope="row">{{ name }}</th><td>{{ value(v) }}</td></tr>{% endfor %}
+    </table>
+  </div>
   {% if together %}<p>Вместе с записью будет удалено: <strong>{{ together }}</strong>.</p>{% endif %}
   <p class="small">Проблемы журнала об этой записи не пропадут: они закроются с пометкой
     «запись удалена». Если от записи зависят другие (например, у выезда есть особи), удалить

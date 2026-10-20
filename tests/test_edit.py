@@ -124,9 +124,12 @@ def test_identify_adds_history(edit_db):
         identified_by="Иванов", identified_on="2026-09-15", notes="GenBank XX",
     )  # fmt: skip
     assert "→ Pangasius elongatus" in result.message
+    assert "В справочник людей добавлен(а) «Иванов»" in result.message
+    # identified_by — ссылка на справочник людей (person); имя — через JOIN
     history = edit_db.execute(
-        "SELECT method, confidence, identified_by, identified_on FROM species_identification "
-        "JOIN specimen USING (specimen_id) WHERE label = '1 e' ORDER BY identification_id"
+        "SELECT method, confidence, p.full_name, identified_on FROM species_identification si "
+        "JOIN specimen USING (specimen_id) LEFT JOIN person p ON p.person_id = si.identified_by "
+        "WHERE label = '1 e' ORDER BY identification_id"
     ).fetchall()
     assert [tuple(r) for r in history] == [
         ("морфология", "точно", None, "2025-09-27"),

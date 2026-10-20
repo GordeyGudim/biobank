@@ -38,7 +38,7 @@
         {% for name, (title, _) in text_fields.items() if name != "label" %}<th scope="col">{{ title }}</th>{% endfor %}
         {% if trawls %}<th scope="col">траление</th>{% endif %}
         {% for name, title in checks.items() %}<th scope="col">{{ title }}</th>{% endfor %}
-        <th scope="col">примечание</th><th scope="col">проверка</th>
+        <th scope="col">кто определил</th><th scope="col">примечание</th><th scope="col">проверка</th>
       </tr></thead>
       <tbody id="batch-rows">
       {% for row in rows %}
@@ -47,6 +47,7 @@
       </tbody>
     </table>
   </div>
+  <datalist id="batch-people">{% for name in people %}<option value="{{ name }}">{% endfor %}</datalist>
   <input type="hidden" id="batch-next" name="next" value="{{ rows | length + 1 }}">
   <div class="buttons">
     {#- первая кнопка срабатывает по Enter — это «Проверить»: случайный Enter ничего не запишет -#}

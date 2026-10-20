@@ -13,11 +13,15 @@ SQL здесь нет и быть не должно — нужна новая в
   его на место старого. Такой запрос приходит с заголовком «HX-Request: true»;
 - POST/redirect — запись только методом POST; после успешной записи сервер отвечает
   «перейди на другую страницу» (redirect), и обновление страницы (F5) не повторит запись.
+
+Вход и права (этап D3): все страницы — только после входа (auth.py); запись — от имени
+вошедшего (auth.run_edit передаёт user=… в функции entry / records / edit); кнопки и
+формы показываются по permissions.can (в шаблонах — can(…), may(…)); нет прав — 403.
+Пользователи и роли — admin.py; журнал изменений, история записи, люди — journal.py.
 """
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -33,8 +37,9 @@ from flask import (
     request,
     url_for,
 )
+from werkzeug.exceptions import Forbidden
 
-from biobank import browse
+from biobank import browse, users
 from biobank.card import specimen_card
 from biobank.db import connect_read_only
 from biobank.edit import (
@@ -42,7 +47,7 @@ from biobank.edit import (
     METHODS,
     EditError,
     NotFoundError,
-    apply_edit,
+    PermissionDenied,
     identify,
     link_trawl,
     resolve_issue,
@@ -57,7 +62,11 @@ from biobank.entry import (
     WATER_NUMBERS,
 )
 from biobank.parsing import ORGANS
+from biobank.permissions import CREATE, DELETE, MANAGE_USERS, MERGE_PEOPLE, RESOLVE, UPDATE
 from biobank.reports import REPORTS, report_tables
+from biobank.web import auth
+from biobank.web.admin import register_admin_routes
+from biobank.web.auth import flash_result, need, register_auth, run_edit
 from biobank.web.entry_forms import (
     Submitted,
     grouped_sites,
@@ -65,17 +74,27 @@ from biobank.web.entry_forms import (
     register_entry_routes,
     site_hints,
 )
-from biobank.web.record_forms import as_text, register_record_routes
+from biobank.web.journal import register_journal_routes
+from biobank.web.record_forms import (
+    as_text,
+    people_names,
+    record_permit,
+    register_record_routes,
+)
 from biobank.web.views import (
     ISSUE_STATUSES,
+    KIND_TABLES,
     SPECIMEN_ORDERS,
     TABLE_TITLES,
     field_ids,
+    history_url,
     issue_object_url,
     issue_query,
     row_actions,
+    ru_date,
     section_views,
     specimen_query,
+    utc_parts,
 )
 
 # Названия отчётов в меню (ключи — как у команды `python -m biobank report <имя>`)
@@ -88,43 +107,73 @@ REPORT_TITLES = {
 }
 
 
+CROSS_SITE = "Запрос пришёл не со страницы этого сайта и отклонён. База не изменена."
+
+
 class DatabaseMissingError(Exception):
     """Файла базы нет — сайт показывает понятную страницу вместо ошибки 500."""
 
 
-def cell_text(value) -> str | None:
+def cell_text(value, dates: bool = True) -> str | None:
     """Как показать значение в ячейке таблицы; None остаётся None (шаблон пишет «—»).
 
     Дробные числа — до 10 значащих цифр, как в терминале (координаты не обрезаются).
+    Дата ГГГГ-ММ-ДД — как ДД.ММ.ГГГГ (dates=False — как в базе: исходные значения
+    в журнале проблем показываются без изменений).
 
     >>> cell_text(10.103733), cell_text(29.9), cell_text(5), cell_text(None)
     ('10.103733', '29.9', '5', None)
+    >>> cell_text("2025-09-25"), cell_text("2025-09-25", dates=False)
+    ('25.09.2025', '2025-09-25')
     """
     if value is None:
         return None
     if isinstance(value, float):
         return f"{value:.10g}"
-    return str(value)
+    return ru_date(str(value)) if dates else str(value)
 
 
-def create_app(db_path: Path | str) -> Flask:
+def create_app(
+    db_path: Path | str,
+    *,
+    secure_cookies: bool | None = None,
+    trusted_hosts: list[str] | None = None,
+    trusted_proxies: int | None = None,
+) -> Flask:
     """Фабрика приложения: собрать сайт для базы db_path.
 
     Фабрика (функция, которая создаёт приложение), а не один глобальный объект:
     тесты создают своё приложение для копии базы, команда `web` — для рабочей.
+    Настройки для сервера (None — из переменных окружения, см. README, раздел «Сайт»):
+    secure_cookies — cookie сессии только по HTTPS (BIOBANK_SECURE_COOKIES=1; по умолчанию
+    выключено: на 127.0.0.1 HTTPS нет); trusted_hosts — имена сайта (BIOBANK_TRUSTED_HOSTS,
+    через запятую; по умолчанию 127.0.0.1, localhost); trusted_proxies — сколько прокси
+    перед сайтом (BIOBANK_TRUSTED_PROXIES; по умолчанию 0 — X-Forwarded-For не верить).
     """
     app = Flask(__name__)
     app.config["DB_PATH"] = Path(db_path)
-    # ключ для подписи cookie с сообщениями flash(); новый при каждом запуске —
-    # входа по паролю пока нет, хранить в cookie больше нечего
-    app.config["SECRET_KEY"] = os.urandom(32)
-    # Отвечать только на адреса этого компьютера. Защита от «DNS rebinding»: чужой сайт
-    # может направить своё имя на 127.0.0.1 и читать страницы — с чужим именем в
+    # постоянный ключ подписи cookie, cookie, имена сайта, прокси — auth.configure.
+    # TRUSTED_HOSTS — отвечать только на свои имена. Защита от «DNS rebinding»: чужой сайт
+    # может направить своё имя на наш адрес и читать страницы — с чужим именем в
     # заголовке Host Flask ответит ошибкой 400.
-    app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost"]
+    auth.configure(app, Path(db_path), secure_cookies, trusted_hosts, trusted_proxies)
     app.jinja_env.filters["cell"] = cell_text
+    app.jinja_env.filters["ru_date"] = ru_date
+    app.jinja_env.globals.update(
+        utc_parts=utc_parts,
+        may=record_permit,  # may('event', 5, UPDATE) — кнопки правки конкретной записи
+        author_of=author_of,
+        history_url=history_url,
+        CREATE=CREATE,
+        UPDATE=UPDATE,
+        DELETE=DELETE,
+        RESOLVE=RESOLVE,
+        MANAGE_USERS=MANAGE_USERS,
+        MERGE_PEOPLE=MERGE_PEOPLE,
+    )
 
-    _register_db(app)
+    _register_db(app)  # CSRF-проверка — первой, до входа (вход и выход тоже под ней)
+    register_auth(app, sys.modules[__name__])
     _register_errors(app)
     _register_routes(app)
     # формы ввода — в своём модуле entry_forms.py; он получает этот модуль (функции
@@ -132,6 +181,9 @@ def create_app(db_path: Path | str) -> Flask:
     register_entry_routes(app, sys.modules[__name__])
     # правка, удаление и пакетный ввод — record_forms.py, устроены так же
     register_record_routes(app, sys.modules[__name__])
+    # пользователи (админ); журнал изменений, история записи, люди, новая проблема
+    register_admin_routes(app, sys.modules[__name__])
+    register_journal_routes(app, sys.modules[__name__])
     return app
 
 
@@ -159,17 +211,18 @@ def _register_db(app: Flask) -> None:
     def reject_cross_site_post():
         """Запись — только со страниц самого сайта.
 
-        Пароля пока нет, поэтому любая открытая в браузере страница чужого сайта могла бы
-        отправить форму на http://127.0.0.1:5000/… (CSRF — подделка запроса). Браузер
-        сообщает, откуда пришла форма (заголовки Origin и Sec-Fetch-Site), — чужое отклоняем.
+        Открытая в браузере страница чужого сайта могла бы отправить форму на этот сайт
+        от имени вошедшего пользователя (CSRF — подделка запроса). Браузер сообщает,
+        откуда пришла форма (заголовки Origin и Sec-Fetch-Site), — чужое отклоняем.
+        Вход и выход — тоже POST и тоже под этой проверкой.
         """
         if request.method != "POST":
             return None
         origin = request.headers.get("Origin")
         if origin is not None and origin.rstrip("/") != request.host_url.rstrip("/"):
-            abort(403)
+            abort(403, description=CROSS_SITE)
         if request.headers.get("Sec-Fetch-Site") == "cross-site":
-            abort(403)
+            abort(403, description=CROSS_SITE)
         return None
 
 
@@ -214,6 +267,10 @@ def _register_errors(app: Flask) -> None:
     def not_found_record(error: NotFoundError):
         return render_template("error.html", title="Не найдено", message=str(error)), 404
 
+    @app.errorhandler(PermissionDenied)
+    def permission_denied(error: PermissionDenied):
+        return render_template("error.html", title="Нет прав", message=str(error)), 403
+
     @app.errorhandler(EditError)
     def edit_error(error: EditError):
         return render_template("error.html", title="Ошибка", message=str(error)), 400
@@ -237,9 +294,11 @@ def _register_errors(app: Flask) -> None:
         return render_template("error.html", title="Недопустимый запрос", message=message), 405
 
     @app.errorhandler(403)
-    def forbidden(_error):
-        message = "Запрос пришёл не со страницы этого сайта и отклонён. База не изменена."
-        return render_template("error.html", title="Запрещено", message=message), 403
+    def forbidden(error):
+        # abort(403, description=…) — текст отказа (нет прав, чужой сайт); иначе общий
+        message = error.description if error.description != Forbidden.description else None
+        message = message or "Нет прав на это действие."
+        return render_template("error.html", title="Нет прав", message=message), 403
 
 
 # ---------------------------------------------------------------------------
@@ -315,23 +374,29 @@ def _register_routes(app: Flask) -> None:
     @app.post("/specimen/<path:label>/link-trawl")
     def specimen_link_trawl(label: str):
         """Форма «Привязать к тралению» → edit.link_trawl через apply_edit."""
+        need(UPDATE, "specimen", specimen_record(label))
         form = {"trawl_no": request.form.get("trawl_no", "")}
         try:
             trawl_no = int(form["trawl_no"])
         except ValueError:
             return _specimen_page(label, 400, form, link_error="Выберите траление из списка.")
-        return _specimen_edit(label, form, "link_error", lambda c: link_trawl(c, label, trawl_no))
+
+        def action(conn, user):
+            return link_trawl(conn, label, trawl_no, user=user)
+
+        return _specimen_edit(label, form, "link_error", action)
 
     @app.post("/specimen/<path:label>/identify")
     def specimen_identify(label: str):
         """Форма «Новое определение вида» → edit.identify через apply_edit."""
+        need(CREATE, "species_identification")
         form = {
             name: " ".join(request.form.get(name, "").split())
             for name in ("species", "method", "confidence", "identified_on", "identified_by")
         }
         form["notes"] = request.form.get("notes", "").strip()
 
-        def action(conn):
+        def action(conn, user):
             return identify(
                 conn,
                 label,
@@ -341,6 +406,7 @@ def _register_routes(app: Flask) -> None:
                 identified_by=form["identified_by"] or None,
                 identified_on=form["identified_on"] or None,
                 notes=form["notes"] or None,
+                user=user,
             )
 
         return _specimen_edit(label, form, "identify_error", action)
@@ -375,7 +441,11 @@ def _register_routes(app: Flask) -> None:
         conn = read_db()
         sections = browse.site_card(conn, site_id)  # нет места — 404
         views = section_views(
-            sections, own_key="site_id", actions=True, here=url_for("site", site_id=site_id)
+            sections,
+            own_key="site_id",
+            actions=True,
+            here=url_for("site", site_id=site_id),
+            permit=record_permit,
         )
         return render_template(
             "site.html",
@@ -383,6 +453,7 @@ def _register_routes(app: Flask) -> None:
             title=sections[0].rows[0][1],
             site_id=site_id,
             expeditions=browse.list_expeditions(conn),
+            **record_info("site", site_id),
         )
 
     @app.get("/trawlings/<int:trawling_id>")
@@ -398,11 +469,13 @@ def _register_routes(app: Flask) -> None:
                 own_key="trawling_id",
                 actions=True,
                 here=url_for("trawling", trawling_id=trawling_id),
+                permit=record_permit,
             ),
             trawling_id=trawling_id,
             trawl_no=fields["траление"],
             event_title=fields["выезд"],
             ids=ids,
+            **record_info("trawling", trawling_id),
         )
 
     # ---- отчёты ----
@@ -434,6 +507,7 @@ def _register_routes(app: Flask) -> None:
         for item in page.items:
             item["object_url"] = issue_object_url(item)
             item["table_title"] = TABLE_TITLES.get(item["table_name"], item["table_name"])
+            item["can_resolve"] = auth.allowed(RESOLVE, "data_issue", item)
         context = {"query": query, "page": page}
         if _wants_fragment("results"):
             return render_template("_issues_results.html", **context)
@@ -448,6 +522,7 @@ def _register_routes(app: Flask) -> None:
     def issue(issue_id: int):
         """Одна проблема журнала (на неё ведут ссылки из карточек) + форма «Решено»."""
         item = browse.get_issue(read_db(), issue_id)  # нет такой — 404
+        item["can_resolve"] = auth.allowed(RESOLVE, "data_issue", item)
         return render_template(
             "issue.html",
             issue=item,
@@ -462,10 +537,11 @@ def _register_routes(app: Flask) -> None:
         HTMX-запрос получает фрагмент вместо формы (без перезагрузки страницы);
         обычная отправка формы (если JavaScript выключен) — redirect на журнал.
         """
+        need(RESOLVE, "data_issue", browse.get_issue(read_db(), issue_id))  # нет такой — 404
         resolution = request.form.get("resolution", "")
         try:
-            result = apply_edit(
-                app.config["DB_PATH"], lambda conn: resolve_issue(conn, issue_id, resolution)
+            result = run_edit(
+                lambda conn, user: resolve_issue(conn, issue_id, resolution, user=user)
             )
         except EditError as error:
             # NotFoundError — нет такой проблемы; иначе — пустой текст, уже решена и т.п.
@@ -481,9 +557,12 @@ def _register_routes(app: Flask) -> None:
             return redirect(url_for("issues", _anchor=f"issue-{issue_id}"))
         if _is_htmx():
             return render_template(
-                "_resolve_done.html", message=result.message, resolution=resolution
+                "_resolve_done.html",
+                message=result.message,
+                resolution=resolution,
+                notices=[*result.warnings, *result.notices],
             )
-        flash(result.message, "ok")
+        flash_result(result)
         return redirect(url_for("issues"))
 
 
@@ -509,6 +588,7 @@ def expedition_page(expedition_id: int, submitted: Submitted | None = None, stat
     info = next(x for x in browse.list_expeditions(conn) if x["expedition_id"] == expedition_id)
     return render_template(
         "expedition.html",
+        **record_info("expedition", expedition_id),
         expedition=info,
         events=events,
         site_groups=grouped_sites(browse.list_sites(conn)),
@@ -532,7 +612,9 @@ def event_page(event_id: int, submitted: Submitted | None = None, status: int = 
             event_id=event_id,
             actions=True,
             here=url_for("event", event_id=event_id),
+            permit=record_permit,
         ),
+        **record_info("event", event_id),
         title=fields["выезд"],
         event_id=event_id,
         ids=ids,
@@ -542,6 +624,7 @@ def event_page(event_id: int, submitted: Submitted | None = None, status: int = 
         species=browse.list_species(conn),
         methods=browse.list_capture_methods(conn),
         site_groups=grouped_sites(browse.list_sites(conn)),
+        people=people_names(conn),
         suffixes=label_suffixes(),
         confidences=CONFIDENCES,
         sexes=SEXES,
@@ -597,7 +680,12 @@ def _specimen_page(
     # (страница могла прийти и от POST-формы — тогда request.path не адрес карточки)
     here = url_for("specimen", label=fields["номер пробы"])
     views = section_views(
-        sections, own_key="specimen_id", event_id=ids["event_id"], actions=True, here=here
+        sections,
+        own_key="specimen_id",
+        event_id=ids["event_id"],
+        actions=True,
+        here=here,
+        permit=record_permit,
     )
     return render_template(
         "specimen.html",
@@ -607,16 +695,21 @@ def _specimen_page(
         # форма «Привязать к тралению» — только у особей, полученных тралением
         # (способ особи, а если своего нет — выезда; из row_ids раздела «Особь»)
         is_trawled=ids.get("capture_method") == "траление",
-        own_actions=row_actions({"specimen_id": ids["specimen_id"]}, here),
-        # куда отправлены образцы — для кнопок «удалить отправку»
+        own_actions=row_actions(
+            {"specimen_id": ids["specimen_id"]}, here, record_permit, history=False
+        ),
+        **record_info("specimen", ids["specimen_id"]),
+        # куда отправлены образцы — для кнопок «удалить отправку» (только те, что можно)
         shipments=[
             (dict(zip(samples.columns, row, strict=True)), shipment)
             for row, sample_id in zip(samples.rows, sample_ids, strict=True)
             if sample_id is not None
             for shipment in browse.list_shipments(conn, sample_id)
+            if auth.allowed(DELETE, "sample_shipment", shipment)
         ],
         trawls=browse.event_trawls(conn, ids["event_id"]),
         species=browse.list_species(conn),
+        people=people_names(conn),
         methods=METHODS,
         confidences=CONFIDENCES,
         form=form or {},
@@ -652,19 +745,64 @@ def current_measurements(conn: sqlite3.Connection, specimen_id: int) -> dict[str
 
 
 def _specimen_edit(label: str, form: dict, error_name: str, action):
-    """Общая часть форм карточки: apply_edit (резервная копия + транзакция).
+    """Общая часть форм карточки: run_edit (резервная копия + транзакция, от имени вошедшего).
 
     Успех — сообщение и redirect на карточку (F5 не повторит запись).
     Ошибка — та же карточка с текстом ошибки у формы (код 400; нет особи — 404).
     HTMX-форма берёт из ответа только блок #card — карточка обновляется без перезагрузки.
     """
     try:
-        result = apply_edit(current_app.config["DB_PATH"], action)
+        result = run_edit(action)
     except NotFoundError as error:
         return render_template("not_found.html", message=str(error), label=label), 404
     except EditError as error:
         return _specimen_page(label, 400, form, **{error_name: str(error)})
-    flash(result.message, "ok")
-    for warning in result.warnings:
-        flash(warning, "warn")
+    flash_result(result)
     return redirect(url_for("specimen", label=label))
+
+
+# ---------------------------------------------------------------------------
+# Кто внёс запись, история, права на запись по номеру пробы
+# ---------------------------------------------------------------------------
+
+
+def user_name(user_id: int | None) -> str | None:
+    """Подпись пользователя по номеру (один запрос к базе на номер за запрос страницы)."""
+    if user_id is None:
+        return None
+    names = g.setdefault("user_names", {})
+    if user_id not in names:
+        try:
+            names[user_id] = users.get_user(read_db(), user_id).display_name
+        except NotFoundError:
+            names[user_id] = f"пользователь №{user_id}"
+    return names[user_id]
+
+
+def author_of(record) -> dict | None:
+    """Кто и когда внёс запись (created_by / created_at): {'name', 'at'};
+    None — запись перенесена из Excel (created_by пустой)."""
+    if record is None or record.get("created_by") is None:
+        return None
+    return {"name": user_name(record["created_by"]), "at": record.get("created_at")}
+
+
+def record_info(kind: str, record_id: int) -> dict:
+    """Для шаблона карточки: сама запись (record — кто внёс) и её история изменений.
+
+    kind — expedition, site, event, trawling, specimen (так же зовутся и в get_record)."""
+    conn = read_db()
+    record = browse.get_record(conn, kind, record_id)
+    table = KIND_TABLES[kind]
+    return {
+        "record": record,
+        "history": browse.record_history(conn, table, record_id, viewer=auth.current_user()),
+        "history_link": history_url(table, record_id),
+    }
+
+
+def specimen_record(label: str) -> dict:
+    """Запись особи по номеру в любом написании (для проверки прав); нет — 404."""
+    conn = read_db()
+    specimen_id = browse.specimen_measurements(conn, label)["specimen_id"]
+    return browse.get_record(conn, "specimen", specimen_id)

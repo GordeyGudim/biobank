@@ -22,6 +22,10 @@ body {
   line-height: 1.45;
   color: var(--text);
   background: #fff;
+  /* очень длинное слово без пробелов (ссылка, номер, JSON) переносится, а не раздвигает
+     страницу. break-word, а не anywhere: не сужает колонки таблиц — широкая таблица
+     прокручивается в своей рамке (.table-wrap), а не сжимается в столбик из букв */
+  overflow-wrap: break-word;
 }
 
 /* --- верхнее меню --- */
@@ -32,6 +36,7 @@ body {
   gap: 0.5rem 1.5rem;
   padding: 0.6rem 1rem;
   background: var(--accent);
+  color: #fff; /* имя пользователя и роли — светлым по синему */
 }
 .top a { color: #fff; text-decoration: none; }
 .brand { font-weight: 700; font-size: 1.15rem; }
@@ -51,6 +56,8 @@ a { color: var(--accent); }
 
 /* --- таблицы: широкие прокручиваются по горизонтали внутри своей рамки --- */
 .table-wrap {
+  position: relative; /* опора для position:absolute внутри (скрытые подписи полей):
+                         без неё они отсчитываются от страницы и вылезают за рамку */
   overflow-x: auto;
   max-height: 75vh;
   overflow-y: auto;
@@ -74,6 +81,9 @@ tbody tr:nth-child(even) { background: #f8fafb; }
 tbody tr:hover { background: #eef5fb; }
 table.fields { width: auto; min-width: 50%; }
 table.fields th { background: var(--head); white-space: nowrap; width: 1%; }
+/* в таблицах «поле — значение» и журнале изменений длинное значение (примечание, описание
+   проблемы) переносится в любом месте: у них мало колонок, сжимать нечего */
+table.fields td, table.changes td { overflow-wrap: anywhere; }
 .empty { color: var(--muted); }
 :target { outline: 2px solid var(--accent); } /* строка журнала, на которую ведёт ссылка #issue-N */
 
@@ -116,10 +126,17 @@ td.action { min-width: 16rem; }
 
 .links li { margin: 0.3rem 0; }
 
-/* скрыть подпись глазами, но оставить для программ чтения с экрана */
+/* скрыть подпись глазами, но оставить для программ чтения с экрана.
+   !important — нарочно: это служебный класс, его размер не должны перебивать правила вроде
+   «.search label { width: 100% }». Раньше перебивали: скрытая подпись поиска в шапке
+   становилась шириной с окно и уезжала за правый край — у всех страниц появлялась
+   прокрутка вправо. */
 .visually-hidden {
-  position: absolute; width: 1px; height: 1px; overflow: hidden;
-  clip: rect(0 0 0 0); white-space: nowrap;
+  position: absolute !important;
+  width: 1px !important; height: 1px !important;
+  margin: -1px !important; padding: 0 !important; border: 0 !important;
+  overflow: hidden !important; clip: rect(0 0 0 0) !important; clip-path: inset(50%) !important;
+  white-space: nowrap !important;
 }
 
 /* поиск в шапке */
@@ -216,3 +233,19 @@ table.batch tr.row-warn { background: var(--warn-bg); }
   .filters > div, .filters select, .filters input[type="search"] { width: 100%; max-width: none; }
   table { font-size: 0.85rem; }
 }
+
+/* ---- Вход, учётная запись, журнал изменений (этап D3) ---- */
+.top .account { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.75rem; font-size: 0.9rem; }
+.top .account .small { color: rgba(255, 255, 255, 0.8); }
+.top .account form.logout { margin: 0; }
+.top .account button { background: #fff; color: var(--accent); }
+form.login { max-width: 26rem; }
+form.login .field { display: flex; flex-direction: column; margin-bottom: 0.75rem; }
+.author { color: #555; margin-top: -0.5rem; }
+.muted { color: #666; }
+.password-note .temp-password code { font-size: 1.4rem; letter-spacing: 0.05em; user-select: all; }
+tr.inactive td { color: #777; }
+details.json summary { cursor: pointer; color: var(--accent); }
+details.json pre { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 40rem; font-size: 0.8rem; margin: 0.25rem 0; }
+table.changes td { vertical-align: top; }
+fieldset.checks { border: none; padding: 0; margin: 0.5rem 0; }

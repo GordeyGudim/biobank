@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{#- Журнал изменений (browse.list_changes): кто, когда, что изменил на сайте — новые сверху.
+    Фильтры — GET (в адресе), HTMX обновляет только таблицу #results, как в списке особей. -#}
+{% block title %}Журнал изменений{% endblock %}
+{% block content %}
+<h1>Журнал изменений</h1>
+<p>Каждая правка на сайте записывается сюда: кто, когда, какая запись, какое поле, было → стало.
+  Перенос из Excel сюда не попадает. Время — в поясе вашего компьютера.</p>
+<form class="filters" method="get" action="{{ url_for('changes') }}"
+      hx-get="{{ url_for('changes') }}" hx-target="#results" hx-swap="outerHTML"
+      hx-push-url="true" hx-sync="this:replace" hx-trigger="change, submit">
+  <div>
+    <label for="c-user">Кто</label>
+    <select id="c-user" name="user">
+      <option value="">все</option>
+      {% for u in users %}
+      <option value="{{ u.user_id }}"{% if query.text('user') == u.user_id | string %} selected{% endif %}>{{ u.display_name }}{% if u.login %} ({{ u.login }}){% endif %}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label for="c-table">Что</label>
+    <select id="c-table" name="table">
+      <option value="">всё</option>
+      {% for t in tables %}
+      <option value="{{ t }}"{% if query.text('table') == t %} selected{% endif %}>{{ table_title(t) }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label for="c-from">С даты</label>
+    <input id="c-from" name="date_from" type="date" value="{{ query.text('date_from') }}">
+  </div>
+  <div>
+    <label for="c-to">По дату</label>
+    <input id="c-to" name="date_to" type="date" value="{{ query.text('date_to') }}">
+  </div>
+  <div class="buttons"><button type="submit">Показать</button></div>
+</form>
+{% include "_changes_results.html" %}
+{% endblock %}

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{#- Вход на сайт. Форма POST: логин и пароль не попадают в адрес страницы (как было бы у GET).
+    autocomplete — подсказки браузеру и менеджеру паролей, какое поле что значит. -#}
+{% block title %}Вход{% endblock %}
+{% block content %}
+<h1>Вход</h1>
+<p>Сайт закрытый: войдите под логином, который выдал админ.</p>
+<form class="login" method="post" action="{{ url_for('login') }}">
+  {% if error %}<p class="flash flash-error field-error" id="login-error" role="alert">{{ error }}</p>{% endif %}
+  {% if next_url %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
+  <div class="field">
+    <label for="login-name">Логин</label>
+    <input id="login-name" name="login" type="text" required autocomplete="username"
+           autocapitalize="none" spellcheck="false" value="{{ login_name }}"
+           {% if error %}aria-describedby="login-error"{% endif %}>
+  </div>
+  <div class="field">
+    <label for="login-password">Пароль</label>
+    <input id="login-password" name="password" type="password" required autocomplete="current-password"
+           {% if error %}aria-describedby="login-error"{% endif %}>
+  </div>
+  <div class="buttons"><button type="submit">Войти</button></div>
+  <p class="small">Забыли пароль — попросите админа сбросить его: он выдаст временный.</p>
+</form>
+{% endblock %}

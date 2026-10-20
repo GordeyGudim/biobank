@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% from "_macros.html" import change_table %}
+{#- История одной записи (browse.record_history), старые изменения первыми.
+    Удалённая запись тоже видна: журнал остаётся. -#}
+{% block title %}История: {{ label or key }}{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="{{ url_for('changes') }}">Журнал изменений</a> /</p>
+<h1>История: {{ table_title(table) }} {{ label or ("№" ~ key) }}</h1>
+{% if url %}<p><a href="{{ url }}">Открыть карточку записи</a></p>{% endif %}
+{% if items %}{{ change_table(items) }}
+{% else %}<p class="empty">Изменений на сайте не было: запись перенесена из Excel и с тех пор не менялась
+  (или такой записи нет).</p>{% endif %}
+{% endblock %}

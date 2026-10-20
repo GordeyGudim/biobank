@@ -67,7 +67,8 @@
       </select>
     </div>
     {{ date(f, "capture_date", "Своя дата поимки", hint="пусто — дата выезда") }}
-    {{ text(f, "identified_by", "Кто определил вид") }}
+    {{ text(f, "identified_by", "Кто определил вид", list="f-specimen-people", hint="нового человека добавим в справочник людей") }}
+    <datalist id="f-specimen-people">{% for name in people %}<option value="{{ name }}">{% endfor %}</datalist>
     {{ area(f, "notes", "Примечания", hint="икра, «мертвый», куда отправили и т.п.") }}
   </div>
   {{ submit(f, "Добавить особь") }}

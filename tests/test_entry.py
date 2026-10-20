@@ -617,7 +617,8 @@ def test_add_sample_with_labs(entry_db):
 
 
 def test_add_sample_default_label(entry_db):
-    result = entry.add_sample(entry_db, "1pc", "гистология", organ="печень")
+    # у 1 pc из Excel уже есть гистология печени «1 pc» — берём другой орган
+    result = entry.add_sample(entry_db, "1pc", "гистология", organ="почки")
     assert (
         count(entry_db, "SELECT label FROM sample WHERE sample_id = ?", result.record_id) == "1 pc"
     )
@@ -628,7 +629,7 @@ def test_add_sample_default_label(entry_db):
     [
         ("1 pc", "кровь", {}, "Тип образца"),
         ("1 pc", "ДНК", {"sample_label": "26 ph"}, "уже есть у особи 26 ph"),
-        ("1 pc", "ДНК", {"labs": ["Марс"]}, "Лаборатории «Марс» нет"),
+        ("1 pc", "ДНК", {"sample_label": "1 pc x", "labs": ["Марс"]}, "Лаборатории «Марс» нет"),
         ("9999 pc", "ДНК", {}, "не найдена"),
     ],
 )

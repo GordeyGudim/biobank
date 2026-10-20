@@ -1,20 +1,23 @@
 {% extends "base.html" %}
-{% from "_macros.html" import value %}
+{% from "_macros.html" import value, added_by, history_block %}
 {% block title %}{{ expedition.name }}{% endblock %}
 {% block content %}
 <p class="crumbs"><a href="{{ url_for('expeditions') }}">Экспедиции</a> /</p>
 <h1>Экспедиция {{ expedition.name }}</h1>
+{{ added_by(record) }}
 <p class="record-actions">
-  <a class="button-link" href="{{ url_for('record_edit', kind_name='expedition', record_id=expedition.expedition_id) }}">Изменить экспедицию</a>
-  <a class="button-link danger" href="{{ url_for('record_delete', kind_name='expedition', record_id=expedition.expedition_id) }}">Удалить экспедицию</a>
+  {% if may("expedition", expedition.expedition_id, UPDATE) %}<a class="button-link" href="{{ url_for('record_edit', kind_name='expedition', record_id=expedition.expedition_id) }}">Изменить экспедицию</a>{% endif %}
+  {% if may("expedition", expedition.expedition_id, DELETE) %}<a class="button-link danger" href="{{ url_for('record_delete', kind_name='expedition', record_id=expedition.expedition_id) }}">Удалить экспедицию</a>{% endif %}
 </p>
-<table class="fields">
-  <tr><th scope="row">даты</th><td>{{ value(expedition.date_start) }} — {{ value(expedition.date_end) }}</td></tr>
-  <tr><th scope="row">выездов</th><td>{{ expedition.event_count }}</td></tr>
-  <tr><th scope="row">особей</th><td><a href="{{ url_for('specimens', expedition=expedition.expedition_id) }}">{{ expedition.specimen_count }} — список</a></td></tr>
-  <tr><th scope="row">примечания</th><td>{{ value(expedition.notes) }}</td></tr>
-</table>
-{% include "_form_event.html" %}
+<div class="table-wrap">
+  <table class="fields">
+    <tr><th scope="row">даты</th><td>{{ value(expedition.date_start) }} — {{ value(expedition.date_end) }}</td></tr>
+    <tr><th scope="row">выездов</th><td>{{ expedition.event_count }}</td></tr>
+    <tr><th scope="row">особей</th><td><a href="{{ url_for('specimens', expedition=expedition.expedition_id) }}">{{ expedition.specimen_count }} — список</a></td></tr>
+    <tr><th scope="row">примечания</th><td>{{ value(expedition.notes) }}</td></tr>
+  </table>
+</div>
+{% if can(CREATE, "sampling_event") %}{% include "_form_event.html" %}{% endif %}
 <section class="section">
   <h2>Выезды <small>(строк: {{ events | length }})</small></h2>
   {% if events %}
@@ -45,4 +48,5 @@
   <p class="empty">Выездов пока нет.</p>
   {% endif %}
 </section>
+{{ history_block(history, history_link) }}
 {% endblock %}

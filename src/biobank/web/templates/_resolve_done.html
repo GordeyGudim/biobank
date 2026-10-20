@@ -2,4 +2,5 @@
 <div class="resolved" role="status">
   <strong>Решено.</strong> {{ resolution }}
   <div class="small">{{ message }}</div>
+  {% for notice in notices or [] %}<div class="flash flash-warn small">{{ notice }}</div>{% endfor %}
 </div>

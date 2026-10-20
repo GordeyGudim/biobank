@@ -12,21 +12,38 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   {#- локальный файл, не CDN: сайт работает без интернета -#}
   <script src="{{ url_for('static', filename='htmx.min.js') }}" defer></script>
+  {#- время журнала — в поясе браузера (без скрипта остаётся UTC с подписью) -#}
+  <script src="{{ url_for('static', filename='localtime.js') }}" defer></script>
 </head>
 <body>
   {%- set section = request.endpoint -%}
   <header class="top">
     <a class="brand" href="{{ url_for('index') }}">Biobank</a>
+    {% if current_user and not current_user.must_change_password %}
     <nav>
       <a href="{{ url_for('specimens') }}"{% if section in ('specimens', 'specimen') %} aria-current="page"{% endif %}>Особи</a>
       <a href="{{ url_for('expeditions') }}"{% if section in ('expeditions', 'expedition', 'event') %} aria-current="page"{% endif %}>Экспедиции</a>
       <a href="{{ url_for('sites') }}"{% if section in ('sites', 'site') %} aria-current="page"{% endif %}>Места</a>
-      <a href="{{ url_for('issues') }}"{% if section == 'issues' %} aria-current="page"{% endif %}>Журнал проблем</a>
+      <a href="{{ url_for('issues') }}"{% if section in ('issues', 'issue', 'issue_new') %} aria-current="page"{% endif %}>Журнал проблем</a>
       <a href="{{ url_for('reports') }}"{% if section in ('reports', 'report') %} aria-current="page"{% endif %}>Отчёты</a>
+      <a href="{{ url_for('changes') }}"{% if section in ('changes', 'history') %} aria-current="page"{% endif %}>Журнал изменений</a>
+      <a href="{{ url_for('people') }}"{% if section == 'people' %} aria-current="page"{% endif %}>Люди</a>
+      {% if can(MANAGE_USERS) %}<a href="{{ url_for('admin_users') }}"{% if section in ('admin_users', 'admin_user') %} aria-current="page"{% endif %}>Пользователи</a>{% endif %}
     </nav>
     {#- на главной большая форма поиска, вторая в шапке не нужна -#}
     {% if section != 'index' %}
       {% with form_id="top", compact=true, label=none, error=none %}{% include "_search_form.html" %}{% endwith %}
+    {% endif %}
+    {% endif %}
+    {% if current_user %}
+    {#- кто вошёл; «Выйти» — форма POST (выход меняет состояние, по ссылке GET его не делают) -#}
+    <div class="account">
+      <span class="who">{{ current_user.display_name }} <span class="small">({{ current_user.roles | sort | join(", ") }})</span></span>
+      <a href="{{ url_for('password') }}">Сменить пароль</a>
+      <form method="post" action="{{ url_for('logout') }}" class="logout">
+        <button type="submit" class="secondary small-button" title="выход на всех ваших устройствах">Выйти</button>
+      </form>
+    </div>
     {% endif %}
   </header>
   <main>
